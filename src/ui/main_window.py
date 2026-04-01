@@ -19,8 +19,9 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem, QToolBar, QVBoxLayout, QWidget, QAbstractItemView,
 )
 
-from ..scanner import Scanner
+from ..scanner import Scanner, STEP_NAMES, TOTAL_STEPS, _format_eta
 from ..models import DuplicateGroup, FileInfo
+from ..logger import logger
 
 
 def human_size(n: int) -> str:
@@ -35,7 +36,8 @@ def human_size(n: int) -> str:
 
 # ── Worker ────────────────────────────────────────────────────────────────────
 class ScanWorker(QObject):
-    progress = pyqtSignal(str, int, int)
+    # msg, current, total, step(1-3), total_steps(3), eta_secs
+    progress = pyqtSignal(str, int, int, int, int, int)
     finished = pyqtSignal(list)
     error    = pyqtSignal(str)
 
@@ -49,7 +51,7 @@ class ScanWorker(QObject):
         self._scanner = Scanner(
             roots=self._roots,
             min_size=self._min_size,
-            on_progress=lambda m, c, t: self.progress.emit(m, c, t),
+            on_progress=lambda m, c, t, s, ts, eta: self.progress.emit(m, c, t, s, ts, eta),
             on_done=lambda g: self.finished.emit(g),
             on_error=lambda e: self.error.emit(e),
         )
@@ -58,6 +60,14 @@ class ScanWorker(QObject):
     def stop(self):
         if self._scanner:
             self._scanner.stop()
+
+    def pause(self):
+        if self._scanner:
+            self._scanner.pause()
+
+    def resume(self):
+        if self._scanner:
+            self._scanner.resume()
 
 
 # ── Palette / Style ───────────────────────────────────────────────────────────
@@ -366,7 +376,7 @@ class GroupCard(QFrame):
 
 # ── Main Window ───────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
-    _progress_signal = pyqtSignal(str, int, int)
+    _progress_signal = pyqtSignal(str, int, int, int, int, int)
     _done_signal     = pyqtSignal(list)
     _error_signal    = pyqtSignal(str)
 
@@ -380,7 +390,8 @@ class MainWindow(QMainWindow):
         self._cards:  list[GroupCard]      = []
         self._thread: QThread | None       = None
         self._worker: ScanWorker | None    = None
-        self._scanning: bool               = False  # tracks whether a scan is active
+        self._scanning: bool               = False
+        self._paused:   bool               = False
 
         self._progress_signal.connect(self._on_progress)
         self._done_signal.connect(self._on_done)
@@ -437,6 +448,11 @@ class MainWindow(QMainWindow):
         self.btn_scan.setFixedHeight(32)
         self.btn_scan.clicked.connect(self._toggle_scan)
 
+        self.btn_pause = QPushButton("⏸  暫停")
+        self.btn_pause.setFixedHeight(32)
+        self.btn_pause.setVisible(False)
+        self.btn_pause.clicked.connect(self._toggle_pause)
+
         self.btn_reset = QPushButton("🔄  重置")
         self.btn_reset.setFixedHeight(32)
         self.btn_reset.setToolTip("停止掃描並清除所有結果，回到初始狀態")
@@ -444,18 +460,40 @@ class MainWindow(QMainWindow):
 
         opt_row.addStretch()
         opt_row.addWidget(self.btn_reset)
+        opt_row.addWidget(self.btn_pause)
         opt_row.addWidget(self.btn_scan)
         cfg_layout.addLayout(opt_row)
 
         main_layout.addWidget(cfg_box)
 
         # ── Progress ────────────────────────────────────────────────────
+        self.progress_section = QWidget()
+        prog_layout = QVBoxLayout(self.progress_section)
+        prog_layout.setContentsMargins(0, 0, 0, 0)
+        prog_layout.setSpacing(4)
+
+        # Step header row: "步驟 2/3 — 快速 Hash 比對"   "預估剩餘: 約 45 秒"
+        step_row = QHBoxLayout()
+        self.step_label = QLabel("")
+        self.step_label.setStyleSheet(
+            f"color:{ACCENT};font-weight:bold;font-size:13px;"
+        )
+        self.eta_label = QLabel("")
+        self.eta_label.setStyleSheet(f"color:{SUBTEXT};font-size:12px;")
+        step_row.addWidget(self.step_label)
+        step_row.addStretch()
+        step_row.addWidget(self.eta_label)
+        prog_layout.addLayout(step_row)
+
         self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
+        prog_layout.addWidget(self.progress_bar)
+
         self.progress_label = QLabel("")
         self.progress_label.setStyleSheet(f"color:{SUBTEXT};font-size:12px;")
-        main_layout.addWidget(self.progress_bar)
-        main_layout.addWidget(self.progress_label)
+        prog_layout.addWidget(self.progress_label)
+
+        self.progress_section.setVisible(False)
+        main_layout.addWidget(self.progress_section)
 
         # ── Summary bar ─────────────────────────────────────────────────
         self.summary_widget = QWidget()
@@ -532,11 +570,13 @@ class MainWindow(QMainWindow):
 
         self._clear_results()
         self.summary_widget.setVisible(False)
-        self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
+        self.progress_section.setVisible(True)
         self._set_scanning(True)
+        self._paused = False
 
         min_bytes = self.min_size_spin.value() * 1024
+        logger.info(f"掃描開始 — 路徑: {path}, 最小大小: {min_bytes} B")
 
         self._worker = ScanWorker(roots=[path], min_size=min_bytes)
         self._worker.progress.connect(self._on_progress)
@@ -546,28 +586,60 @@ class MainWindow(QMainWindow):
         self._thread = QThread()
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
-        # When thread finishes for ANY reason, clean up state
         self._thread.finished.connect(self._on_thread_finished)
         self._thread.start()
 
     def _cancel_scan(self):
-        """Signal worker to stop; wait for thread.finished to restore UI."""
+        """Signal worker to stop; thread.finished will restore UI."""
         if self._worker:
             self._worker.stop()
-        # Disable button while waiting for thread to actually die
         self.btn_scan.setEnabled(False)
         self.btn_scan.setText("取消中...")
+        self.btn_pause.setVisible(False)
         self.status_bar.showMessage("正在取消掃描...")
+        logger.info("掃描已取消（使用者操作）")
+
+    def _toggle_pause(self):
+        if not self._scanning or not self._worker:
+            return
+        if self._paused:
+            # Resume
+            self._worker.resume()
+            self._paused = False
+            self.btn_pause.setText("⏸  暫停")
+            self.btn_pause.setStyleSheet("")
+            self.step_label.setStyleSheet(f"color:{ACCENT};font-weight:bold;font-size:13px;")
+            self.status_bar.showMessage("掃描繼續中...")
+            logger.info("掃描已繼續")
+        else:
+            # Pause
+            self._worker.pause()
+            self._paused = True
+            self.btn_pause.setText("▶  繼續")
+            self.btn_pause.setStyleSheet(
+                f"background:{ACCENT2};color:{DARK_BG};font-weight:bold;"
+                f"border:none;border-radius:5px;padding:5px 14px;min-height:26px;"
+            )
+            self.step_label.setStyleSheet(
+                f"color:{ACCENT2};font-weight:bold;font-size:13px;"
+            )
+            self.step_label.setText(self.step_label.text() + "  ⏸ 已暫停")
+            self.status_bar.showMessage("掃描已暫停")
+            logger.info("掃描已暫停")
 
     def _reset_all(self):
         """Stop any running scan, clear all results, return to clean idle state."""
         self._kill_thread()
         self._clear_results()
         self.summary_widget.setVisible(False)
-        self.progress_bar.setVisible(False)
+        self.progress_section.setVisible(False)
         self.progress_label.setText("")
+        self.step_label.setText("")
+        self.eta_label.setText("")
         self._set_scanning(False)
+        self._paused = False
         self.status_bar.showMessage("已重置")
+        logger.info("已重置（使用者操作）")
 
     def _kill_thread(self):
         """Synchronously stop the worker thread (blocks up to 5 s)."""
@@ -575,7 +647,7 @@ class MainWindow(QMainWindow):
             self._worker.stop()
         if self._thread and self._thread.isRunning():
             self._thread.quit()
-            self._thread.wait(5000)   # wait up to 5 seconds
+            self._thread.wait(5000)
         self._thread = None
         self._worker = None
 
@@ -589,10 +661,14 @@ class MainWindow(QMainWindow):
                 f"font-weight:bold;border:none;"
                 f"border-radius:5px;padding:5px 14px;min-height:26px;"
             )
+            self.btn_pause.setVisible(True)
+            self.btn_pause.setText("⏸  暫停")
+            self.btn_pause.setStyleSheet("")
         else:
             self.btn_scan.setText("▶  開始掃描")
             self.btn_scan.setObjectName("btn_scan")
-            self.btn_scan.setStyleSheet("")   # revert to stylesheet default
+            self.btn_scan.setStyleSheet("")
+            self.btn_pause.setVisible(False)
         self.btn_scan.setEnabled(True)
 
     # ── Slots ─────────────────────────────────────────────────────────
@@ -600,16 +676,34 @@ class MainWindow(QMainWindow):
         """Called when the QThread exits — always restore idle state."""
         self._thread = None
         self._worker = None
+        self._paused = False
         if self._scanning:
-            # Thread died without _on_done (e.g. cancelled mid-scan)
+            # Thread ended without _on_done (e.g. cancelled mid-scan)
             self._set_scanning(False)
-            self.progress_bar.setVisible(False)
+            self.progress_section.setVisible(False)
             self.progress_label.setText("")
+            self.step_label.setText("")
+            self.eta_label.setText("")
             self.status_bar.showMessage("掃描已取消")
 
-    def _on_progress(self, msg: str, cur: int, total: int):
+    def _on_progress(self, msg: str, cur: int, total: int,
+                     step: int, total_steps: int, eta_secs: int):
         if not self._scanning:
             return   # stale signal from a cancelled scan — ignore
+
+        # Step header
+        step_name = STEP_NAMES.get(step, f"步驟 {step}")
+        self.step_label.setText(f"步驟 {step}/{total_steps} — {step_name}")
+
+        # ETA
+        if eta_secs == 0:
+            self.eta_label.setText("完成")
+        elif eta_secs > 0:
+            self.eta_label.setText(f"預估剩餘: {_format_eta(eta_secs)}")
+        else:
+            self.eta_label.setText("預估剩餘: 計算中...")
+
+        # Progress bar
         self.progress_label.setText(msg)
         if total > 0:
             self.progress_bar.setRange(0, total)
@@ -621,12 +715,16 @@ class MainWindow(QMainWindow):
         if not self._scanning:
             return   # stale signal after reset — ignore
         self._set_scanning(False)
-        self.progress_bar.setVisible(False)
+        self._paused = False
+        self.progress_section.setVisible(False)
         self.progress_label.setText("")
+        self.step_label.setText("")
+        self.eta_label.setText("")
         self._groups = groups
         self._cards.clear()
 
         if not groups:
+            logger.info("掃描完成 — 未發現重複檔案")
             self.status_bar.showMessage("掃描完成 — 未發現重複檔案！")
             no_dup = QLabel("✅  未發現重複檔案")
             no_dup.setStyleSheet(
@@ -638,6 +736,16 @@ class MainWindow(QMainWindow):
             return
 
         total_wasted = sum(g.wasted_bytes for g in groups)
+        logger.info(
+            f"掃描完成 — {len(groups)} 個重複群組，"
+            f"共浪費 {human_size(total_wasted)}（{total_wasted} B）"
+        )
+        for g in groups:
+            logger.debug(
+                f"  群組 hash={g.hash_value[:16]}  size={human_size(g.size)}  "
+                f"files={len(g.files)}  wasted={human_size(g.wasted_bytes)}"
+            )
+
         self.lbl_groups.setText(f"{len(groups)} 個重複群組")
         self.lbl_wasted.setText(f"浪費空間: {human_size(total_wasted)}")
         self.summary_widget.setVisible(True)
@@ -656,8 +764,10 @@ class MainWindow(QMainWindow):
         if not self._scanning:
             return   # stale signal — ignore
         self._set_scanning(False)
-        self.progress_bar.setVisible(False)
+        self._paused = False
+        self.progress_section.setVisible(False)
         self.progress_label.setText("")
+        logger.error(f"掃描錯誤: {msg}")
         QMessageBox.critical(self, "掃描錯誤", msg)
         self.status_bar.showMessage(f"錯誤: {msg}")
 
@@ -690,14 +800,18 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
+        logger.info(f"開始刪除 {len(to_delete)} 個檔案")
         success, fail = 0, 0
         for p in to_delete:
             try:
                 p.unlink()
+                logger.info(f"  刪除: {p}  ({human_size(p.stat().st_size) if p.exists() else '已刪除'})")
                 success += 1
             except OSError as e:
+                logger.warning(f"  刪除失敗: {p}  原因: {e}")
                 fail += 1
 
+        logger.info(f"刪除完成 — 成功 {success} 個，失敗 {fail} 個")
         QMessageBox.information(
             self, "刪除完成",
             f"成功刪除 {success} 個檔案" + (f"，失敗 {fail} 個" if fail else "")
