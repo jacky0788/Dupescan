@@ -380,6 +380,7 @@ class MainWindow(QMainWindow):
         self._cards:  list[GroupCard]      = []
         self._thread: QThread | None       = None
         self._worker: ScanWorker | None    = None
+        self._scanning: bool               = False  # tracks whether a scan is active
 
         self._progress_signal.connect(self._on_progress)
         self._done_signal.connect(self._on_done)
@@ -434,15 +435,15 @@ class MainWindow(QMainWindow):
         self.btn_scan = QPushButton("▶  開始掃描")
         self.btn_scan.setObjectName("btn_scan")
         self.btn_scan.setFixedHeight(32)
-        self.btn_scan.clicked.connect(self._start_scan)
+        self.btn_scan.clicked.connect(self._toggle_scan)
 
-        self.btn_stop = QPushButton("■  停止")
-        self.btn_stop.setFixedHeight(32)
-        self.btn_stop.setEnabled(False)
-        self.btn_stop.clicked.connect(self._stop_scan)
+        self.btn_reset = QPushButton("🔄  重置")
+        self.btn_reset.setFixedHeight(32)
+        self.btn_reset.setToolTip("停止掃描並清除所有結果，回到初始狀態")
+        self.btn_reset.clicked.connect(self._reset_all)
 
         opt_row.addStretch()
-        opt_row.addWidget(self.btn_stop)
+        opt_row.addWidget(self.btn_reset)
         opt_row.addWidget(self.btn_scan)
         cfg_layout.addLayout(opt_row)
 
@@ -510,6 +511,13 @@ class MainWindow(QMainWindow):
         if path:
             self.path_edit.setText(path)
 
+    def _toggle_scan(self):
+        """Single button: starts scan when idle, cancels when scanning."""
+        if self._scanning:
+            self._cancel_scan()
+        else:
+            self._start_scan()
+
     def _start_scan(self):
         path = self.path_edit.text().strip()
         if not path:
@@ -519,13 +527,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "路徑錯誤", f"路徑不存在：{path}")
             return
 
-        # Clear previous results
+        # Ensure any previous thread is fully dead before starting a new one
+        self._kill_thread()
+
         self._clear_results()
         self.summary_widget.setVisible(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
-        self.btn_scan.setEnabled(False)
-        self.btn_stop.setEnabled(True)
+        self._set_scanning(True)
 
         min_bytes = self.min_size_spin.value() * 1024
 
@@ -537,22 +546,70 @@ class MainWindow(QMainWindow):
         self._thread = QThread()
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
+        # When thread finishes for ANY reason, clean up state
+        self._thread.finished.connect(self._on_thread_finished)
         self._thread.start()
 
-    def _stop_scan(self):
+    def _cancel_scan(self):
+        """Signal worker to stop; wait for thread.finished to restore UI."""
         if self._worker:
             self._worker.stop()
-        self._reset_scan_ui()
-        self.status_bar.showMessage("掃描已停止")
+        # Disable button while waiting for thread to actually die
+        self.btn_scan.setEnabled(False)
+        self.btn_scan.setText("取消中...")
+        self.status_bar.showMessage("正在取消掃描...")
 
-    def _reset_scan_ui(self):
-        self.btn_scan.setEnabled(True)
-        self.btn_stop.setEnabled(False)
+    def _reset_all(self):
+        """Stop any running scan, clear all results, return to clean idle state."""
+        self._kill_thread()
+        self._clear_results()
+        self.summary_widget.setVisible(False)
         self.progress_bar.setVisible(False)
         self.progress_label.setText("")
+        self._set_scanning(False)
+        self.status_bar.showMessage("已重置")
+
+    def _kill_thread(self):
+        """Synchronously stop the worker thread (blocks up to 5 s)."""
+        if self._worker:
+            self._worker.stop()
+        if self._thread and self._thread.isRunning():
+            self._thread.quit()
+            self._thread.wait(5000)   # wait up to 5 seconds
+        self._thread = None
+        self._worker = None
+
+    def _set_scanning(self, scanning: bool):
+        self._scanning = scanning
+        if scanning:
+            self.btn_scan.setText("✕  取消掃描")
+            self.btn_scan.setObjectName("btn_stop_inline")
+            self.btn_scan.setStyleSheet(
+                f"background-color:{DANGER};color:{DARK_BG};"
+                f"font-weight:bold;border:none;"
+                f"border-radius:5px;padding:5px 14px;min-height:26px;"
+            )
+        else:
+            self.btn_scan.setText("▶  開始掃描")
+            self.btn_scan.setObjectName("btn_scan")
+            self.btn_scan.setStyleSheet("")   # revert to stylesheet default
+        self.btn_scan.setEnabled(True)
 
     # ── Slots ─────────────────────────────────────────────────────────
+    def _on_thread_finished(self):
+        """Called when the QThread exits — always restore idle state."""
+        self._thread = None
+        self._worker = None
+        if self._scanning:
+            # Thread died without _on_done (e.g. cancelled mid-scan)
+            self._set_scanning(False)
+            self.progress_bar.setVisible(False)
+            self.progress_label.setText("")
+            self.status_bar.showMessage("掃描已取消")
+
     def _on_progress(self, msg: str, cur: int, total: int):
+        if not self._scanning:
+            return   # stale signal from a cancelled scan — ignore
         self.progress_label.setText(msg)
         if total > 0:
             self.progress_bar.setRange(0, total)
@@ -561,7 +618,11 @@ class MainWindow(QMainWindow):
             self.progress_bar.setRange(0, 0)
 
     def _on_done(self, groups: list):
-        self._reset_scan_ui()
+        if not self._scanning:
+            return   # stale signal after reset — ignore
+        self._set_scanning(False)
+        self.progress_bar.setVisible(False)
+        self.progress_label.setText("")
         self._groups = groups
         self._cards.clear()
 
@@ -592,7 +653,11 @@ class MainWindow(QMainWindow):
         )
 
     def _on_error(self, msg: str):
-        self._reset_scan_ui()
+        if not self._scanning:
+            return   # stale signal — ignore
+        self._set_scanning(False)
+        self.progress_bar.setVisible(False)
+        self.progress_label.setText("")
         QMessageBox.critical(self, "掃描錯誤", msg)
         self.status_bar.showMessage(f"錯誤: {msg}")
 
@@ -638,5 +703,6 @@ class MainWindow(QMainWindow):
             f"成功刪除 {success} 個檔案" + (f"，失敗 {fail} 個" if fail else "")
         )
         self.status_bar.showMessage(f"已刪除 {success} 個檔案")
-        # Refresh scan
-        self._start_scan()
+        # Re-scan the same path to refresh results
+        if not self._scanning:
+            self._start_scan()
