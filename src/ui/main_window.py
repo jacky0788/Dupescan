@@ -1,6 +1,7 @@
 """DupeScan – Main Window (PyQt6, dark theme)"""
 
-import threading
+import os
+import datetime
 from pathlib import Path
 
 try:
@@ -9,10 +10,10 @@ try:
 except ImportError:
     _HZ = False
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QSize
-from PyQt6.QtGui import QColor, QFont, QIcon, QPalette, QAction
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QSize, QEvent, QPoint
+from PyQt6.QtGui import QColor, QFont, QIcon, QPalette, QAction, QPixmap
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QFileDialog, QFrame, QGroupBox,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGroupBox,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QPushButton, QProgressBar, QScrollArea,
     QSizePolicy, QSpinBox, QSplitter, QStatusBar, QTableWidget,
@@ -22,6 +23,9 @@ from PyQt6.QtWidgets import (
 from ..scanner import Scanner, STEP_NAMES, TOTAL_STEPS, _format_eta
 from ..models import DuplicateGroup, FileInfo
 from ..logger import logger
+
+# 圖片副檔名，用於懸停預覽
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif', '.ico'}
 
 
 def human_size(n: int) -> str:
@@ -148,6 +152,26 @@ QLineEdit, QSpinBox {{
 QLineEdit:focus, QSpinBox:focus {{
     border-color: {ACCENT};
 }}
+QComboBox {{
+    background-color: {PANEL_BG};
+    border: 1px solid {BORDER};
+    border-radius: 4px;
+    padding: 4px 8px;
+    color: {TEXT};
+}}
+QComboBox:focus {{
+    border-color: {ACCENT};
+}}
+QComboBox::drop-down {{
+    border: none;
+    width: 20px;
+}}
+QComboBox QAbstractItemView {{
+    background-color: {PANEL_BG};
+    border: 1px solid {BORDER};
+    color: {TEXT};
+    selection-background-color: {SURFACE};
+}}
 QProgressBar {{
     background-color: {PANEL_BG};
     border: 1px solid {BORDER};
@@ -234,13 +258,57 @@ QLabel#badge_groups {{
 """
 
 
+# ── Image Preview Popup ───────────────────────────────────────────────────────
+class ImagePreviewPopup(QLabel):
+    """滑鼠懸停時顯示的圖片預覽浮動視窗。"""
+
+    def __init__(self):
+        super().__init__(
+            None,
+            Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint,
+        )
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setStyleSheet(
+            f"background:{PANEL_BG};border:2px solid {ACCENT};"
+            f"border-radius:8px;padding:6px;"
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self._last_path: str = ""
+
+    def show_image(self, path: str, global_pos: QPoint):
+        if path == self._last_path and self.isVisible():
+            self.move(global_pos)
+            return
+        self._last_path = path
+        pix = QPixmap(path)
+        if pix.isNull():
+            self.hide()
+            return
+        pix = pix.scaled(
+            220, 220,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.setPixmap(pix)
+        self.resize(pix.width() + 16, pix.height() + 16)
+        self.move(global_pos)
+        self.show()
+
+    def reset(self):
+        self._last_path = ""
+        self.hide()
+
+
 # ── Group Card ────────────────────────────────────────────────────────────────
 class GroupCard(QFrame):
     """One card per duplicate group."""
 
-    def __init__(self, group: DuplicateGroup, index: int, parent=None):
+    def __init__(self, group: DuplicateGroup, index: int,
+                 preview_popup: ImagePreviewPopup, parent=None):
         super().__init__(parent)
         self.group = group
+        self._preview_popup = preview_popup
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setStyleSheet(f"""
             GroupCard {{
@@ -316,8 +384,13 @@ class GroupCard(QFrame):
         self.table.setShowGrid(False)
         self.table.setFixedHeight(min(38 * len(group.files) + 30, 260))
 
+        # 滑鼠追蹤，用於圖片懸停預覽
+        self.table.viewport().setMouseTracking(True)
+        self.table.viewport().installEventFilter(self)
+        # 點擊檔案名稱開啟檔案
+        self.table.cellClicked.connect(self._on_cell_clicked)
+
         self.checkboxes: list[QCheckBox] = []
-        import datetime
         for row, fi in enumerate(group.files):
             cb = QCheckBox()
             cb_widget = QWidget()
@@ -328,18 +401,60 @@ class GroupCard(QFrame):
             self.table.setCellWidget(row, 0, cb_widget)
             self.checkboxes.append(cb)
 
-            self.table.setItem(row, 1, QTableWidgetItem(fi.name))
+            # 檔案名稱欄：藍色底線，看起來可點擊
+            name_item = QTableWidgetItem(fi.name)
+            name_item.setForeground(QColor(ACCENT))
+            name_font = QFont()
+            name_font.setUnderline(True)
+            name_item.setFont(name_font)
+            name_item.setToolTip(f"點擊開啟: {fi.path}")
+            self.table.setItem(row, 1, name_item)
+
             self.table.setItem(row, 2, QTableWidgetItem(fi.folder))
             self.table.setItem(row, 3, QTableWidgetItem(human_size(fi.size)))
             mtime = datetime.datetime.fromtimestamp(fi.mtime).strftime("%Y-%m-%d %H:%M")
             self.table.setItem(row, 4, QTableWidgetItem(mtime))
             self.table.setRowHeight(row, 34)
 
-        # col 0 width
         self.table.setColumnWidth(0, 50)
         self.table.setColumnWidth(3, 80)
         self.table.setColumnWidth(4, 130)
         root.addWidget(self.table)
+
+    # ── 點擊開啟檔案 ──────────────────────────────────────────────────
+    def _on_cell_clicked(self, row: int, col: int):
+        """點擊檔案名稱欄（col=1）時，用預設程式開啟該檔案。"""
+        if col == 1 and 0 <= row < len(self.group.files):
+            fi = self.group.files[row]
+            try:
+                os.startfile(str(fi.path))
+                logger.info(f"開啟檔案: {fi.path}")
+            except Exception as e:
+                logger.warning(f"無法開啟檔案 {fi.path}: {e}")
+                QMessageBox.warning(
+                    self, "無法開啟", f"無法開啟檔案：\n{fi.path}\n\n{e}"
+                )
+
+    # ── 圖片懸停預覽 (event filter) ───────────────────────────────────
+    def eventFilter(self, obj, event):
+        if obj is self.table.viewport():
+            etype = event.type()
+            if etype == QEvent.Type.MouseMove:
+                pos = event.pos()
+                row = self.table.rowAt(pos.y())
+                col = self.table.columnAt(pos.x())
+                if row >= 0 and col == 1 and row < len(self.group.files):
+                    fi = self.group.files[row]
+                    if fi.path.suffix.lower() in IMAGE_EXTENSIONS and fi.path.exists():
+                        gpos = self.table.viewport().mapToGlobal(pos)
+                        self._preview_popup.show_image(str(fi.path), gpos + QPoint(20, 10))
+                    else:
+                        self._preview_popup.reset()
+                else:
+                    self._preview_popup.reset()
+            elif etype == QEvent.Type.Leave:
+                self._preview_popup.reset()
+        return super().eventFilter(obj, event)
 
     # ── Selection helpers ─────────────────────────────────────────────
     def _keep_first(self):
@@ -386,12 +501,16 @@ class MainWindow(QMainWindow):
         self.resize(1100, 780)
         self.setMinimumSize(800, 600)
 
-        self._groups: list[DuplicateGroup] = []
-        self._cards:  list[GroupCard]      = []
-        self._thread: QThread | None       = None
-        self._worker: ScanWorker | None    = None
-        self._scanning: bool               = False
-        self._paused:   bool               = False
+        self._all_groups: list[DuplicateGroup] = []   # 完整掃描結果（未篩選）
+        self._groups:     list[DuplicateGroup] = []   # 目前顯示中的（篩選後）
+        self._cards:      list[GroupCard]      = []
+        self._thread:     QThread | None       = None
+        self._worker:     ScanWorker | None    = None
+        self._scanning:   bool                 = False
+        self._paused:     bool                 = False
+        self._scan_id:    int                  = 0    # 防止舊 thread 的 signal 污染新掃描
+
+        self._preview_popup = ImagePreviewPopup()
 
         self._progress_signal.connect(self._on_progress)
         self._done_signal.connect(self._on_done)
@@ -472,7 +591,6 @@ class MainWindow(QMainWindow):
         prog_layout.setContentsMargins(0, 0, 0, 0)
         prog_layout.setSpacing(4)
 
-        # Step header row: "步驟 2/3 — 快速 Hash 比對"   "預估剩餘: 約 45 秒"
         step_row = QHBoxLayout()
         self.step_label = QLabel("")
         self.step_label.setStyleSheet(
@@ -524,6 +642,38 @@ class MainWindow(QMainWindow):
         self.summary_widget.setVisible(False)
         main_layout.addWidget(self.summary_widget)
 
+        # ── Filter / Sort bar ────────────────────────────────────────────
+        self.filter_sort_box = QGroupBox("篩選與排序")
+        fs_layout = QHBoxLayout(self.filter_sort_box)
+        fs_layout.setContentsMargins(10, 6, 10, 8)
+        fs_layout.setSpacing(8)
+
+        fs_layout.addWidget(QLabel("副檔名篩選:"))
+        self.ext_filter_edit = QLineEdit()
+        self.ext_filter_edit.setPlaceholderText("jpg,png… (留空顯示全部)")
+        self.ext_filter_edit.setFixedWidth(190)
+        self.ext_filter_edit.textChanged.connect(self._apply_filter_sort)
+        fs_layout.addWidget(self.ext_filter_edit)
+
+        fs_layout.addSpacing(16)
+        fs_layout.addWidget(QLabel("排序依據:"))
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItems([
+            "群組大小（大 → 小）",
+            "群組大小（小 → 大）",
+            "檔案數量（多 → 少）",
+            "檔案數量（少 → 多）",
+            "副檔名 A → Z",
+            "副檔名 Z → A",
+        ])
+        self.sort_combo.setFixedWidth(190)
+        self.sort_combo.currentIndexChanged.connect(self._apply_filter_sort)
+        fs_layout.addWidget(self.sort_combo)
+
+        fs_layout.addStretch()
+        self.filter_sort_box.setVisible(False)
+        main_layout.addWidget(self.filter_sort_box)
+
         # ── Results scroll area ─────────────────────────────────────────
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -543,6 +693,65 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("就緒")
 
+    # ── Filter / Sort / Rebuild ───────────────────────────────────────
+    def _apply_filter_sort(self):
+        """依目前的篩選與排序設定重建卡片列表。"""
+        if not self._all_groups:
+            return
+
+        # 副檔名篩選
+        ext_text = self.ext_filter_edit.text().strip().lower()
+        if ext_text:
+            exts = {e.strip().lstrip('.') for e in ext_text.split(',') if e.strip()}
+            groups = [
+                g for g in self._all_groups
+                if any(fi.path.suffix.lstrip('.').lower() in exts for fi in g.files)
+            ]
+        else:
+            groups = list(self._all_groups)
+
+        # 排序
+        idx = self.sort_combo.currentIndex()
+        sort_opts = [
+            (lambda g: g.size,                                               True),
+            (lambda g: g.size,                                               False),
+            (lambda g: len(g.files),                                         True),
+            (lambda g: len(g.files),                                         False),
+            (lambda g: g.files[0].path.suffix.lower() if g.files else '',   False),
+            (lambda g: g.files[0].path.suffix.lower() if g.files else '',   True),
+        ]
+        key_fn, reverse = sort_opts[idx]
+        groups.sort(key=key_fn, reverse=reverse)
+
+        self._rebuild_cards(groups)
+
+    def _rebuild_cards(self, groups: list[DuplicateGroup]):
+        """清除舊卡片，依 groups 重建。"""
+        # 清除預覽（避免殘留）
+        self._preview_popup.reset()
+
+        while self.results_layout.count() > 1:
+            item = self.results_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._cards.clear()
+        self._groups = groups
+
+        if not groups:
+            no_match = QLabel("無符合條件的群組")
+            no_match.setStyleSheet(
+                f"color:{SUBTEXT};font-size:15px;padding:30px;"
+                f"qproperty-alignment:AlignCenter;"
+            )
+            no_match.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.results_layout.insertWidget(0, no_match)
+            return
+
+        for i, group in enumerate(groups):
+            card = GroupCard(group, i, self._preview_popup)
+            self._cards.append(card)
+            self.results_layout.insertWidget(i, card)
+
     # ── Actions ───────────────────────────────────────────────────────
     def _browse(self):
         path = QFileDialog.getExistingDirectory(self, "選擇資料夾", "")
@@ -550,7 +759,7 @@ class MainWindow(QMainWindow):
             self.path_edit.setText(path)
 
     def _toggle_scan(self):
-        """Single button: starts scan when idle, cancels when scanning."""
+        """掃描按鈕：閒置時開始，掃描中時取消。"""
         if self._scanning:
             self._cancel_scan()
         else:
@@ -565,15 +774,20 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "路徑錯誤", f"路徑不存在：{path}")
             return
 
-        # Ensure any previous thread is fully dead before starting a new one
+        # 確保前一個 thread 完全結束
         self._kill_thread()
 
         self._clear_results()
         self.summary_widget.setVisible(False)
+        self.filter_sort_box.setVisible(False)
         self.progress_bar.setRange(0, 0)
         self.progress_section.setVisible(True)
         self._set_scanning(True)
         self._paused = False
+
+        # 每次掃描遞增 ID，讓 _on_thread_finished 能辨別舊 thread 的 stale signal
+        self._scan_id += 1
+        current_scan_id = self._scan_id
 
         min_bytes = self.min_size_spin.value() * 1024
         logger.info(f"掃描開始 — 路徑: {path}, 最小大小: {min_bytes} B")
@@ -586,11 +800,14 @@ class MainWindow(QMainWindow):
         self._thread = QThread()
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
-        self._thread.finished.connect(self._on_thread_finished)
+        # 用 lambda 捕捉 current_scan_id，防止 race condition
+        self._thread.finished.connect(
+            lambda sid=current_scan_id: self._on_thread_finished(sid)
+        )
         self._thread.start()
 
     def _cancel_scan(self):
-        """Signal worker to stop; thread.finished will restore UI."""
+        """送 stop 訊號；thread.finished 會恢復 UI。"""
         if self._worker:
             self._worker.stop()
         self.btn_scan.setEnabled(False)
@@ -603,7 +820,6 @@ class MainWindow(QMainWindow):
         if not self._scanning or not self._worker:
             return
         if self._paused:
-            # Resume
             self._worker.resume()
             self._paused = False
             self.btn_pause.setText("⏸  暫停")
@@ -612,7 +828,6 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage("掃描繼續中...")
             logger.info("掃描已繼續")
         else:
-            # Pause
             self._worker.pause()
             self._paused = True
             self.btn_pause.setText("▶  繼續")
@@ -628,10 +843,11 @@ class MainWindow(QMainWindow):
             logger.info("掃描已暫停")
 
     def _reset_all(self):
-        """Stop any running scan, clear all results, return to clean idle state."""
+        """強制停止掃描，清除所有結果，回到乾淨的閒置狀態。"""
         self._kill_thread()
         self._clear_results()
         self.summary_widget.setVisible(False)
+        self.filter_sort_box.setVisible(False)
         self.progress_section.setVisible(False)
         self.progress_label.setText("")
         self.step_label.setText("")
@@ -642,7 +858,7 @@ class MainWindow(QMainWindow):
         logger.info("已重置（使用者操作）")
 
     def _kill_thread(self):
-        """Synchronously stop the worker thread (blocks up to 5 s)."""
+        """同步停止 worker thread（最多等 5 秒）。"""
         if self._worker:
             self._worker.stop()
         if self._thread and self._thread.isRunning():
@@ -672,13 +888,20 @@ class MainWindow(QMainWindow):
         self.btn_scan.setEnabled(True)
 
     # ── Slots ─────────────────────────────────────────────────────────
-    def _on_thread_finished(self):
-        """Called when the QThread exits — always restore idle state."""
+    def _on_thread_finished(self, scan_id: int):
+        """QThread.finished 接收者。
+
+        用 scan_id 判斷是否為當前掃描的 thread，
+        避免舊 thread 的 stale signal 覆蓋新掃描的 _thread/_worker 參照。
+        """
+        if scan_id != self._scan_id:
+            return   # 舊 thread 的殘留 signal，直接忽略
+
         self._thread = None
         self._worker = None
         self._paused = False
         if self._scanning:
-            # Thread ended without _on_done (e.g. cancelled mid-scan)
+            # Thread 結束但未收到 _on_done（如取消中途結束）
             self._set_scanning(False)
             self.progress_section.setVisible(False)
             self.progress_label.setText("")
@@ -689,13 +912,11 @@ class MainWindow(QMainWindow):
     def _on_progress(self, msg: str, cur: int, total: int,
                      step: int, total_steps: int, eta_secs: int):
         if not self._scanning:
-            return   # stale signal from a cancelled scan — ignore
+            return
 
-        # Step header
         step_name = STEP_NAMES.get(step, f"步驟 {step}")
         self.step_label.setText(f"步驟 {step}/{total_steps} — {step_name}")
 
-        # ETA
         if eta_secs == 0:
             self.eta_label.setText("完成")
         elif eta_secs > 0:
@@ -703,7 +924,6 @@ class MainWindow(QMainWindow):
         else:
             self.eta_label.setText("預估剩餘: 計算中...")
 
-        # Progress bar
         self.progress_label.setText(msg)
         if total > 0:
             self.progress_bar.setRange(0, total)
@@ -713,15 +933,15 @@ class MainWindow(QMainWindow):
 
     def _on_done(self, groups: list):
         if not self._scanning:
-            return   # stale signal after reset — ignore
+            return
         self._set_scanning(False)
         self._paused = False
         self.progress_section.setVisible(False)
         self.progress_label.setText("")
         self.step_label.setText("")
         self.eta_label.setText("")
-        self._groups = groups
-        self._cards.clear()
+
+        self._all_groups = groups
 
         if not groups:
             logger.info("掃描完成 — 未發現重複檔案")
@@ -751,10 +971,9 @@ class MainWindow(QMainWindow):
         self.summary_widget.setVisible(True)
         self.btn_delete.setEnabled(True)
 
-        for i, group in enumerate(groups):
-            card = GroupCard(group, i)
-            self._cards.append(card)
-            self.results_layout.insertWidget(i, card)
+        # 顯示篩選/排序列，並套用（重建卡片）
+        self.filter_sort_box.setVisible(True)
+        self._apply_filter_sort()
 
         self.status_bar.showMessage(
             f"掃描完成 — 找到 {len(groups)} 個重複群組，浪費 {human_size(total_wasted)}"
@@ -762,7 +981,7 @@ class MainWindow(QMainWindow):
 
     def _on_error(self, msg: str):
         if not self._scanning:
-            return   # stale signal — ignore
+            return
         self._set_scanning(False)
         self._paused = False
         self.progress_section.setVisible(False)
@@ -772,12 +991,14 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(f"錯誤: {msg}")
 
     def _clear_results(self):
+        self._preview_popup.reset()
         while self.results_layout.count() > 1:
             item = self.results_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
         self._cards.clear()
         self._groups.clear()
+        self._all_groups.clear()
 
     def _delete_selected(self):
         to_delete: list[Path] = []
@@ -805,7 +1026,7 @@ class MainWindow(QMainWindow):
         for p in to_delete:
             try:
                 p.unlink()
-                logger.info(f"  刪除: {p}  ({human_size(p.stat().st_size) if p.exists() else '已刪除'})")
+                logger.info(f"  刪除: {p}")
                 success += 1
             except OSError as e:
                 logger.warning(f"  刪除失敗: {p}  原因: {e}")
@@ -817,6 +1038,5 @@ class MainWindow(QMainWindow):
             f"成功刪除 {success} 個檔案" + (f"，失敗 {fail} 個" if fail else "")
         )
         self.status_bar.showMessage(f"已刪除 {success} 個檔案")
-        # Re-scan the same path to refresh results
         if not self._scanning:
             self._start_scan()
