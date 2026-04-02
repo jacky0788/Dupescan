@@ -212,7 +212,7 @@ Qt 的 worker 包裝，`moveToThread` 到 `QThread` 執行。
 
 | 方法/屬性 | 說明 |
 |-----------|------|
-| `__init__(group, index, preview_popup)` | 建立卡片，渲染檔案清單 table；需傳入共用的 `ImagePreviewPopup` 實例 |
+| `__init__(group, index, preview_popup, font_size=13)` | 建立卡片，渲染檔案清單 table；`font_size` 控制行高（依比例縮放） |
 | `checkboxes` | 每行的 QCheckBox 清單 |
 | `selected_paths()` | 回傳所有被勾選的檔案路徑 |
 | `_on_cell_clicked(row, col)` | `cellClicked` 接收者；col=1（檔名欄）時呼叫 `os.startfile` 開啟檔案 |
@@ -259,6 +259,7 @@ Qt 的 worker 包裝，`moveToThread` 到 `QThread` 執行。
 | `_groups` | 目前顯示中的群組（套用篩選/排序後）|
 | `_cards` | 對應的 GroupCard 元件清單 |
 | `_preview_popup` | 共用的 `ImagePreviewPopup` 實例（所有 GroupCard 共享同一個）|
+| `_font_size: int` | 目前套用的 UI 文字大小（預設 13px，範圍 9–18）|
 
 **關鍵方法：**
 
@@ -273,10 +274,13 @@ Qt 的 worker 包裝，`moveToThread` 到 `QThread` 執行。
 | `_set_scanning(bool)` | 切換掃描狀態，更新按鈕文字/顏色/可見性 |
 | `_on_thread_finished(scan_id)` | `thread.finished` 接收者；比對 `scan_id` 與 `_scan_id`，若不符則忽略（防止 race condition） |
 | `_on_progress(...)` | 更新步驟標籤、ETA、進度條 |
-| `_on_done(groups)` | 儲存 `_all_groups`，顯示 filter_sort_box，呼叫 `_apply_filter_sort` 渲染卡片 |
+| `_on_done(groups)` | 儲存 `_all_groups`，顯示 filter_sort_sec，呼叫 `_apply_filter_sort` 渲染卡片；啟用 `btn_export` |
 | `_on_error(msg)` | 顯示錯誤 dialog，記錄 log |
 | `_apply_filter_sort()` | 依 ext_filter_edit 與 sort_combo 篩選/排序 `_all_groups`，呼叫 `_rebuild_cards` |
-| `_rebuild_cards(groups)` | 清除舊 GroupCard，依傳入的 groups 重新建立 |
+| `_rebuild_cards(groups)` | 清除舊 GroupCard，依傳入的 groups 重新建立（傳入 `_font_size`）|
+| `_apply_font_size(size)` | 更新 `_font_size`，重設 stylesheet，若有結果則重建卡片 |
+| `_export_report()` | 彙整副檔名統計，呼叫 `_make_pie_svg` 產生兩張圓餅圖，輸出 HTML 報表並以瀏覽器開啟 |
+| `_make_pie_svg(slices, title)` | 輸入 `[(label, value), ...]`，回傳含自動配色圓餅圖的 SVG 字串（右側附圖例）|
 | `_global_apply(method_name)` | 對 `self._cards` 中每個 GroupCard 呼叫指定選取方法 |
 | `_global_keep_newest()` … | 9 種全域快速選取，各自委派給 `_global_apply` |
 | `_global_select_all/deselect_all()` | 全域全選 / 全不選 |
