@@ -206,13 +206,49 @@ Qt 的 worker 包裝，`moveToThread` 到 `QThread` 執行。
 
 ---
 
+#### 模組層級：Condition 系統
+
+| 名稱 | 說明 |
+|------|------|
+| `CONDITIONS_DEF` | 條件定義列表 `[(id, label, key_fn, reverse, conflict_id), ...]`，共 9 條 |
+| `_COND_BY_ID` | `{id: condition_tuple}` 快速查找字典 |
+| `_rank_by_conditions(files, conditions)` | 多條件穩定排序，回傳「勝出」檔案索引；`conditions = [(id, key_fn, reverse), ...]` |
+
+條件 ID 對照表：
+
+| ID | 標籤 | 排序邏輯 | 互斥 |
+|----|------|---------|------|
+| `newer` | 修改較新 | mtime 降序 | `older` |
+| `older` | 修改較舊 | mtime 升序 | `newer` |
+| `sh_path` | 路徑較短 | path 長度升序 | `lo_path` |
+| `lo_path` | 路徑較長 | path 長度降序 | `sh_path` |
+| `shallow` | 目錄較淺 | depth 升序 | `deep` |
+| `deep` | 目錄較深 | depth 降序 | `shallow` |
+| `al_first` | 字母較前 | path 字串升序 | `al_last` |
+| `al_last` | 字母較後 | path 字串降序 | `al_first` |
+| `list_1st` | 列表第一 | 原始索引升序 | 無 |
+
+#### `class ConditionPanel(QWidget)`
+
+可重用的多條件勾選面板。條件以互斥對排列（4對 + 1單項）。
+
+| 方法 | 說明 |
+|------|------|
+| `get_active()` | 回傳 `[(id, key_fn, reverse), ...]`，依使用者勾選順序排列 |
+| `clear_all()` | 清除所有勾選並重新啟用所有選項 |
+| `_on_toggle(cond_id, state)` | 勾選時將衝突條件 disable 並移出優先清單；取消時恢復 |
+
+---
+
 #### `class GroupCard(QFrame)`
 
 每個重複群組的 UI 卡片元件。
 
 | 方法/屬性 | 說明 |
 |-----------|------|
-| `__init__(group, index, preview_popup, font_size=13)` | 建立卡片，渲染檔案清單 table；`font_size` 控制行高（依比例縮放） |
+| `__init__(group, index, preview_popup, font_size=13)` | 建立卡片，渲染檔案清單 table；`font_size` 控制行高與表格字體（依比例縮放） |
+| `_apply_conditions()` | 讀取卡片自身 ConditionPanel 的條件，呼叫 `_apply_with` |
+| `_apply_with(conditions, mode)` | 呼叫 `_rank_by_conditions` 取得勝出索引，依 mode 設定 checkbox 狀態 |
 | `checkboxes` | 每行的 QCheckBox 清單 |
 | `selected_paths()` | 回傳所有被勾選的檔案路徑 |
 | `_on_cell_clicked(row, col)` | `cellClicked` 接收者；col=1（檔名欄）時呼叫 `os.startfile` 開啟檔案 |
@@ -278,9 +314,14 @@ Qt 的 worker 包裝，`moveToThread` 到 `QThread` 執行。
 | `_on_error(msg)` | 顯示錯誤 dialog，記錄 log |
 | `_apply_filter_sort()` | 依 ext_filter_edit 與 sort_combo 篩選/排序 `_all_groups`，呼叫 `_rebuild_cards` |
 | `_rebuild_cards(groups)` | 清除舊 GroupCard，依傳入的 groups 重新建立（傳入 `_font_size`）|
-| `_apply_font_size(size)` | 更新 `_font_size`，重設 stylesheet，若有結果則重建卡片 |
+| `_apply_font_size(size)` | 更新 `_font_size`，只重建卡片（不改全局 stylesheet），僅影響群組內表格字體與行高 |
 | `_export_report()` | 彙整副檔名統計，呼叫 `_make_pie_svg` 產生兩張圓餅圖，輸出 HTML 報表並以瀏覽器開啟 |
 | `_make_pie_svg(slices, title)` | 輸入 `[(label, value), ...]`，回傳含自動配色圓餅圖的 SVG 字串（右側附圖例）|
+| `_toggle_sidebar()` | 切換側邊功能列顯示/隱藏，更新 ◀/▶ 圖示 |
+| `_toggle_filter_panel()` | 切換側邊「篩選與排序」區段展開/收折 |
+| `_toggle_qs_panel()` | 切換側邊「批量快速選取」區段展開/收折 |
+| `_global_apply_conditions()` | 取得全局 ConditionPanel 的條件，套用到所有 GroupCard |
+| `_set_global_mode(mode)` | 設定全局操作模式（保留/刪除），更新按鈕樣式 |
 | `_global_apply(method_name)` | 對 `self._cards` 中每個 GroupCard 呼叫指定選取方法 |
 | `_global_keep_newest()` … | 9 種全域快速選取，各自委派給 `_global_apply` |
 | `_global_select_all/deselect_all()` | 全域全選 / 全不選 |

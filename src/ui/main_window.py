@@ -15,10 +15,10 @@ try:
 except ImportError:
     _HZ = False
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QSize, QEvent, QPoint
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QEvent, QPoint
 from PyQt6.QtGui import QColor, QFont, QPixmap
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGroupBox,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QFrame,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QPushButton, QProgressBar, QScrollArea,
     QSizePolicy, QSpinBox, QStatusBar, QTableWidget,
@@ -44,6 +44,38 @@ def human_size(n: int) -> str:
 
 def _path_depth(p: Path) -> int:
     return len(p.parts)
+
+
+# ── Condition definitions ──────────────────────────────────────────────────────
+# (id, label, key_fn, reverse=True means higher value is "winner", conflict_id)
+CONDITIONS_DEF = [
+    ("newer",    "修改較新", lambda fi: fi.mtime,             True,  "older"),
+    ("older",    "修改較舊", lambda fi: fi.mtime,             False, "newer"),
+    ("sh_path",  "路徑較短", lambda fi: len(str(fi.path)),    False, "lo_path"),
+    ("lo_path",  "路徑較長", lambda fi: len(str(fi.path)),    True,  "sh_path"),
+    ("shallow",  "目錄較淺", lambda fi: len(fi.path.parts),   False, "deep"),
+    ("deep",     "目錄較深", lambda fi: len(fi.path.parts),   True,  "shallow"),
+    ("al_first", "字母較前", lambda fi: str(fi.path).lower(), False, "al_last"),
+    ("al_last",  "字母較後", lambda fi: str(fi.path).lower(), True,  "al_first"),
+    ("list_1st", "列表第一", None,                             False, None),
+]
+_COND_BY_ID = {c[0]: c for c in CONDITIONS_DEF}
+
+
+def _rank_by_conditions(files: list, conditions: list) -> int:
+    """
+    Stable multi-sort: apply conditions in reverse priority order.
+    Returns index of 'winner' file.
+    """
+    if not conditions:
+        return 0
+    indices = list(range(len(files)))
+    for cond_id, key_fn, rev in reversed(conditions):
+        if cond_id == "list_1st" or key_fn is None:
+            indices.sort(key=lambda i: i)
+        else:
+            indices.sort(key=lambda i: key_fn(files[i]), reverse=rev)
+    return indices[0]
 
 
 # ── Worker ────────────────────────────────────────────────────────────────────
@@ -82,10 +114,10 @@ class ScanWorker(QObject):
 DARK_BG  = "#1e1e2e"
 PANEL_BG = "#181825"
 SURFACE  = "#313244"
-ACCENT   = "#89b4fa"   # blue
-ACCENT2  = "#a6e3a1"   # green
-ACCENT3  = "#fab387"   # peach
-DANGER   = "#f38ba8"   # red
+ACCENT   = "#89b4fa"
+ACCENT2  = "#a6e3a1"
+ACCENT3  = "#fab387"
+DANGER   = "#f38ba8"
 TEXT     = "#cdd6f4"
 SUBTEXT  = "#a6adc8"
 BORDER   = "#45475a"
@@ -97,25 +129,13 @@ QMainWindow, QWidget {{
     font-family: "Segoe UI", "Inter", sans-serif;
     font-size: 13px;
 }}
-QGroupBox {{
-    border: 1px solid {BORDER};
-    border-radius: 6px;
-    margin-top: 8px;
-    padding-top: 6px;
-}}
-QGroupBox::title {{
-    subcontrol-origin: margin;
-    left: 10px;
-    color: {ACCENT};
-    font-weight: bold;
-}}
 QPushButton {{
     background-color: {SURFACE};
     color: {TEXT};
     border: 1px solid {BORDER};
     border-radius: 5px;
-    padding: 5px 14px;
-    min-height: 26px;
+    padding: 4px 10px;
+    min-height: 22px;
 }}
 QPushButton:hover {{
     background-color: #414459;
@@ -140,25 +160,11 @@ QPushButton#btn_delete {{
 }}
 QPushButton#btn_delete:hover {{ background-color: #f06090; }}
 QPushButton#btn_delete:disabled {{ background-color: {SURFACE}; color: {SUBTEXT}; }}
-QPushButton#sec_header {{
-    background-color: {SURFACE};
-    color: {ACCENT};
-    border: 1px solid {BORDER};
-    border-radius: 6px;
-    padding: 5px 12px;
-    font-weight: bold;
-    text-align: left;
-    min-height: 28px;
-}}
-QPushButton#sec_header:hover {{
-    background-color: #414459;
-    border-color: {ACCENT};
-}}
 QLineEdit, QSpinBox {{
     background-color: {PANEL_BG};
     border: 1px solid {BORDER};
     border-radius: 4px;
-    padding: 4px 8px;
+    padding: 3px 8px;
     color: {TEXT};
 }}
 QLineEdit:focus, QSpinBox:focus {{ border-color: {ACCENT}; }}
@@ -166,7 +172,7 @@ QComboBox {{
     background-color: {PANEL_BG};
     border: 1px solid {BORDER};
     border-radius: 4px;
-    padding: 4px 8px;
+    padding: 3px 8px;
     color: {TEXT};
 }}
 QComboBox:focus {{ border-color: {ACCENT}; }}
@@ -183,7 +189,7 @@ QProgressBar {{
     border-radius: 4px;
     text-align: center;
     color: {TEXT};
-    height: 18px;
+    height: 16px;
 }}
 QProgressBar::chunk {{ background-color: {ACCENT}; border-radius: 3px; }}
 QTableWidget {{
@@ -193,22 +199,16 @@ QTableWidget {{
     border-radius: 4px;
     gridline-color: {BORDER};
 }}
-QTableWidget::item {{ padding: 4px 8px; }}
+QTableWidget::item {{ padding: 3px 8px; }}
 QTableWidget::item:selected {{ background-color: {SURFACE}; color: {TEXT}; }}
 QHeaderView::section {{
     background-color: {SURFACE};
     color: {SUBTEXT};
     border: none;
     border-right: 1px solid {BORDER};
-    padding: 5px 8px;
+    padding: 4px 8px;
     font-weight: bold;
 }}
-QSplitter::handle {{
-    background-color: {BORDER};
-    height: 4px;
-    border-radius: 2px;
-}}
-QSplitter::handle:hover {{ background-color: {ACCENT}; }}
 QScrollBar:vertical {{
     background: {PANEL_BG};
     width: 10px;
@@ -221,75 +221,109 @@ QScrollBar::handle:vertical {{
 }}
 QScrollBar::handle:vertical:hover {{ background: {ACCENT}; }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; }}
+QScrollBar:horizontal {{
+    background: {PANEL_BG};
+    height: 8px;
+    border-radius: 4px;
+}}
+QScrollBar::handle:horizontal {{
+    background: {BORDER};
+    border-radius: 4px;
+    min-width: 20px;
+}}
+QScrollBar::handle:horizontal:hover {{ background: {ACCENT}; }}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0px; }}
 QStatusBar {{
     background-color: {PANEL_BG};
     border-top: 1px solid {BORDER};
     color: {SUBTEXT};
 }}
-QCheckBox {{ spacing: 6px; }}
+QCheckBox {{ spacing: 5px; }}
 QCheckBox::indicator {{
-    width: 16px; height: 16px;
+    width: 14px; height: 14px;
     border: 1px solid {BORDER};
     border-radius: 3px;
     background: {PANEL_BG};
 }}
 QCheckBox::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT}; }}
+QCheckBox:disabled {{ color: {BORDER}; }}
+QCheckBox::indicator:disabled {{ background: {SURFACE}; border-color: {BORDER}; opacity: 0.4; }}
 """
 
-_BTN_KEEP_ON  = f"background:{ACCENT};color:{DARK_BG};font-weight:bold;border:none;border-radius:4px;padding:2px 10px;font-size:11px;"
-_BTN_KEEP_OFF = f"background:{SURFACE};color:{TEXT};border:1px solid {BORDER};border-radius:4px;padding:2px 10px;font-size:11px;"
-_BTN_DEL_ON   = f"background:{DANGER};color:{DARK_BG};font-weight:bold;border:none;border-radius:4px;padding:2px 10px;font-size:11px;"
-_BTN_DEL_OFF  = f"background:{SURFACE};color:{TEXT};border:1px solid {BORDER};border-radius:4px;padding:2px 10px;font-size:11px;"
-_BTN_STRAT    = f"padding:2px 8px;font-size:11px;background:{SURFACE};border:1px solid {BORDER};border-radius:4px;color:{TEXT};"
+_BTN_KEEP_ON  = f"background:{ACCENT};color:{DARK_BG};font-weight:bold;border:none;border-radius:4px;padding:2px 8px;font-size:12px;"
+_BTN_KEEP_OFF = f"background:{SURFACE};color:{TEXT};border:1px solid {BORDER};border-radius:4px;padding:2px 8px;font-size:12px;"
+_BTN_DEL_ON   = f"background:{DANGER};color:{DARK_BG};font-weight:bold;border:none;border-radius:4px;padding:2px 8px;font-size:12px;"
+_BTN_DEL_OFF  = f"background:{SURFACE};color:{TEXT};border:1px solid {BORDER};border-radius:4px;padding:2px 8px;font-size:12px;"
 
 
-# ── CollapsibleSection ────────────────────────────────────────────────────────
-class CollapsibleSection(QFrame):
-    """折疊式 UI 區塊，點擊標題展開/收起內容。"""
+# ── ConditionPanel ────────────────────────────────────────────────────────────
+class ConditionPanel(QWidget):
+    """Multi-condition checkbox panel; tracks check-order for priority sorting."""
 
-    def __init__(self, title: str, initially_collapsed: bool = True, parent=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self._title = title
-        self._collapsed = initially_collapsed
-        self.setFrameShape(QFrame.Shape.NoFrame)
+        self._checked_order: list[str] = []
+        self._checkboxes: dict[str, QCheckBox] = {}
 
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(2)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(2, 2, 2, 4)
+        lay.setSpacing(3)
 
-        self._header = QPushButton(self._label())
-        self._header.setObjectName("sec_header")
-        self._header.clicked.connect(self._toggle)
-        outer.addWidget(self._header)
+        hint = QLabel("勾選條件（依優先順序疊加）：")
+        hint.setStyleSheet(f"color:{SUBTEXT};font-size:11px;")
+        lay.addWidget(hint)
 
-        self._body = QWidget()
-        self._body_layout = QVBoxLayout(self._body)
-        self._body_layout.setContentsMargins(0, 4, 0, 0)
-        self._body_layout.setSpacing(4)
-        self._body.setVisible(not initially_collapsed)
-        outer.addWidget(self._body)
+        pairs = [("newer", "older"), ("sh_path", "lo_path"),
+                 ("shallow", "deep"), ("al_first", "al_last")]
+        for id1, id2 in pairs:
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            row.addWidget(self._make_cb(id1))
+            row.addWidget(self._make_cb(id2))
+            row.addStretch()
+            lay.addLayout(row)
 
-    def _label(self) -> str:
-        return f"  {'▶' if self._collapsed else '▼'}  {self._title}"
+        lay.addWidget(self._make_cb("list_1st"))
 
-    def _toggle(self):
-        self._collapsed = not self._collapsed
-        self._body.setVisible(not self._collapsed)
-        self._header.setText(self._label())
+    def _make_cb(self, cond_id: str) -> QCheckBox:
+        label = _COND_BY_ID[cond_id][1]
+        cb = QCheckBox(label)
+        cb.setStyleSheet(f"font-size:12px; color:{TEXT}; min-width:75px;")
+        cb.stateChanged.connect(lambda s, cid=cond_id: self._on_toggle(cid, s))
+        self._checkboxes[cond_id] = cb
+        return cb
 
-    def add_widget(self, w: QWidget):
-        self._body_layout.addWidget(w)
+    def _on_toggle(self, cond_id: str, state: int):
+        checked = (state == Qt.CheckState.Checked.value)
+        conflict = _COND_BY_ID[cond_id][4]
+        if checked:
+            if cond_id not in self._checked_order:
+                self._checked_order.append(cond_id)
+            if conflict and conflict in self._checkboxes:
+                cb = self._checkboxes[conflict]
+                cb.blockSignals(True)
+                cb.setChecked(False)
+                cb.setEnabled(False)
+                cb.blockSignals(False)
+                if conflict in self._checked_order:
+                    self._checked_order.remove(conflict)
+        else:
+            if cond_id in self._checked_order:
+                self._checked_order.remove(cond_id)
+            if conflict and conflict in self._checkboxes:
+                self._checkboxes[conflict].setEnabled(True)
 
-    def add_layout(self, lay):
-        self._body_layout.addLayout(lay)
+    def get_active(self) -> list:
+        """Returns [(id, key_fn, reverse), ...] in checked priority order."""
+        return [(cid, _COND_BY_ID[cid][2], _COND_BY_ID[cid][3]) for cid in self._checked_order]
 
-    def expand(self):
-        if self._collapsed:
-            self._toggle()
-
-    def collapse(self):
-        if not self._collapsed:
-            self._toggle()
+    def clear_all(self):
+        for cb in self._checkboxes.values():
+            cb.blockSignals(True)
+            cb.setChecked(False)
+            cb.setEnabled(True)
+            cb.blockSignals(False)
+        self._checked_order.clear()
 
 
 # ── Image Preview Popup ───────────────────────────────────────────────────────
@@ -335,8 +369,8 @@ class GroupCard(QFrame):
         self.group = group
         self._preview_popup = preview_popup
         self._font_size = font_size
-        self._qs_mode = "keep"       # "keep" or "delete"
-        self._qs_open = False        # quick-select panel open?
+        self._qs_mode = "keep"
+        self._qs_open = False
 
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setStyleSheet(f"""
@@ -349,8 +383,8 @@ class GroupCard(QFrame):
         """)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(12, 10, 12, 10)
-        root.setSpacing(5)
+        root.setContentsMargins(12, 8, 12, 8)
+        root.setSpacing(4)
 
         # ── Header ────────────────────────────────────────────────────
         hdr = QHBoxLayout()
@@ -361,7 +395,8 @@ class GroupCard(QFrame):
         title_lbl.setStyleSheet(f"color:{TEXT};font-weight:bold;")
         wasted_lbl = QLabel(f"浪費 {human_size(group.wasted_bytes)}")
         wasted_lbl.setStyleSheet(
-            f"background:{DANGER};color:{DARK_BG};border-radius:4px;padding:2px 8px;font-weight:bold;"
+            f"background:{DANGER};color:{DARK_BG};border-radius:4px;"
+            f"padding:1px 6px;font-weight:bold;font-size:11px;"
         )
         hash_lbl = QLabel(f"Hash: {group.hash_value[:16]}…")
         hash_lbl.setStyleSheet(f"color:{SUBTEXT};font-size:11px;")
@@ -373,9 +408,9 @@ class GroupCard(QFrame):
 
         # ── Quick-select toggle button ────────────────────────────────
         self._qs_toggle_btn = QPushButton("▶  快速選取")
-        self._qs_toggle_btn.setFixedHeight(22)
+        self._qs_toggle_btn.setFixedHeight(20)
         self._qs_toggle_btn.setStyleSheet(
-            f"text-align:left;padding:2px 8px;font-size:11px;color:{SUBTEXT};"
+            f"text-align:left;padding:1px 8px;font-size:11px;color:{SUBTEXT};"
             f"background:transparent;border:none;"
         )
         self._qs_toggle_btn.clicked.connect(self._toggle_qs)
@@ -383,17 +418,16 @@ class GroupCard(QFrame):
 
         # ── Quick-select panel (hidden by default) ────────────────────
         self._qs_panel = QWidget()
-        qs_layout = QVBoxLayout(self._qs_panel)
-        qs_layout.setContentsMargins(0, 2, 0, 2)
-        qs_layout.setSpacing(4)
+        qs_lay = QVBoxLayout(self._qs_panel)
+        qs_lay.setContentsMargins(0, 2, 0, 2)
+        qs_lay.setSpacing(4)
 
         # Mode toggle row
         mode_row = QHBoxLayout()
-        mode_row.setSpacing(0)
-        lbl_mode = QLabel("操作模式:")
-        lbl_mode.setStyleSheet(f"color:{SUBTEXT};font-size:11px;")
-        mode_row.addWidget(lbl_mode)
-        mode_row.addSpacing(6)
+        mode_row.setSpacing(4)
+        lbl_m = QLabel("操作模式:")
+        lbl_m.setStyleSheet(f"color:{SUBTEXT};font-size:12px;")
+        mode_row.addWidget(lbl_m)
         self._btn_mode_keep = QPushButton("保留目標")
         self._btn_mode_keep.setFixedHeight(22)
         self._btn_mode_keep.clicked.connect(lambda: self._set_mode("keep"))
@@ -402,50 +436,48 @@ class GroupCard(QFrame):
         self._btn_mode_delete.clicked.connect(lambda: self._set_mode("delete"))
         mode_row.addWidget(self._btn_mode_keep)
         mode_row.addWidget(self._btn_mode_delete)
-        mode_row.addSpacing(16)
+        mode_row.addStretch()
+        qs_lay.addLayout(mode_row)
 
-        # Strategy buttons
-        strat_lbl = QLabel("策略:")
-        strat_lbl.setStyleSheet(f"color:{SUBTEXT};font-size:11px;")
-        mode_row.addWidget(strat_lbl)
-        for label, fn in [
-            ("修改最新", self._newest),
-            ("修改最舊", self._oldest),
-            ("路徑最短", self._shortest_path),
-            ("路徑最長", self._longest_path),
-            ("目錄最淺", self._shallowest),
-            ("目錄最深", self._deepest),
-            ("字母最前", self._alpha_first),
-            ("字母最後", self._alpha_last),
-            ("列表第一", self._first),
-        ]:
-            b = QPushButton(label)
-            b.setFixedHeight(22)
-            b.setStyleSheet(_BTN_STRAT)
-            b.clicked.connect(fn)
-            mode_row.addWidget(b)
+        # Condition checkboxes
+        self._cond_panel = ConditionPanel()
+        qs_lay.addWidget(self._cond_panel)
 
-        mode_row.addSpacing(12)
+        # Action row
+        act_row = QHBoxLayout()
+        act_row.setSpacing(4)
+        btn_apply = QPushButton("套用條件")
+        btn_apply.setFixedHeight(24)
+        btn_apply.setStyleSheet(
+            f"background:{ACCENT};color:{DARK_BG};font-weight:bold;border:none;"
+            f"border-radius:4px;padding:2px 10px;font-size:12px;"
+        )
+        btn_apply.clicked.connect(self._apply_conditions)
         sep = QLabel("|")
         sep.setStyleSheet(f"color:{BORDER};")
-        mode_row.addWidget(sep)
-        mode_row.addSpacing(4)
-
-        for label, fn in [("全選", self._select_all), ("全不選", self._deselect_all)]:
-            b = QPushButton(label)
-            b.setFixedHeight(22)
-            b.setStyleSheet(_BTN_STRAT)
-            b.clicked.connect(fn)
-            mode_row.addWidget(b)
-
-        mode_row.addStretch()
-        qs_layout.addLayout(mode_row)
+        btn_all = QPushButton("全選")
+        btn_all.setFixedHeight(24)
+        btn_all.setStyleSheet(f"padding:2px 8px;font-size:12px;background:{SURFACE};"
+                               f"border:1px solid {BORDER};border-radius:4px;color:{TEXT};")
+        btn_all.clicked.connect(self._select_all)
+        btn_none = QPushButton("全不選")
+        btn_none.setFixedHeight(24)
+        btn_none.setStyleSheet(f"padding:2px 8px;font-size:12px;background:{SURFACE};"
+                                f"border:1px solid {BORDER};border-radius:4px;color:{TEXT};")
+        btn_none.clicked.connect(self._deselect_all)
+        act_row.addWidget(btn_apply)
+        act_row.addWidget(sep)
+        act_row.addWidget(btn_all)
+        act_row.addWidget(btn_none)
+        act_row.addStretch()
+        qs_lay.addLayout(act_row)
 
         self._qs_panel.setVisible(False)
         root.addWidget(self._qs_panel)
         self._update_mode_btns()
 
         # ── File table ────────────────────────────────────────────────
+        _row_h = max(24, int(34 * font_size / 13))
         self.table = QTableWidget(len(group.files), 5)
         self.table.setHorizontalHeaderLabels(
             ["刪除", "檔案名稱", "路徑（點擊開啟資料夾）", "大小", "修改時間"]
@@ -457,11 +489,15 @@ class GroupCard(QFrame):
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
-        _row_h = max(24, int(34 * font_size / 13))
-        self.table.setFixedHeight(min(_row_h * len(group.files) + 30, int(260 * font_size / 13)))
+        self.table.setFixedHeight(min(_row_h * len(group.files) + 30,
+                                      int(260 * font_size / 13)))
         self.table.viewport().setMouseTracking(True)
         self.table.viewport().installEventFilter(self)
         self.table.cellClicked.connect(self._on_cell_clicked)
+
+        tbl_font = QFont()
+        tbl_font.setPixelSize(font_size)
+        self.table.setFont(tbl_font)
 
         self.checkboxes: list[QCheckBox] = []
         for row, fi in enumerate(group.files):
@@ -498,7 +534,7 @@ class GroupCard(QFrame):
         self.table.setColumnWidth(4, 130)
         root.addWidget(self.table)
 
-    # ── Quick-select panel toggle ─────────────────────────────────────
+    # ── Quick-select internals ────────────────────────────────────────
     def _toggle_qs(self):
         self._qs_open = not self._qs_open
         self._qs_panel.setVisible(self._qs_open)
@@ -506,7 +542,6 @@ class GroupCard(QFrame):
             "▼  快速選取" if self._qs_open else "▶  快速選取"
         )
 
-    # ── Mode management ───────────────────────────────────────────────
     def _set_mode(self, mode: str):
         self._qs_mode = mode
         self._update_mode_btns()
@@ -519,42 +554,20 @@ class GroupCard(QFrame):
             self._btn_mode_keep.setStyleSheet(_BTN_KEEP_OFF)
             self._btn_mode_delete.setStyleSheet(_BTN_DEL_ON)
 
-    # ── Strategy dispatch ─────────────────────────────────────────────
-    def _apply(self, idx: int):
-        """套用目前模式：保留→其他打勾；刪除→只打勾 idx。"""
-        if self._qs_mode == "keep":
+    def _apply_conditions(self):
+        conditions = self._cond_panel.get_active()
+        if not conditions:
+            return
+        self._apply_with(conditions, self._qs_mode)
+
+    def _apply_with(self, conditions: list, mode: str):
+        winner = _rank_by_conditions(self.group.files, conditions)
+        if mode == "keep":
             for i, cb in enumerate(self.checkboxes):
-                cb.setChecked(i != idx)
+                cb.setChecked(i != winner)
         else:
             for i, cb in enumerate(self.checkboxes):
-                cb.setChecked(i == idx)
-
-    def _newest(self):
-        self._apply(max(range(len(self.group.files)), key=lambda i: self.group.files[i].mtime))
-
-    def _oldest(self):
-        self._apply(min(range(len(self.group.files)), key=lambda i: self.group.files[i].mtime))
-
-    def _shortest_path(self):
-        self._apply(min(range(len(self.group.files)), key=lambda i: len(str(self.group.files[i].path))))
-
-    def _longest_path(self):
-        self._apply(max(range(len(self.group.files)), key=lambda i: len(str(self.group.files[i].path))))
-
-    def _shallowest(self):
-        self._apply(min(range(len(self.group.files)), key=lambda i: _path_depth(self.group.files[i].path)))
-
-    def _deepest(self):
-        self._apply(max(range(len(self.group.files)), key=lambda i: _path_depth(self.group.files[i].path)))
-
-    def _alpha_first(self):
-        self._apply(min(range(len(self.group.files)), key=lambda i: str(self.group.files[i].path).lower()))
-
-    def _alpha_last(self):
-        self._apply(max(range(len(self.group.files)), key=lambda i: str(self.group.files[i].path).lower()))
-
-    def _first(self):
-        self._apply(0)
+                cb.setChecked(i == winner)
 
     def _select_all(self):
         for cb in self.checkboxes: cb.setChecked(True)
@@ -616,8 +629,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("DupeScan — 重複檔案掃描工具")
-        self.resize(1100, 780)
-        self.setMinimumSize(800, 580)
+        self.resize(1280, 820)
+        self.setMinimumSize(880, 580)
 
         self._all_groups: list[DuplicateGroup] = []
         self._groups:     list[DuplicateGroup] = []
@@ -627,11 +640,13 @@ class MainWindow(QMainWindow):
         self._scanning:   bool                 = False
         self._paused:     bool                 = False
         self._scan_id:    int                  = 0
-        self._global_qs_mode: str              = "keep"
         self._font_size:  int                  = 13
+        self._global_qs_mode: str              = "keep"
+        self._sidebar_open:   bool             = True
+        self._sb_filter_open: bool             = True
+        self._sb_qs_open:     bool             = True
 
         self._preview_popup = ImagePreviewPopup()
-
         self._progress_signal.connect(self._on_progress)
         self._done_signal.connect(self._on_done)
         self._error_signal.connect(self._on_error)
@@ -644,17 +659,17 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         main = QVBoxLayout(central)
-        main.setContentsMargins(14, 14, 14, 14)
-        main.setSpacing(8)
+        main.setContentsMargins(10, 8, 10, 8)
+        main.setSpacing(5)
 
         # ── Title ──────────────────────────────────────────────────────
         title_lbl = QLabel("DupeScan")
         title_lbl.setStyleSheet(
-            f"font-size:22px;font-weight:bold;color:{ACCENT};letter-spacing:1px;"
+            f"font-size:20px;font-weight:bold;color:{ACCENT};letter-spacing:1px;"
         )
         main.addWidget(title_lbl)
 
-        # ── Scan config (single compact row) ───────────────────────────
+        # ── Scan config row ─────────────────────────────────────────────
         cfg_row = QHBoxLayout()
         cfg_row.setSpacing(6)
 
@@ -662,41 +677,46 @@ class MainWindow(QMainWindow):
         self.path_edit = QLineEdit()
         self.path_edit.setPlaceholderText("選擇要掃描的資料夾或磁碟機…")
         self.path_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.path_edit.setMinimumWidth(200)
         cfg_row.addWidget(self.path_edit, 1)
 
         browse_btn = QPushButton("瀏覽")
-        browse_btn.setFixedWidth(60)
+        browse_btn.setFixedWidth(58)
+        browse_btn.setFixedHeight(28)
         browse_btn.clicked.connect(self._browse)
         cfg_row.addWidget(browse_btn)
 
-        cfg_row.addSpacing(10)
-        cfg_row.addWidget(QLabel("最小:"))
+        cfg_row.addSpacing(8)
+        min_lbl = QLabel("最小:")
+        cfg_row.addWidget(min_lbl)
         self.min_size_spin = QSpinBox()
         self.min_size_spin.setRange(0, 1_000_000)
         self.min_size_spin.setValue(1)
         self.min_size_spin.setSuffix(" KB")
-        self.min_size_spin.setFixedWidth(90)
+        self.min_size_spin.setFixedWidth(88)
+        self.min_size_spin.setFixedHeight(28)
         cfg_row.addWidget(self.min_size_spin)
 
-        cfg_row.addSpacing(10)
+        cfg_row.addSpacing(8)
 
-        self.btn_reset = QPushButton("🔄")
-        self.btn_reset.setFixedWidth(36)
-        self.btn_reset.setFixedHeight(30)
+        self.btn_reset = QPushButton("重置")
+        self.btn_reset.setFixedWidth(52)
+        self.btn_reset.setFixedHeight(28)
         self.btn_reset.setToolTip("重置：停止掃描並清除所有結果")
         self.btn_reset.clicked.connect(self._reset_all)
         cfg_row.addWidget(self.btn_reset)
 
         self.btn_pause = QPushButton("⏸")
         self.btn_pause.setFixedWidth(36)
-        self.btn_pause.setFixedHeight(30)
+        self.btn_pause.setFixedHeight(28)
         self.btn_pause.setVisible(False)
         self.btn_pause.clicked.connect(self._toggle_pause)
         cfg_row.addWidget(self.btn_pause)
 
         self.btn_scan = QPushButton("▶  開始掃描")
         self.btn_scan.setObjectName("btn_scan")
-        self.btn_scan.setFixedHeight(30)
+        self.btn_scan.setFixedHeight(28)
+        self.btn_scan.setMinimumWidth(100)
         self.btn_scan.clicked.connect(self._toggle_scan)
         cfg_row.addWidget(self.btn_scan)
 
@@ -706,8 +726,7 @@ class MainWindow(QMainWindow):
         self.progress_section = QWidget()
         prog_l = QVBoxLayout(self.progress_section)
         prog_l.setContentsMargins(0, 0, 0, 0)
-        prog_l.setSpacing(3)
-
+        prog_l.setSpacing(2)
         step_row = QHBoxLayout()
         self.step_label = QLabel("")
         self.step_label.setStyleSheet(f"color:{ACCENT};font-weight:bold;font-size:13px;")
@@ -729,152 +748,255 @@ class MainWindow(QMainWindow):
         self.summary_widget = QWidget()
         sum_l = QHBoxLayout(self.summary_widget)
         sum_l.setContentsMargins(0, 0, 0, 0)
-        self.lbl_groups = QLabel("0 個重複群組")
-        self.lbl_wasted = QLabel("浪費空間: 0 B")
+        sum_l.setSpacing(5)
+
+        self.lbl_groups = QLabel("0 個群組")
+        self.lbl_wasted = QLabel("浪費: 0 B")
         for lbl, bg in [(self.lbl_groups, ACCENT), (self.lbl_wasted, DANGER)]:
             lbl.setStyleSheet(
                 f"background:{bg};color:{DARK_BG};border-radius:4px;"
-                f"padding:3px 10px;font-weight:bold;"
+                f"padding:2px 8px;font-weight:bold;font-size:11px;"
             )
-        self.btn_delete = QPushButton("🗑  刪除已勾選")
-        self.btn_delete.setObjectName("btn_delete")
-        self.btn_delete.setFixedHeight(30)
-        self.btn_delete.setEnabled(False)
-        self.btn_delete.clicked.connect(self._delete_selected)
-        self.btn_export = QPushButton("📊  匯出報表")
-        self.btn_export.setFixedHeight(30)
+            lbl.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
+        self.btn_export = QPushButton("📊 匯出報表")
+        self.btn_export.setFixedHeight(26)
         self.btn_export.setEnabled(False)
         self.btn_export.setToolTip("分析重複檔案分布並匯出 HTML 報表（含圓餅圖）")
         self.btn_export.clicked.connect(self._export_report)
+
+        self.btn_delete = QPushButton("🗑 刪除已勾選")
+        self.btn_delete.setObjectName("btn_delete")
+        self.btn_delete.setFixedHeight(26)
+        self.btn_delete.setEnabled(False)
+        self.btn_delete.clicked.connect(self._delete_selected)
+
         sum_l.addWidget(self.lbl_groups)
         sum_l.addWidget(self.lbl_wasted)
         sum_l.addStretch()
         sum_l.addWidget(self.btn_export)
-        sum_l.addSpacing(6)
         sum_l.addWidget(self.btn_delete)
         self.summary_widget.setVisible(False)
         main.addWidget(self.summary_widget)
 
-        # ── 控制面板 + 結果區 ────────────────────────────────────────────
-        # 上方：篩選/排序 + 批量選取（CollapsibleSection，高度自適應）
-        mid_widget = QWidget()
-        mid_layout = QVBoxLayout(mid_widget)
-        mid_layout.setContentsMargins(0, 0, 0, 0)
-        mid_layout.setSpacing(4)
+        # ── Content area: sidebar + results (80%) ───────────────────────
+        content_widget = QWidget()
+        content_lay = QHBoxLayout(content_widget)
+        content_lay.setContentsMargins(0, 0, 0, 0)
+        content_lay.setSpacing(0)
 
-        # Filter/Sort section
-        self.filter_sort_sec = CollapsibleSection("篩選與排序", initially_collapsed=True)
-        fs_w = QWidget()
-        fs_l = QHBoxLayout(fs_w)
-        fs_l.setContentsMargins(4, 2, 4, 2)
-        fs_l.setSpacing(8)
-        fs_l.addWidget(QLabel("副檔名篩選:"))
-        self.ext_filter_edit = QLineEdit()
-        self.ext_filter_edit.setPlaceholderText("jpg,png… (留空顯示全部)")
-        self.ext_filter_edit.setFixedWidth(180)
-        self.ext_filter_edit.textChanged.connect(self._apply_filter_sort)
-        fs_l.addWidget(self.ext_filter_edit)
-        fs_l.addSpacing(16)
-        fs_l.addWidget(QLabel("排序:"))
-        self.sort_combo = QComboBox()
-        self.sort_combo.addItems([
-            "群組大小（大→小）", "群組大小（小→大）",
-            "檔案數量（多→少）", "檔案數量（少→多）",
-            "副檔名 A→Z",       "副檔名 Z→A",
-        ])
-        self.sort_combo.setFixedWidth(180)
-        self.sort_combo.currentIndexChanged.connect(self._apply_filter_sort)
-        fs_l.addWidget(self.sort_combo)
-        fs_l.addSpacing(16)
-        fs_l.addWidget(QLabel("文字大小:"))
-        self.font_size_spin = QSpinBox()
-        self.font_size_spin.setRange(9, 18)
-        self.font_size_spin.setValue(13)
-        self.font_size_spin.setSuffix(" px")
-        self.font_size_spin.setFixedWidth(72)
-        self.font_size_spin.setToolTip("調整文字大小（較小時每頁可顯示更多群組）")
-        self.font_size_spin.valueChanged.connect(self._apply_font_size)
-        fs_l.addWidget(self.font_size_spin)
-        fs_l.addStretch()
-        self.filter_sort_sec.add_widget(fs_w)
+        # Build sidebar
+        self._sidebar_widget = self._build_sidebar()
+        content_lay.addWidget(self._sidebar_widget)
 
-        # Global quick-select section
-        self.global_select_sec = CollapsibleSection("批量快速選取", initially_collapsed=True)
-        gs_w = QWidget()
-        gs_l = QVBoxLayout(gs_w)
-        gs_l.setContentsMargins(4, 2, 4, 2)
-        gs_l.setSpacing(4)
+        # Toggle strip
+        self._sidebar_tab = QPushButton("◀")
+        self._sidebar_tab.setFixedWidth(14)
+        self._sidebar_tab.setToolTip("展開/收起功能列")
+        self._sidebar_tab.setStyleSheet(
+            f"QPushButton{{background:{SURFACE};border:none;"
+            f"border-left:1px solid {BORDER};border-right:1px solid {BORDER};"
+            f"color:{SUBTEXT};font-size:9px;border-radius:0px;padding:0px;}}"
+            f"QPushButton:hover{{background:{ACCENT};color:{DARK_BG};}}"
+        )
+        self._sidebar_tab.clicked.connect(self._toggle_sidebar)
+        content_lay.addWidget(self._sidebar_tab)
 
-        # Global mode row
-        gm_row = QHBoxLayout()
-        gm_row.setSpacing(4)
-        gm_lbl = QLabel("操作模式:")
-        gm_lbl.setStyleSheet(f"color:{SUBTEXT};font-size:12px;")
-        gm_row.addWidget(gm_lbl)
-        self._g_btn_keep = QPushButton("保留目標")
-        self._g_btn_keep.setFixedHeight(26)
-        self._g_btn_keep.clicked.connect(lambda: self._set_global_mode("keep"))
-        self._g_btn_delete = QPushButton("刪除目標")
-        self._g_btn_delete.setFixedHeight(26)
-        self._g_btn_delete.clicked.connect(lambda: self._set_global_mode("delete"))
-        gm_row.addWidget(self._g_btn_keep)
-        gm_row.addWidget(self._g_btn_delete)
-        gm_row.addSpacing(16)
-
-        strat_lbl = QLabel("策略:")
-        strat_lbl.setStyleSheet(f"color:{SUBTEXT};font-size:12px;")
-        gm_row.addWidget(strat_lbl)
-        for label, method in [
-            ("修改最新", "_newest"),  ("修改最舊", "_oldest"),
-            ("路徑最短", "_shortest_path"), ("路徑最長", "_longest_path"),
-            ("目錄最淺", "_shallowest"),    ("目錄最深", "_deepest"),
-            ("字母最前", "_alpha_first"),   ("字母最後", "_alpha_last"),
-            ("列表第一", "_first"),
-        ]:
-            b = QPushButton(label)
-            b.setFixedHeight(26)
-            b.setStyleSheet(f"padding:3px 8px;font-size:12px;background:{SURFACE};"
-                            f"border:1px solid {BORDER};border-radius:4px;color:{TEXT};")
-            b.clicked.connect(lambda _=False, m=method: self._global_apply(m))
-            gm_row.addWidget(b)
-        gm_row.addSpacing(10)
-        sep2 = QLabel("|"); sep2.setStyleSheet(f"color:{BORDER};")
-        gm_row.addWidget(sep2)
-        for label, fn in [("全部勾選", self._global_select_all), ("全部取消", self._global_deselect_all)]:
-            b = QPushButton(label)
-            b.setFixedHeight(26)
-            b.setStyleSheet(f"padding:3px 10px;font-size:12px;background:{SURFACE};"
-                            f"border:1px solid {BORDER};border-radius:4px;color:{TEXT};")
-            b.clicked.connect(fn)
-            gm_row.addWidget(b)
-        gm_row.addStretch()
-        gs_l.addLayout(gm_row)
-        self.global_select_sec.add_widget(gs_w)
-        self._update_global_mode_btns()
-
-        mid_layout.addWidget(self.filter_sort_sec)
-        mid_layout.addWidget(self.global_select_sec)
-
-        # 下方：結果捲動區（固定位置，佔滿剩餘空間）
+        # Results scroll area
         self._results_scroll = QScrollArea()
         self._results_scroll.setWidgetResizable(True)
         self._results_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.results_widget = QWidget()
         self.results_layout = QVBoxLayout(self.results_widget)
         self.results_layout.setSpacing(6)
-        self.results_layout.setContentsMargins(0, 0, 0, 0)
+        self.results_layout.setContentsMargins(8, 0, 0, 0)
         self.results_layout.addStretch()
         self._results_scroll.setWidget(self.results_widget)
+        content_lay.addWidget(self._results_scroll, 1)
 
-        main.addWidget(mid_widget, 0)       # 控制面板不拉伸
-        main.addWidget(self._results_scroll, 1)  # 結果區佔滿剩餘空間
+        main.addWidget(content_widget, 1)
 
         # ── Status bar ──────────────────────────────────────────────────
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("就緒")
 
-    # ── Global quick-select mode ──────────────────────────────────────
+    def _build_sidebar(self) -> QWidget:
+        sb = QWidget()
+        sb.setFixedWidth(248)
+        sb.setStyleSheet(
+            f"QWidget#sidebar_root{{background:{PANEL_BG};"
+            f"border-right:1px solid {BORDER};}}"
+        )
+        sb.setObjectName("sidebar_root")
+
+        sb_lay = QVBoxLayout(sb)
+        sb_lay.setContentsMargins(8, 8, 8, 8)
+        sb_lay.setSpacing(6)
+
+        hdr = QLabel("功能列")
+        hdr.setStyleSheet(
+            f"font-size:13px;font-weight:bold;color:{ACCENT};"
+            f"padding-bottom:4px;border-bottom:1px solid {BORDER};"
+        )
+        sb_lay.addWidget(hdr)
+
+        # ── Scroll area for sidebar content ───────────────────────────
+        sb_scroll = QScrollArea()
+        sb_scroll.setWidgetResizable(True)
+        sb_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        sb_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        sb_body = QWidget()
+        sb_body_lay = QVBoxLayout(sb_body)
+        sb_body_lay.setContentsMargins(0, 0, 4, 0)
+        sb_body_lay.setSpacing(6)
+
+        # ── Section: 篩選與排序 ────────────────────────────────────────
+        self._sb_filter_hdr = QPushButton("▼  篩選與排序")
+        self._sb_filter_hdr.setStyleSheet(
+            f"QPushButton{{text-align:left;background:{SURFACE};border:1px solid {BORDER};"
+            f"border-radius:4px;color:{ACCENT};font-weight:bold;padding:5px 8px;font-size:12px;}}"
+            f"QPushButton:hover{{background:#414459;}}"
+        )
+        self._sb_filter_hdr.clicked.connect(self._toggle_filter_panel)
+        sb_body_lay.addWidget(self._sb_filter_hdr)
+
+        self._sb_filter_body = QWidget()
+        fb = QVBoxLayout(self._sb_filter_body)
+        fb.setContentsMargins(4, 2, 4, 4)
+        fb.setSpacing(6)
+
+        ext_lbl = QLabel("副檔名篩選:")
+        ext_lbl.setStyleSheet(f"font-size:11px;color:{SUBTEXT};")
+        self.ext_filter_edit = QLineEdit()
+        self.ext_filter_edit.setPlaceholderText("jpg,png… (留空顯示全部)")
+        self.ext_filter_edit.textChanged.connect(self._apply_filter_sort)
+        fb.addWidget(ext_lbl)
+        fb.addWidget(self.ext_filter_edit)
+
+        sort_lbl = QLabel("排序方式:")
+        sort_lbl.setStyleSheet(f"font-size:11px;color:{SUBTEXT};")
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItems([
+            "群組大小（大→小）", "群組大小（小→大）",
+            "檔案數量（多→少）", "檔案數量（少→多）",
+            "副檔名 A→Z",        "副檔名 Z→A",
+        ])
+        self.sort_combo.currentIndexChanged.connect(self._apply_filter_sort)
+        fb.addWidget(sort_lbl)
+        fb.addWidget(self.sort_combo)
+
+        font_row = QHBoxLayout()
+        font_lbl = QLabel("文字大小:")
+        font_lbl.setStyleSheet(f"font-size:11px;color:{SUBTEXT};")
+        self.font_size_spin = QSpinBox()
+        self.font_size_spin.setRange(9, 18)
+        self.font_size_spin.setValue(13)
+        self.font_size_spin.setSuffix(" px")
+        self.font_size_spin.setFixedWidth(70)
+        self.font_size_spin.setToolTip("僅調整群組內表格的字體大小（較小時可顯示更多群組）")
+        self.font_size_spin.valueChanged.connect(self._apply_font_size)
+        font_row.addWidget(font_lbl)
+        font_row.addWidget(self.font_size_spin)
+        font_row.addStretch()
+        fb.addLayout(font_row)
+
+        sb_body_lay.addWidget(self._sb_filter_body)
+
+        # ── Section: 批量快速選取 ──────────────────────────────────────
+        self._sb_qs_hdr = QPushButton("▼  批量快速選取")
+        self._sb_qs_hdr.setStyleSheet(
+            f"QPushButton{{text-align:left;background:{SURFACE};border:1px solid {BORDER};"
+            f"border-radius:4px;color:{ACCENT};font-weight:bold;padding:5px 8px;font-size:12px;}}"
+            f"QPushButton:hover{{background:#414459;}}"
+        )
+        self._sb_qs_hdr.clicked.connect(self._toggle_qs_panel)
+        sb_body_lay.addWidget(self._sb_qs_hdr)
+
+        self._sb_qs_body = QWidget()
+        qb = QVBoxLayout(self._sb_qs_body)
+        qb.setContentsMargins(4, 2, 4, 4)
+        qb.setSpacing(4)
+
+        gm_row = QHBoxLayout()
+        gm_row.setSpacing(4)
+        gm_lbl = QLabel("操作模式:")
+        gm_lbl.setStyleSheet(f"font-size:11px;color:{SUBTEXT};")
+        gm_row.addWidget(gm_lbl)
+        self._g_btn_keep = QPushButton("保留目標")
+        self._g_btn_keep.setFixedHeight(22)
+        self._g_btn_keep.clicked.connect(lambda: self._set_global_mode("keep"))
+        self._g_btn_delete = QPushButton("刪除目標")
+        self._g_btn_delete.setFixedHeight(22)
+        self._g_btn_delete.clicked.connect(lambda: self._set_global_mode("delete"))
+        gm_row.addWidget(self._g_btn_keep)
+        gm_row.addWidget(self._g_btn_delete)
+        gm_row.addStretch()
+        qb.addLayout(gm_row)
+        self._update_global_mode_btns()
+
+        self._global_cond_panel = ConditionPanel()
+        qb.addWidget(self._global_cond_panel)
+
+        ga_row = QHBoxLayout()
+        ga_row.setSpacing(4)
+        btn_apply_all = QPushButton("套用到所有群組")
+        btn_apply_all.setFixedHeight(24)
+        btn_apply_all.setStyleSheet(
+            f"background:{ACCENT};color:{DARK_BG};font-weight:bold;border:none;"
+            f"border-radius:4px;padding:2px 8px;font-size:12px;"
+        )
+        btn_apply_all.clicked.connect(self._global_apply_conditions)
+        ga_row.addWidget(btn_apply_all)
+        ga_row.addStretch()
+        qb.addLayout(ga_row)
+
+        ga_row2 = QHBoxLayout()
+        ga_row2.setSpacing(4)
+        btn_all = QPushButton("全部勾選")
+        btn_all.setFixedHeight(24)
+        btn_all.setStyleSheet(f"padding:2px 6px;font-size:12px;background:{SURFACE};"
+                               f"border:1px solid {BORDER};border-radius:4px;color:{TEXT};")
+        btn_all.clicked.connect(self._global_select_all)
+        btn_none = QPushButton("全部取消")
+        btn_none.setFixedHeight(24)
+        btn_none.setStyleSheet(f"padding:2px 6px;font-size:12px;background:{SURFACE};"
+                                f"border:1px solid {BORDER};border-radius:4px;color:{TEXT};")
+        btn_none.clicked.connect(self._global_deselect_all)
+        ga_row2.addWidget(btn_all)
+        ga_row2.addWidget(btn_none)
+        ga_row2.addStretch()
+        qb.addLayout(ga_row2)
+
+        sb_body_lay.addWidget(self._sb_qs_body)
+        sb_body_lay.addStretch()
+
+        sb_scroll.setWidget(sb_body)
+        sb_lay.addWidget(sb_scroll, 1)
+
+        return sb
+
+    # ── Sidebar toggle ────────────────────────────────────────────────
+    def _toggle_sidebar(self):
+        self._sidebar_open = not self._sidebar_open
+        self._sidebar_widget.setVisible(self._sidebar_open)
+        self._sidebar_tab.setText("◀" if self._sidebar_open else "▶")
+
+    def _toggle_filter_panel(self):
+        self._sb_filter_open = not self._sb_filter_open
+        self._sb_filter_body.setVisible(self._sb_filter_open)
+        self._sb_filter_hdr.setText(
+            "▼  篩選與排序" if self._sb_filter_open else "▶  篩選與排序"
+        )
+
+    def _toggle_qs_panel(self):
+        self._sb_qs_open = not self._sb_qs_open
+        self._sb_qs_body.setVisible(self._sb_qs_open)
+        self._sb_qs_hdr.setText(
+            "▼  批量快速選取" if self._sb_qs_open else "▶  批量快速選取"
+        )
+
+    # ── Global quick-select ───────────────────────────────────────────
     def _set_global_mode(self, mode: str):
         self._global_qs_mode = mode
         self._update_global_mode_btns()
@@ -887,20 +1009,25 @@ class MainWindow(QMainWindow):
             self._g_btn_keep.setStyleSheet(_BTN_KEEP_OFF)
             self._g_btn_delete.setStyleSheet(_BTN_DEL_ON)
 
-    def _global_apply(self, method: str):
-        """以 _global_qs_mode 對所有卡片套用 method 策略。"""
-        mode = self._global_qs_mode
+    def _global_apply_conditions(self):
+        conditions = self._global_cond_panel.get_active()
+        if not conditions:
+            QMessageBox.information(self, "提示", "請先勾選至少一個條件。")
+            return
         for card in self._cards:
-            old = card._qs_mode
-            card._qs_mode = mode
-            getattr(card, method)()
-            card._qs_mode = old
+            card._apply_with(conditions, self._global_qs_mode)
 
     def _global_select_all(self):
         for card in self._cards: card._select_all()
 
     def _global_deselect_all(self):
         for card in self._cards: card._deselect_all()
+
+    # ── Font size (cards only) ────────────────────────────────────────
+    def _apply_font_size(self, size: int):
+        self._font_size = size
+        if self._groups:
+            self._rebuild_cards(self._groups)
 
     # ── Filter / Sort / Rebuild ───────────────────────────────────────
     def _apply_filter_sort(self):
@@ -968,8 +1095,8 @@ class MainWindow(QMainWindow):
         self._kill_thread()
         self._clear_results()
         self.summary_widget.setVisible(False)
-        self.filter_sort_sec.setVisible(False)
-        self.global_select_sec.setVisible(False)
+        self._sb_filter_body.setVisible(False)
+        self._sb_qs_body.setVisible(False)
         self.progress_bar.setRange(0, 0)
         self.progress_section.setVisible(True)
         self._set_scanning(True)
@@ -1026,8 +1153,8 @@ class MainWindow(QMainWindow):
         self._kill_thread()
         self._clear_results()
         self.summary_widget.setVisible(False)
-        self.filter_sort_sec.setVisible(False)
-        self.global_select_sec.setVisible(False)
+        self._sb_filter_body.setVisible(self._sb_filter_open)
+        self._sb_qs_body.setVisible(self._sb_qs_open)
         self.progress_section.setVisible(False)
         self.progress_label.setText("")
         self.step_label.setText("")
@@ -1052,7 +1179,7 @@ class MainWindow(QMainWindow):
             self.btn_scan.setObjectName("btn_stop_inline")
             self.btn_scan.setStyleSheet(
                 f"background-color:{DANGER};color:{DARK_BG};font-weight:bold;border:none;"
-                f"border-radius:5px;padding:5px 14px;min-height:26px;"
+                f"border-radius:5px;padding:4px 10px;min-height:22px;"
             )
             self.btn_pause.setVisible(True)
             self.btn_pause.setText("⏸")
@@ -1118,26 +1245,24 @@ class MainWindow(QMainWindow):
             return
 
         total_wasted = sum(g.wasted_bytes for g in groups)
-        logger.info(
-            f"掃描完成 — {len(groups)} 個重複群組，共浪費 {human_size(total_wasted)}"
-        )
+        logger.info(f"掃描完成 — {len(groups)} 個重複群組，共浪費 {human_size(total_wasted)}")
         for g in groups:
             logger.debug(
                 f"  群組 hash={g.hash_value[:16]}  size={human_size(g.size)}  "
                 f"files={len(g.files)}  wasted={human_size(g.wasted_bytes)}"
             )
 
-        self.lbl_groups.setText(f"{len(groups)} 個重複群組")
-        self.lbl_wasted.setText(f"浪費空間: {human_size(total_wasted)}")
+        self.lbl_groups.setText(f"{len(groups)} 個群組")
+        self.lbl_wasted.setText(f"浪費: {human_size(total_wasted)}")
         self.summary_widget.setVisible(True)
         self.btn_delete.setEnabled(True)
         self.btn_export.setEnabled(True)
 
-        # 顯示折疊式控制面板（預設收起）
-        self.filter_sort_sec.setVisible(True)
-        self.global_select_sec.setVisible(True)
-        self._apply_filter_sort()
+        # Restore sidebar section visibility
+        self._sb_filter_body.setVisible(self._sb_filter_open)
+        self._sb_qs_body.setVisible(self._sb_qs_open)
 
+        self._apply_filter_sort()
         self.status_bar.showMessage(
             f"掃描完成 — 找到 {len(groups)} 個重複群組，浪費 {human_size(total_wasted)}"
         )
@@ -1203,17 +1328,8 @@ class MainWindow(QMainWindow):
         if not self._scanning:
             self._start_scan()
 
-    # ── Font size ─────────────────────────────────────────────────────
-    def _apply_font_size(self, size: int):
-        self._font_size = size
-        new_style = STYLE.replace("font-size: 13px", f"font-size: {size}px")
-        self.setStyleSheet(new_style)
-        if self._groups:
-            self._rebuild_cards(self._groups)
-
     # ── Export Report ─────────────────────────────────────────────────
     def _make_pie_svg(self, slices: list, title: str = "") -> str:
-        """slices: [(label, value), ...] 自動配色，回傳 SVG 字串"""
         COLORS = [
             "#89b4fa", "#a6e3a1", "#fab387", "#f38ba8", "#cba6f7",
             "#94e2d5", "#f9e2af", "#89dceb", "#b4befe", "#eba0ac",
@@ -1225,14 +1341,12 @@ class MainWindow(QMainWindow):
 
         W, H = 520, 340
         cx, cy, r = 165, 170, 140
-
         lines = [f'<svg width="{W}" height="{H}" xmlns="http://www.w3.org/2000/svg">']
         if title:
             lines.append(
-                f'<text x="{W // 2}" y="18" text-anchor="middle" '
+                f'<text x="{W // 2}" y="16" text-anchor="middle" '
                 f'font-size="13" fill="#cdd6f4" font-weight="bold">{title}</text>'
             )
-
         start = -math.pi / 2
         legend_y = 36
         for i, (label, value) in enumerate(slices):
@@ -1248,10 +1362,7 @@ class MainWindow(QMainWindow):
             large = 1 if ang > math.pi else 0
             path = (f"M{cx},{cy} L{x1:.1f},{y1:.1f} "
                     f"A{r},{r} 0 {large},1 {x2:.1f},{y2:.1f} Z")
-            lines.append(
-                f'<path d="{path}" fill="{color}" '
-                f'stroke="#1e1e2e" stroke-width="1.5"/>'
-            )
+            lines.append(f'<path d="{path}" fill="{color}" stroke="#1e1e2e" stroke-width="1.5"/>')
             pct = value / total * 100
             if pct > 4:
                 mid = start + ang / 2
@@ -1259,10 +1370,8 @@ class MainWindow(QMainWindow):
                 ly = cy + r * 0.65 * math.sin(mid)
                 lines.append(
                     f'<text x="{lx:.1f}" y="{ly:.1f}" text-anchor="middle" '
-                    f'dominant-baseline="middle" font-size="10" fill="white">'
-                    f'{pct:.1f}%</text>'
+                    f'dominant-baseline="middle" font-size="10" fill="white">{pct:.1f}%</text>'
                 )
-            # Legend on the right
             lines.append(
                 f'<rect x="325" y="{legend_y - 10}" width="13" height="13" '
                 f'fill="{color}" rx="2"/>'
@@ -1283,48 +1392,39 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "提示", "請先執行掃描以取得資料。")
             return
 
-        # ── Aggregate by extension ────────────────────────────────────
         ext_data: dict = defaultdict(lambda: {
             "group_hashes": set(), "files": 0, "total_size": 0, "wasted": 0
         })
-
         for g in self._all_groups:
-            # Determine primary extension (most common in group)
             ext_count: dict[str, int] = {}
             for fi in g.files:
                 ext = fi.path.suffix.lower() or "(無副檔名)"
                 ext_count[ext] = ext_count.get(ext, 0) + 1
             primary = max(ext_count, key=lambda e: ext_count[e])
-
             for fi in g.files:
                 ext = fi.path.suffix.lower() or "(無副檔名)"
                 ext_data[ext]["group_hashes"].add(g.hash_value)
                 ext_data[ext]["files"] += 1
                 ext_data[ext]["total_size"] += fi.size
-
             ext_data[primary]["wasted"] += g.wasted_bytes
 
-        # Convert sets → counts, sort by wasted desc
-        rows = []
-        for ext, d in ext_data.items():
-            rows.append((ext, {
-                "groups":     len(d["group_hashes"]),
-                "files":      d["files"],
-                "total_size": d["total_size"],
-                "wasted":     d["wasted"],
-            }))
-        rows.sort(key=lambda x: x[1]["wasted"], reverse=True)
+        rows = sorted(
+            [(ext, {"groups": len(d["group_hashes"]), "files": d["files"],
+                    "total_size": d["total_size"], "wasted": d["wasted"]})
+             for ext, d in ext_data.items()],
+            key=lambda x: x[1]["wasted"], reverse=True
+        )
 
-        total_groups  = len(self._all_groups)
-        total_files   = sum(len(g.files) for g in self._all_groups)
-        total_size    = sum(g.size * len(g.files) for g in self._all_groups)
-        total_wasted  = sum(g.wasted_bytes for g in self._all_groups)
+        total_groups = len(self._all_groups)
+        total_files  = sum(len(g.files) for g in self._all_groups)
+        total_size   = sum(g.size * len(g.files) for g in self._all_groups)
+        total_wasted = sum(g.wasted_bytes for g in self._all_groups)
 
-        pie_wasted_svg = self._make_pie_svg(
+        pie_wasted  = self._make_pie_svg(
             [(ext, d["wasted"]) for ext, d in rows if d["wasted"] > 0],
             "浪費空間分布（依副檔名）"
         )
-        pie_count_svg = self._make_pie_svg(
+        pie_count   = self._make_pie_svg(
             [(ext, d["files"]) for ext, d in rows if d["files"] > 0],
             "重複檔案數量分布（依副檔名）"
         )
@@ -1332,99 +1432,62 @@ class MainWindow(QMainWindow):
         scan_path = self.path_edit.text()
         scan_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # ── Build HTML ────────────────────────────────────────────────
-        table_rows_html = ""
+        tbl_rows = ""
         for ext, d in rows:
             pct = d["wasted"] / total_wasted * 100 if total_wasted > 0 else 0
-            bar_w = min(pct, 100)
-            table_rows_html += (
-                f"<tr>"
-                f"<td><strong>{ext}</strong></td>"
-                f"<td>{d['groups']}</td>"
-                f"<td>{d['files']}</td>"
+            tbl_rows += (
+                f"<tr><td><strong>{ext}</strong></td>"
+                f"<td>{d['groups']}</td><td>{d['files']}</td>"
                 f"<td>{human_size(d['total_size'])}</td>"
                 f"<td style='color:#f38ba8'>{human_size(d['wasted'])}</td>"
-                f"<td>"
-                f"<div style='display:flex;align-items:center;gap:8px;'>"
-                f"<div class='pct-bar'><div class='pct-fill' "
-                f"style='width:{bar_w:.1f}%'></div></div>"
-                f"<span>{pct:.1f}%</span></div>"
-                f"</td></tr>\n"
+                f"<td><div style='display:flex;align-items:center;gap:8px;'>"
+                f"<div class='pb'><div class='pf' style='width:{min(pct,100):.1f}%'></div></div>"
+                f"<span>{pct:.1f}%</span></div></td></tr>\n"
             )
 
         html = f"""<!DOCTYPE html>
-<html lang="zh-TW">
-<head>
-<meta charset="UTF-8">
-<title>DupeScan 分析報表</title>
+<html lang="zh-TW"><head><meta charset="UTF-8"><title>DupeScan 分析報表</title>
 <style>
 *{{box-sizing:border-box;}}
-body{{font-family:"Segoe UI",sans-serif;background:#1e1e2e;color:#cdd6f4;
-     margin:0;padding:24px;}}
+body{{font-family:"Segoe UI",sans-serif;background:#1e1e2e;color:#cdd6f4;margin:0;padding:24px;}}
 h1{{color:#89b4fa;font-size:22px;margin-bottom:4px;}}
-h2{{color:#89b4fa;font-size:15px;margin-top:28px;
-    border-bottom:1px solid #45475a;padding-bottom:6px;}}
+h2{{color:#89b4fa;font-size:15px;margin-top:28px;border-bottom:1px solid #45475a;padding-bottom:6px;}}
 .meta{{color:#a6adc8;font-size:12px;margin-bottom:20px;}}
-.summary-grid{{display:grid;grid-template-columns:repeat(4,1fr);
-               gap:12px;margin-bottom:24px;}}
-.stat-card{{background:#181825;border:1px solid #45475a;border-radius:8px;
-            padding:16px;text-align:center;}}
-.stat-value{{font-size:20px;font-weight:bold;color:#89b4fa;}}
-.stat-label{{font-size:11px;color:#a6adc8;margin-top:4px;}}
+.grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:24px;}}
+.card{{background:#181825;border:1px solid #45475a;border-radius:8px;padding:16px;text-align:center;}}
+.val{{font-size:20px;font-weight:bold;color:#89b4fa;}}
+.lbl{{font-size:11px;color:#a6adc8;margin-top:4px;}}
 .charts{{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:8px;}}
-.chart-box{{background:#181825;border:1px solid #45475a;
-            border-radius:8px;padding:14px;}}
-table{{width:100%;border-collapse:collapse;margin-top:8px;font-size:13px;}}
-th{{background:#313244;padding:9px 12px;text-align:left;
-    font-size:11px;color:#a6adc8;font-weight:600;}}
+.cbox{{background:#181825;border:1px solid #45475a;border-radius:8px;padding:14px;}}
+table{{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px;}}
+th{{background:#313244;padding:9px 12px;text-align:left;font-size:11px;color:#a6adc8;}}
 td{{padding:8px 12px;border-bottom:1px solid #313244;}}
 tr:hover td{{background:#252535;}}
-.pct-bar{{background:#313244;border-radius:3px;height:8px;width:110px;}}
-.pct-fill{{background:#89b4fa;height:8px;border-radius:3px;}}
+.pb{{background:#313244;border-radius:3px;height:8px;width:110px;}}
+.pf{{background:#89b4fa;height:8px;border-radius:3px;}}
 footer{{color:#585b70;font-size:11px;margin-top:30px;}}
-</style>
-</head>
-<body>
+</style></head><body>
 <h1>DupeScan 分析報表</h1>
 <div class="meta">掃描路徑：{scan_path}&nbsp;&nbsp;|&nbsp;&nbsp;產生時間：{scan_time}</div>
-
-<div class="summary-grid">
-  <div class="stat-card">
-    <div class="stat-value">{total_groups}</div>
-    <div class="stat-label">重複群組數</div>
-  </div>
-  <div class="stat-card">
-    <div class="stat-value">{total_files}</div>
-    <div class="stat-label">重複檔案總數</div>
-  </div>
-  <div class="stat-card">
-    <div class="stat-value" style="color:#f38ba8">{human_size(total_wasted)}</div>
-    <div class="stat-label">可釋放空間</div>
-  </div>
-  <div class="stat-card">
-    <div class="stat-value">{human_size(total_size)}</div>
-    <div class="stat-label">重複檔案總大小</div>
-  </div>
+<div class="grid">
+  <div class="card"><div class="val">{total_groups}</div><div class="lbl">重複群組數</div></div>
+  <div class="card"><div class="val">{total_files}</div><div class="lbl">重複檔案總數</div></div>
+  <div class="card"><div class="val" style="color:#f38ba8">{human_size(total_wasted)}</div><div class="lbl">可釋放空間</div></div>
+  <div class="card"><div class="val">{human_size(total_size)}</div><div class="lbl">重複檔案總大小</div></div>
 </div>
-
 <h2>重複檔案分布圖</h2>
 <div class="charts">
-  <div class="chart-box">{pie_wasted_svg}</div>
-  <div class="chart-box">{pie_count_svg}</div>
+  <div class="cbox">{pie_wasted}</div>
+  <div class="cbox">{pie_count}</div>
 </div>
-
 <h2>副檔名詳細分析</h2>
-<table>
-  <thead><tr>
-    <th>副檔名</th><th>群組數</th><th>重複檔案數</th>
-    <th>總大小</th><th>可釋放空間</th><th>占總浪費空間</th>
-  </tr></thead>
-  <tbody>
-{table_rows_html}  </tbody>
-</table>
+<table><thead><tr>
+  <th>副檔名</th><th>群組數</th><th>重複檔案數</th>
+  <th>總大小</th><th>可釋放空間</th><th>占總浪費空間</th>
+</tr></thead><tbody>
+{tbl_rows}</tbody></table>
 <footer>由 DupeScan 自動產生</footer>
-</body>
-</html>"""
+</body></html>"""
 
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".html", delete=False,
