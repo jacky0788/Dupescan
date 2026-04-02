@@ -1,6 +1,7 @@
 """DupeScan – Main Window (PyQt6, dark theme)"""
 
 import os
+import subprocess
 import datetime
 from pathlib import Path
 
@@ -36,6 +37,11 @@ def human_size(n: int) -> str:
             return f"{n:.1f} {unit}"
         n /= 1024
     return f"{n:.1f} PB"
+
+
+def _path_depth(p: Path) -> int:
+    """回傳路徑的目錄層數（parts 數量，包含磁碟機代號）。"""
+    return len(p.parts)
 
 
 # ── Worker ────────────────────────────────────────────────────────────────────
@@ -80,6 +86,7 @@ PANEL_BG    = "#181825"
 SURFACE     = "#313244"
 ACCENT      = "#89b4fa"   # blue
 ACCENT2     = "#a6e3a1"   # green
+ACCENT3     = "#fab387"   # peach – 路徑欄可點擊色
 DANGER      = "#f38ba8"   # red
 TEXT        = "#cdd6f4"
 SUBTEXT     = "#a6adc8"
@@ -257,6 +264,18 @@ QLabel#badge_groups {{
 }}
 """
 
+# ── Quick-select button style helpers ─────────────────────────────────────────
+_QS_BASE = (
+    f"padding:2px 8px;font-size:11px;"
+    f"background:{SURFACE};border:1px solid {BORDER};"
+    f"border-radius:4px;color:{TEXT};"
+)
+_QS_GLOBAL = (
+    f"padding:3px 10px;font-size:12px;"
+    f"background:{SURFACE};border:1px solid {BORDER};"
+    f"border-radius:4px;color:{TEXT};"
+)
+
 
 # ── Image Preview Popup ───────────────────────────────────────────────────────
 class ImagePreviewPopup(QLabel):
@@ -321,7 +340,7 @@ class GroupCard(QFrame):
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 10, 12, 10)
-        root.setSpacing(6)
+        root.setSpacing(5)
 
         # ── Header ────────────────────────────────────────────────────
         hdr = QHBoxLayout()
@@ -344,32 +363,49 @@ class GroupCard(QFrame):
         hdr.addWidget(wasted_lbl)
         root.addLayout(hdr)
 
-        # ── Quick-select row ──────────────────────────────────────────
-        qs = QHBoxLayout()
-        qs.addWidget(QLabel("快速選取:"))
+        # ── Quick-select Row 1：基本 ───────────────────────────────────
+        qs1 = QHBoxLayout()
+        qs1.setSpacing(4)
+        qs1.addWidget(QLabel("選取:"))
         for label, fn in [
-            ("保留最新", self._keep_newest),
-            ("保留最舊", self._keep_oldest),
-            ("保留第一個", self._keep_first),
+            ("修改最新", self._keep_newest),
+            ("修改最舊", self._keep_oldest),
+            ("路徑最短", self._keep_shortest_path),
+            ("路徑最長", self._keep_longest_path),
+            ("目錄最淺", self._keep_shallowest),
+            ("目錄最深", self._keep_deepest),
+            ("字母最前", self._keep_alpha_first),
+            ("字母最後", self._keep_alpha_last),
+            ("保留第一", self._keep_first),
+        ]:
+            btn = QPushButton(label)
+            btn.setFixedHeight(22)
+            btn.setStyleSheet(_QS_BASE)
+            btn.clicked.connect(fn)
+            qs1.addWidget(btn)
+
+        # 分隔
+        sep = QLabel("|")
+        sep.setStyleSheet(f"color:{BORDER};")
+        qs1.addWidget(sep)
+
+        for label, fn in [
             ("全選", self._select_all),
             ("全不選", self._deselect_all),
         ]:
             btn = QPushButton(label)
-            btn.setFixedHeight(24)
-            btn.setStyleSheet(
-                f"padding:2px 10px;font-size:12px;"
-                f"background:{SURFACE};border:1px solid {BORDER};"
-                f"border-radius:4px;color:{TEXT};"
-            )
+            btn.setFixedHeight(22)
+            btn.setStyleSheet(_QS_BASE)
             btn.clicked.connect(fn)
-            qs.addWidget(btn)
-        qs.addStretch()
-        root.addLayout(qs)
+            qs1.addWidget(btn)
+
+        qs1.addStretch()
+        root.addLayout(qs1)
 
         # ── File table ────────────────────────────────────────────────
         self.table = QTableWidget(len(group.files), 5)
         self.table.setHorizontalHeaderLabels(
-            ["刪除", "檔案名稱", "路徑", "大小", "修改時間"]
+            ["刪除", "檔案名稱", "路徑（點擊開啟資料夾）", "大小", "修改時間"]
         )
         self.table.horizontalHeader().setSectionResizeMode(
             2, QHeaderView.ResizeMode.Stretch
@@ -387,7 +423,7 @@ class GroupCard(QFrame):
         # 滑鼠追蹤，用於圖片懸停預覽
         self.table.viewport().setMouseTracking(True)
         self.table.viewport().installEventFilter(self)
-        # 點擊檔案名稱開啟檔案
+        # 點擊欄位處理
         self.table.cellClicked.connect(self._on_cell_clicked)
 
         self.checkboxes: list[QCheckBox] = []
@@ -401,16 +437,24 @@ class GroupCard(QFrame):
             self.table.setCellWidget(row, 0, cb_widget)
             self.checkboxes.append(cb)
 
-            # 檔案名稱欄：藍色底線，看起來可點擊
+            # col 1：檔案名稱 — 藍色底線，點擊開啟檔案
             name_item = QTableWidgetItem(fi.name)
             name_item.setForeground(QColor(ACCENT))
             name_font = QFont()
             name_font.setUnderline(True)
             name_item.setFont(name_font)
-            name_item.setToolTip(f"點擊開啟: {fi.path}")
+            name_item.setToolTip(f"點擊以預設程式開啟: {fi.path}")
             self.table.setItem(row, 1, name_item)
 
-            self.table.setItem(row, 2, QTableWidgetItem(fi.folder))
+            # col 2：路徑 — 橘色底線，點擊在 Explorer 中定位
+            path_item = QTableWidgetItem(fi.folder)
+            path_item.setForeground(QColor(ACCENT3))
+            path_font = QFont()
+            path_font.setUnderline(True)
+            path_item.setFont(path_font)
+            path_item.setToolTip(f"點擊在檔案總管中定位: {fi.path}")
+            self.table.setItem(row, 2, path_item)
+
             self.table.setItem(row, 3, QTableWidgetItem(human_size(fi.size)))
             mtime = datetime.datetime.fromtimestamp(fi.mtime).strftime("%Y-%m-%d %H:%M")
             self.table.setItem(row, 4, QTableWidgetItem(mtime))
@@ -421,19 +465,29 @@ class GroupCard(QFrame):
         self.table.setColumnWidth(4, 130)
         root.addWidget(self.table)
 
-    # ── 點擊開啟檔案 ──────────────────────────────────────────────────
+    # ── 點擊欄位處理 ──────────────────────────────────────────────────
     def _on_cell_clicked(self, row: int, col: int):
-        """點擊檔案名稱欄（col=1）時，用預設程式開啟該檔案。"""
-        if col == 1 and 0 <= row < len(self.group.files):
-            fi = self.group.files[row]
+        if not (0 <= row < len(self.group.files)):
+            return
+        fi = self.group.files[row]
+
+        if col == 1:
+            # 用預設程式開啟檔案
             try:
                 os.startfile(str(fi.path))
                 logger.info(f"開啟檔案: {fi.path}")
             except Exception as e:
                 logger.warning(f"無法開啟檔案 {fi.path}: {e}")
-                QMessageBox.warning(
-                    self, "無法開啟", f"無法開啟檔案：\n{fi.path}\n\n{e}"
-                )
+                QMessageBox.warning(self, "無法開啟", f"無法開啟檔案：\n{fi.path}\n\n{e}")
+
+        elif col == 2:
+            # 在 Windows 檔案總管中定位並選取該檔案
+            try:
+                subprocess.Popen(f'explorer /select,"{fi.path}"', shell=True)
+                logger.info(f"在檔案總管定位: {fi.path}")
+            except Exception as e:
+                logger.warning(f"無法開啟資料夾 {fi.path}: {e}")
+                QMessageBox.warning(self, "無法開啟", f"無法開啟資料夾：\n{fi.folder}\n\n{e}")
 
     # ── 圖片懸停預覽 (event filter) ───────────────────────────────────
     def eventFilter(self, obj, event):
@@ -457,21 +511,45 @@ class GroupCard(QFrame):
         return super().eventFilter(obj, event)
 
     # ── Selection helpers ─────────────────────────────────────────────
-    def _keep_first(self):
+    def _keep_index(self, keep: int):
+        """保留索引 keep 的檔案，其餘全打勾。"""
         for i, cb in enumerate(self.checkboxes):
-            cb.setChecked(i != 0)
+            cb.setChecked(i != keep)
+
+    def _keep_first(self):
+        self._keep_index(0)
 
     def _keep_newest(self):
-        newest = max(range(len(self.group.files)),
-                     key=lambda i: self.group.files[i].mtime)
-        for i, cb in enumerate(self.checkboxes):
-            cb.setChecked(i != newest)
+        self._keep_index(max(range(len(self.group.files)),
+                            key=lambda i: self.group.files[i].mtime))
 
     def _keep_oldest(self):
-        oldest = min(range(len(self.group.files)),
-                     key=lambda i: self.group.files[i].mtime)
-        for i, cb in enumerate(self.checkboxes):
-            cb.setChecked(i != oldest)
+        self._keep_index(min(range(len(self.group.files)),
+                            key=lambda i: self.group.files[i].mtime))
+
+    def _keep_shortest_path(self):
+        self._keep_index(min(range(len(self.group.files)),
+                            key=lambda i: len(str(self.group.files[i].path))))
+
+    def _keep_longest_path(self):
+        self._keep_index(max(range(len(self.group.files)),
+                            key=lambda i: len(str(self.group.files[i].path))))
+
+    def _keep_shallowest(self):
+        self._keep_index(min(range(len(self.group.files)),
+                            key=lambda i: _path_depth(self.group.files[i].path)))
+
+    def _keep_deepest(self):
+        self._keep_index(max(range(len(self.group.files)),
+                            key=lambda i: _path_depth(self.group.files[i].path)))
+
+    def _keep_alpha_first(self):
+        self._keep_index(min(range(len(self.group.files)),
+                            key=lambda i: str(self.group.files[i].path).lower()))
+
+    def _keep_alpha_last(self):
+        self._keep_index(max(range(len(self.group.files)),
+                            key=lambda i: str(self.group.files[i].path).lower()))
 
     def _select_all(self):
         for cb in self.checkboxes:
@@ -618,8 +696,8 @@ class MainWindow(QMainWindow):
         sum_layout = QHBoxLayout(self.summary_widget)
         sum_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.lbl_groups  = QLabel("0 個重複群組")
-        self.lbl_wasted  = QLabel("浪費空間: 0 B")
+        self.lbl_groups = QLabel("0 個重複群組")
+        self.lbl_wasted = QLabel("浪費空間: 0 B")
         self.lbl_groups.setStyleSheet(
             f"background:{ACCENT};color:{DARK_BG};border-radius:4px;"
             f"padding:3px 10px;font-weight:bold;"
@@ -674,6 +752,54 @@ class MainWindow(QMainWindow):
         self.filter_sort_box.setVisible(False)
         main_layout.addWidget(self.filter_sort_box)
 
+        # ── Global Quick-Select panel ────────────────────────────────────
+        self.global_select_box = QGroupBox("批量快速選取（對所有顯示中的群組同時套用）")
+        gqs_outer = QVBoxLayout(self.global_select_box)
+        gqs_outer.setContentsMargins(10, 6, 10, 8)
+        gqs_outer.setSpacing(4)
+
+        # Row 1：保留策略
+        gqs1 = QHBoxLayout()
+        gqs1.setSpacing(6)
+        gqs1.addWidget(QLabel("各群組保留:"))
+        for label, fn in [
+            ("修改最新", self._global_keep_newest),
+            ("修改最舊", self._global_keep_oldest),
+            ("路徑最短", self._global_keep_shortest_path),
+            ("路徑最長", self._global_keep_longest_path),
+            ("目錄最淺", self._global_keep_shallowest),
+            ("目錄最深", self._global_keep_deepest),
+            ("字母最前", self._global_keep_alpha_first),
+            ("字母最後", self._global_keep_alpha_last),
+            ("列表第一", self._global_keep_first),
+        ]:
+            btn = QPushButton(label)
+            btn.setFixedHeight(26)
+            btn.setStyleSheet(_QS_GLOBAL)
+            btn.clicked.connect(fn)
+            gqs1.addWidget(btn)
+        gqs1.addStretch()
+        gqs_outer.addLayout(gqs1)
+
+        # Row 2：全選 / 全不選
+        gqs2 = QHBoxLayout()
+        gqs2.setSpacing(6)
+        gqs2.addWidget(QLabel("全部:"))
+        for label, fn in [
+            ("全部勾選", self._global_select_all),
+            ("全部取消", self._global_deselect_all),
+        ]:
+            btn = QPushButton(label)
+            btn.setFixedHeight(26)
+            btn.setStyleSheet(_QS_GLOBAL)
+            btn.clicked.connect(fn)
+            gqs2.addWidget(btn)
+        gqs2.addStretch()
+        gqs_outer.addLayout(gqs2)
+
+        self.global_select_box.setVisible(False)
+        main_layout.addWidget(self.global_select_box)
+
         # ── Results scroll area ─────────────────────────────────────────
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -699,7 +825,6 @@ class MainWindow(QMainWindow):
         if not self._all_groups:
             return
 
-        # 副檔名篩選
         ext_text = self.ext_filter_edit.text().strip().lower()
         if ext_text:
             exts = {e.strip().lstrip('.') for e in ext_text.split(',') if e.strip()}
@@ -710,7 +835,6 @@ class MainWindow(QMainWindow):
         else:
             groups = list(self._all_groups)
 
-        # 排序
         idx = self.sort_combo.currentIndex()
         sort_opts = [
             (lambda g: g.size,                                               True),
@@ -727,7 +851,6 @@ class MainWindow(QMainWindow):
 
     def _rebuild_cards(self, groups: list[DuplicateGroup]):
         """清除舊卡片，依 groups 重建。"""
-        # 清除預覽（避免殘留）
         self._preview_popup.reset()
 
         while self.results_layout.count() > 1:
@@ -752,6 +875,24 @@ class MainWindow(QMainWindow):
             self._cards.append(card)
             self.results_layout.insertWidget(i, card)
 
+    # ── Global Quick-Select ───────────────────────────────────────────
+    def _global_apply(self, method_name: str):
+        """對所有目前顯示的 GroupCard 呼叫 method_name 對應的選取方法。"""
+        for card in self._cards:
+            getattr(card, method_name)()
+
+    def _global_keep_newest(self):      self._global_apply("_keep_newest")
+    def _global_keep_oldest(self):      self._global_apply("_keep_oldest")
+    def _global_keep_shortest_path(self): self._global_apply("_keep_shortest_path")
+    def _global_keep_longest_path(self):  self._global_apply("_keep_longest_path")
+    def _global_keep_shallowest(self):  self._global_apply("_keep_shallowest")
+    def _global_keep_deepest(self):     self._global_apply("_keep_deepest")
+    def _global_keep_alpha_first(self): self._global_apply("_keep_alpha_first")
+    def _global_keep_alpha_last(self):  self._global_apply("_keep_alpha_last")
+    def _global_keep_first(self):       self._global_apply("_keep_first")
+    def _global_select_all(self):       self._global_apply("_select_all")
+    def _global_deselect_all(self):     self._global_apply("_deselect_all")
+
     # ── Actions ───────────────────────────────────────────────────────
     def _browse(self):
         path = QFileDialog.getExistingDirectory(self, "選擇資料夾", "")
@@ -759,7 +900,6 @@ class MainWindow(QMainWindow):
             self.path_edit.setText(path)
 
     def _toggle_scan(self):
-        """掃描按鈕：閒置時開始，掃描中時取消。"""
         if self._scanning:
             self._cancel_scan()
         else:
@@ -774,18 +914,17 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "路徑錯誤", f"路徑不存在：{path}")
             return
 
-        # 確保前一個 thread 完全結束
         self._kill_thread()
 
         self._clear_results()
         self.summary_widget.setVisible(False)
         self.filter_sort_box.setVisible(False)
+        self.global_select_box.setVisible(False)
         self.progress_bar.setRange(0, 0)
         self.progress_section.setVisible(True)
         self._set_scanning(True)
         self._paused = False
 
-        # 每次掃描遞增 ID，讓 _on_thread_finished 能辨別舊 thread 的 stale signal
         self._scan_id += 1
         current_scan_id = self._scan_id
 
@@ -800,14 +939,12 @@ class MainWindow(QMainWindow):
         self._thread = QThread()
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
-        # 用 lambda 捕捉 current_scan_id，防止 race condition
         self._thread.finished.connect(
             lambda sid=current_scan_id: self._on_thread_finished(sid)
         )
         self._thread.start()
 
     def _cancel_scan(self):
-        """送 stop 訊號；thread.finished 會恢復 UI。"""
         if self._worker:
             self._worker.stop()
         self.btn_scan.setEnabled(False)
@@ -843,11 +980,11 @@ class MainWindow(QMainWindow):
             logger.info("掃描已暫停")
 
     def _reset_all(self):
-        """強制停止掃描，清除所有結果，回到乾淨的閒置狀態。"""
         self._kill_thread()
         self._clear_results()
         self.summary_widget.setVisible(False)
         self.filter_sort_box.setVisible(False)
+        self.global_select_box.setVisible(False)
         self.progress_section.setVisible(False)
         self.progress_label.setText("")
         self.step_label.setText("")
@@ -858,7 +995,6 @@ class MainWindow(QMainWindow):
         logger.info("已重置（使用者操作）")
 
     def _kill_thread(self):
-        """同步停止 worker thread（最多等 5 秒）。"""
         if self._worker:
             self._worker.stop()
         if self._thread and self._thread.isRunning():
@@ -889,19 +1025,13 @@ class MainWindow(QMainWindow):
 
     # ── Slots ─────────────────────────────────────────────────────────
     def _on_thread_finished(self, scan_id: int):
-        """QThread.finished 接收者。
-
-        用 scan_id 判斷是否為當前掃描的 thread，
-        避免舊 thread 的 stale signal 覆蓋新掃描的 _thread/_worker 參照。
-        """
         if scan_id != self._scan_id:
-            return   # 舊 thread 的殘留 signal，直接忽略
+            return
 
         self._thread = None
         self._worker = None
         self._paused = False
         if self._scanning:
-            # Thread 結束但未收到 _on_done（如取消中途結束）
             self._set_scanning(False)
             self.progress_section.setVisible(False)
             self.progress_label.setText("")
@@ -971,8 +1101,8 @@ class MainWindow(QMainWindow):
         self.summary_widget.setVisible(True)
         self.btn_delete.setEnabled(True)
 
-        # 顯示篩選/排序列，並套用（重建卡片）
         self.filter_sort_box.setVisible(True)
+        self.global_select_box.setVisible(True)
         self._apply_filter_sort()
 
         self.status_bar.showMessage(
