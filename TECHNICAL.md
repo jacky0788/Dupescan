@@ -223,7 +223,24 @@ Qt 的 worker 包裝，`moveToThread` 到 `QThread` 執行。
 | `_select_all()` | 全選 |
 | `_deselect_all()` | 全不選 |
 
-**檔名欄樣式**：藍色 (`ACCENT`) + 底線字型，搭配 ToolTip 提示完整路徑，視覺上表示可點擊。
+**檔名欄樣式**：藍色 (`ACCENT`) + 底線字型，點擊呼叫 `os.startfile` 以預設程式開啟。
+**路徑欄樣式**：橘色 (`ACCENT3`) + 底線字型，點擊呼叫 `subprocess.Popen('explorer /select,"<path>"', shell=True)` 在 Windows 檔案總管中定位並選取檔案。
+
+#### 選取策略一覽
+
+| 方法 | 保留條件 |
+|------|---------|
+| `_keep_newest` | `mtime` 最大 |
+| `_keep_oldest` | `mtime` 最小 |
+| `_keep_shortest_path` | `len(str(path))` 最小 |
+| `_keep_longest_path` | `len(str(path))` 最大 |
+| `_keep_shallowest` | `len(path.parts)` 最小 |
+| `_keep_deepest` | `len(path.parts)` 最大 |
+| `_keep_alpha_first` | `str(path).lower()` 字母序最小 |
+| `_keep_alpha_last` | `str(path).lower()` 字母序最大 |
+| `_keep_first` | 列表索引 0 |
+
+所有方法都透過 `_keep_index(i)` 實作，將除 `i` 以外的 checkbox 全勾選。
 
 ---
 
@@ -260,6 +277,9 @@ Qt 的 worker 包裝，`moveToThread` 到 `QThread` 執行。
 | `_on_error(msg)` | 顯示錯誤 dialog，記錄 log |
 | `_apply_filter_sort()` | 依 ext_filter_edit 與 sort_combo 篩選/排序 `_all_groups`，呼叫 `_rebuild_cards` |
 | `_rebuild_cards(groups)` | 清除舊 GroupCard，依傳入的 groups 重新建立 |
+| `_global_apply(method_name)` | 對 `self._cards` 中每個 GroupCard 呼叫指定選取方法 |
+| `_global_keep_newest()` … | 9 種全域快速選取，各自委派給 `_global_apply` |
+| `_global_select_all/deselect_all()` | 全域全選 / 全不選 |
 | `_delete_selected()` | 確認刪除 → `Path.unlink()` → 記錄 log → 重新掃描 |
 
 ---
