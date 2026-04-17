@@ -1,9 +1,11 @@
 @echo off
 chcp 65001 >nul
-title DupeScan 啟動程式
+:: 切換到此腳本所在目錄，確保雙擊啟動時路徑正確
+cd /d "%~dp0"
+title DupeScan
 
 echo ========================================
-echo   DupeScan — 重複檔案掃描工具
+echo   DupeScan - 重複檔案掃描工具
 echo ========================================
 echo.
 
@@ -26,7 +28,7 @@ python --version
 echo.
 
 echo [2/3] 正在安裝 / 更新依賴套件...
-python -m pip install --upgrade pip -q
+python -m pip install --upgrade pip -q 2>nul
 python -m pip install -r requirements.txt -q
 if errorlevel 1 (
     echo.
@@ -40,7 +42,6 @@ if errorlevel 1 (
 echo [3/3] 啟動 DupeScan...
 echo.
 python main.py
-
 if errorlevel 1 (
     echo.
     echo [錯誤] 程式執行時發生問題，請查看上方錯誤訊息。
