@@ -387,22 +387,31 @@ class GroupCard(QFrame):
         root.setSpacing(4)
 
         # ── Header ────────────────────────────────────────────────────
+        _HDR_H = 28
         hdr = QHBoxLayout()
+        hdr.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+
         title_lbl = QLabel(
             f"  群組 #{index + 1}  ·  {len(group.files)} 個重複  ·  "
             f"每個 {human_size(group.size)}"
         )
         title_lbl.setStyleSheet(f"color:{TEXT};font-weight:bold;")
-        # Expanding policy + stretch weight: title always fills available space
-        # regardless of how few/many duplicates — consistent proportion across all cards
+        title_lbl.setFixedHeight(_HDR_H)
         title_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
         wasted_lbl = QLabel(f"浪費 {human_size(group.wasted_bytes)}")
         wasted_lbl.setStyleSheet(
             f"background:{DANGER};color:{DARK_BG};border-radius:4px;"
             f"padding:1px 6px;font-weight:bold;font-size:11px;"
         )
+        wasted_lbl.setFixedHeight(_HDR_H)
+        wasted_lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+
         hash_lbl = QLabel(f"Hash: {group.hash_value[:16]}…")
         hash_lbl.setStyleSheet(f"color:{SUBTEXT};font-size:11px;")
+        hash_lbl.setFixedHeight(_HDR_H)
+        hash_lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+
         hdr.addWidget(title_lbl, 1)
         hdr.addWidget(hash_lbl)
         hdr.addWidget(wasted_lbl)
