@@ -4,12 +4,16 @@ DupeScan - Scanner Engine
   Pass 1: Group by file size        (no I/O, instant)
   Pass 2: Partial hash (first 4 KB) (cheap, filters ~90% of candidates)
   Pass 3: Full xxHash               (only for confirmed candidates)
+
+Pass 2 and Pass 3 support multi-threaded execution for SSD/NVMe drives.
+Thread count is supplied by disk_detect.DiskProfile; HDD always uses 1 thread.
 """
 
 import os
 import threading
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable
 
@@ -21,11 +25,11 @@ except ImportError:
 
 from .models import DuplicateGroup, FileInfo
 
-PARTIAL_READ = 4096    # bytes read in pass-2
-CHUNK_SIZE   = 131072  # bytes per chunk in full-hash pass (128 KB, better throughput)
-EMIT_INTERVAL = 0.15   # minimum seconds between progress signals
-TOTAL_STEPS  = 3
-STEP_NAMES   = {
+PARTIAL_READ  = 4096    # bytes read in pass-2
+CHUNK_SIZE    = 131072  # bytes per chunk in full-hash pass (128 KB)
+EMIT_INTERVAL = 0.15    # minimum seconds between progress signals
+TOTAL_STEPS   = 3
+STEP_NAMES    = {
     1: "依檔案大小分組",
     2: "快速 Hash 比對（前 4 KB）",
     3: "完整 Hash 比對",
@@ -83,6 +87,9 @@ class Scanner:
     Thread-safe scanner with pause/resume support.
     Call scan() from a worker thread; use stop()/pause()/resume() from any thread.
 
+    pass2_workers / pass3_workers > 1 enable parallel I/O for SSD/NVMe drives.
+    HDD should always use workers=1 to avoid random-seek penalty.
+
     on_progress(msg, current, total, step, total_steps, eta_secs)
       - step: 1/2/3 (current pass)
       - eta_secs: estimated remaining seconds, -1 if unknown
@@ -93,16 +100,20 @@ class Scanner:
         roots: list[str],
         min_size: int = 1,
         include_hidden: bool = False,
+        pass2_workers: int = 1,
+        pass3_workers: int = 1,
         on_progress: ProgressCallback | None = None,
         on_done: Callable[[list[DuplicateGroup]], None] | None = None,
         on_error: Callable[[str], None] | None = None,
     ):
-        self.roots = [Path(r) for r in roots]
-        self.min_size = min_size
+        self.roots          = [Path(r) for r in roots]
+        self.min_size       = min_size
         self.include_hidden = include_hidden
-        self.on_progress = on_progress
-        self.on_done = on_done
-        self.on_error = on_error
+        self.pass2_workers  = pass2_workers
+        self.pass3_workers  = pass3_workers
+        self.on_progress    = on_progress
+        self.on_done        = on_done
+        self.on_error       = on_error
 
         self._stop_event  = threading.Event()
         self._pause_event = threading.Event()
@@ -141,6 +152,10 @@ class Scanner:
         self._pause_event.wait()
         return self._stop_event.is_set()
 
+    def _stopped(self) -> bool:
+        """Non-blocking stop check (used in parallel consumption loop)."""
+        return self._stop_event.is_set()
+
     def _emit(self, msg: str, current: int, total: int,
               step: int, eta_secs: int = -1):
         if self.on_progress:
@@ -155,6 +170,113 @@ class Scanner:
             return -1
         rate = done / elapsed
         return int((total - done) / rate)
+
+    # ── Pass 2 helpers ─────────────────────────────────────────────────
+    def _pass2_sequential(self, candidates, total_c, t0) -> dict | None:
+        """Single-threaded partial hash — used for HDD to preserve sequential I/O."""
+        by_partial: dict[str, list[FileInfo]] = defaultdict(list)
+        done = 0
+        last_emit = t0
+
+        for files in candidates.values():
+            for fi in files:
+                if self._check():
+                    return None
+                ph = _partial_hash(fi.path)
+                if ph:
+                    by_partial[ph].append(fi)
+                done += 1
+                now = time.monotonic()
+                if now - last_emit >= EMIT_INTERVAL or done == total_c:
+                    self._emit(f"快速比對中... ({done:,}/{total_c:,})",
+                               done, total_c, 2, self._eta(t0, done, total_c))
+                    last_emit = now
+
+        return by_partial
+
+    def _pass2_parallel(self, candidates, total_c, t0, workers) -> dict | None:
+        """Multi-threaded partial hash — used for SSD/NVMe."""
+        by_partial: dict[str, list[FileInfo]] = defaultdict(list)
+        done = 0
+        last_emit = t0
+        flat = [fi for files in candidates.values() for fi in files]
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(_partial_hash, fi.path): fi for fi in flat}
+            for fut in as_completed(futs):
+                # Handle pause: block here until resumed
+                self._pause_event.wait()
+                if self._stopped():
+                    for f in futs:
+                        f.cancel()
+                    return None
+                fi = futs[fut]
+                ph = fut.result()
+                if ph:
+                    by_partial[ph].append(fi)
+                done += 1
+                now = time.monotonic()
+                if now - last_emit >= EMIT_INTERVAL or done == total_c:
+                    self._emit(f"快速比對中... ({done:,}/{total_c:,})",
+                               done, total_c, 2, self._eta(t0, done, total_c))
+                    last_emit = now
+
+        return by_partial
+
+    # ── Pass 3 helpers ─────────────────────────────────────────────────
+    def _pass3_sequential(self, candidates2, total2, t0) -> dict | None:
+        """Single-threaded full hash — used for HDD."""
+        by_full: dict[str, list[FileInfo]] = defaultdict(list)
+        done = 0
+        last_emit = t0
+
+        for files in candidates2.values():
+            for fi in files:
+                if self._check():
+                    return None
+                fh = _full_hash(fi.path)
+                if fh:
+                    fi.hash_full = fh
+                    by_full[fh].append(fi)
+                done += 1
+                now = time.monotonic()
+                if now - last_emit >= EMIT_INTERVAL or done == total2:
+                    eta = self._eta(t0, done, total2) if total2 > 0 else 0
+                    self._emit(f"完整比對中... ({done:,}/{total2:,})",
+                               done, total2, 3, eta)
+                    last_emit = now
+
+        return by_full
+
+    def _pass3_parallel(self, candidates2, total2, t0, workers) -> dict | None:
+        """Multi-threaded full hash — used for SSD/NVMe."""
+        by_full: dict[str, list[FileInfo]] = defaultdict(list)
+        done = 0
+        last_emit = t0
+        flat = [fi for files in candidates2.values() for fi in files]
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(_full_hash, fi.path): fi for fi in flat}
+            for fut in as_completed(futs):
+                self._pause_event.wait()
+                if self._stopped():
+                    for f in futs:
+                        f.cancel()
+                    return None
+                fi = futs[fut]
+                fh = fut.result()
+                if fh:
+                    fi.hash_full = fh
+                    by_full[fh].append(fi)
+                done += 1
+                now = time.monotonic()
+                if now - last_emit >= EMIT_INTERVAL or done == total2:
+                    eta = self._eta(t0, done, total2) if total2 > 0 else 0
+                    self._emit(f"完整比對中... ({done:,}/{total2:,})",
+                               done, total2, 3, eta)
+                    last_emit = now
+
+        return by_full
 
     # ── 3-pass algorithm ───────────────────────────────────────────────
     def _run(self) -> list[DuplicateGroup]:
@@ -202,27 +324,14 @@ class Scanner:
         )
 
         # ── Pass 2: partial hash (first 4 KB) ──────────────────────────
-        by_partial: dict[str, list[FileInfo]] = defaultdict(list)
-        done = 0
         t0 = time.monotonic()
-        last_emit2 = t0
+        if self.pass2_workers > 1:
+            by_partial = self._pass2_parallel(candidates, total_c, t0, self.pass2_workers)
+        else:
+            by_partial = self._pass2_sequential(candidates, total_c, t0)
 
-        for files in candidates.values():
-            for fi in files:
-                if self._check():
-                    return []
-                ph = _partial_hash(fi.path)
-                if ph:
-                    by_partial[ph].append(fi)
-                done += 1
-                now = time.monotonic()
-                if now - last_emit2 >= EMIT_INTERVAL or done == total_c:
-                    eta = self._eta(t0, done, total_c)
-                    self._emit(
-                        f"快速比對中... ({done:,}/{total_c:,})",
-                        done, total_c, 2, eta,
-                    )
-                    last_emit2 = now
+        if by_partial is None:
+            return []
 
         candidates2 = {ph: f for ph, f in by_partial.items() if len(f) > 1}
         total2 = sum(len(v) for v in candidates2.values())
@@ -232,28 +341,14 @@ class Scanner:
         )
 
         # ── Pass 3: full hash ──────────────────────────────────────────
-        by_full: dict[str, list[FileInfo]] = defaultdict(list)
-        done = 0
         t0 = time.monotonic()
-        last_emit3 = t0
+        if self.pass3_workers > 1:
+            by_full = self._pass3_parallel(candidates2, total2, t0, self.pass3_workers)
+        else:
+            by_full = self._pass3_sequential(candidates2, total2, t0)
 
-        for files in candidates2.values():
-            for fi in files:
-                if self._check():
-                    return []
-                fh = _full_hash(fi.path)
-                if fh:
-                    fi.hash_full = fh
-                    by_full[fh].append(fi)
-                done += 1
-                now = time.monotonic()
-                if now - last_emit3 >= EMIT_INTERVAL or done == total2:
-                    eta = self._eta(t0, done, total2) if total2 > 0 else 0
-                    self._emit(
-                        f"完整比對中... ({done:,}/{total2:,})",
-                        done, total2, 3, eta,
-                    )
-                    last_emit3 = now
+        if by_full is None:
+            return []
 
         # Build and sort result groups
         groups: list[DuplicateGroup] = [

@@ -35,6 +35,7 @@
 ```
 dupescan/
 ├── main.py              # 入口：建立 QApplication 與 MainWindow
+├── run.bat              # 一鍵啟動腳本（自動安裝依賴）
 ├── requirements.txt     # pip 依賴清單
 ├── .gitignore
 ├── README.md            # 使用者操作說明
@@ -43,7 +44,8 @@ dupescan/
 └── src/
     ├── __init__.py
     ├── models.py        # 資料結構定義
-    ├── scanner.py       # 掃描引擎（核心演算法）
+    ├── scanner.py       # 掃描引擎（3-pass + 多執行緒）
+    ├── disk_detect.py   # 磁碟類型偵測（ctypes，決定執行緒策略）
     ├── logger.py        # 日誌設定（單例）
     └── ui/
         ├── __init__.py
@@ -86,6 +88,61 @@ dupescan/
 
 ---
 
+### `src/disk_detect.py`
+
+磁碟類型偵測模組。掃描開始前由 `ScanWorker.run()` 呼叫，結果決定 Scanner 的執行緒數量。
+
+#### `class DiskProfile`
+
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| `type_name` | `str` | 顯示名稱（"NVMe SSD" / "SATA SSD" / "HDD" / "未知磁碟"）|
+| `pass2_workers` | `int` | Pass 2 執行緒數 |
+| `pass3_workers` | `int` | Pass 3 執行緒數 |
+| `summary()` | method | 回傳 UI 顯示字串 |
+
+**預設策略對照：**
+
+| 磁碟類型 | Pass 2 threads | Pass 3 threads |
+|---------|---------------|---------------|
+| NVMe SSD | 8 | 4 |
+| SATA SSD | 4 | 2 |
+| HDD | 1 | 1 |
+| 未知/網路 | 2 | 1 |
+
+#### `detect_disk_profile(path: Path) -> DiskProfile`
+
+入口函式。任何例外（網路磁碟、虛擬磁碟、非 Windows）自動 fallback 到保守值，不影響掃描主流程。
+
+**Windows 偵測流程（純 ctypes，無需管理員權限）：**
+
+```
+path → drive letter → \\.\C: 裝置路徑
+    │
+    ├─ IOCTL_STORAGE_QUERY_PROPERTY
+    │   PropertyId=7 (StorageDeviceSeekPenaltyProperty)
+    │   → IncursSeekPenalty=True  → HDD
+    │   → IncursSeekPenalty=False → SSD (繼續查 BusType)
+    │
+    └─ IOCTL_STORAGE_QUERY_PROPERTY
+        PropertyId=0 (StorageDeviceProperty)
+        → BusType=17 (NVMe) → NVMe SSD
+        → BusType=11 (SATA) → SATA SSD
+        → 其他           → SSD (generic)
+```
+
+**關鍵內部函式：**
+
+| 函式 | 說明 |
+|------|------|
+| `_volume_device_path(path)` | `path.resolve().drive` → `\\\\.\\C:` |
+| `_open_volume(device)` | `CreateFileW` 開啟磁碟卷（0 access，僅供 IOCTL）|
+| `_ioctl(h, ctl, in, out)` | 包裝 `DeviceIoControl` 呼叫，回傳 bool |
+| `_query_seek_penalty(device)` | SeekPenalty 查詢，回傳 `True/False/None` |
+| `_query_bus_type(device)` | BusType 查詢，回傳 `'nvme'/'sata'/'other'` |
+
+---
+
 ### `src/scanner.py`
 
 #### 模組層級常數
@@ -115,6 +172,8 @@ dupescan/
 | `roots` | `list[str]` | 要掃描的根路徑清單 |
 | `min_size` | `int` | 最小檔案大小（bytes），小於此值的檔案跳過 |
 | `include_hidden` | `bool` | 是否包含隱藏檔案/目錄（預設 False）|
+| `pass2_workers` | `int` | Pass 2 執行緒數（預設 1，由 DiskProfile 提供）|
+| `pass3_workers` | `int` | Pass 3 執行緒數（預設 1，由 DiskProfile 提供）|
 | `on_progress` | `ProgressCallback \| None` | 進度回調，簽名見下方 |
 | `on_done` | `Callable[[list[DuplicateGroup]], None] \| None` | 掃描完成回調 |
 | `on_error` | `Callable[[str], None] \| None` | 錯誤回調 |
@@ -143,10 +202,21 @@ dupescan/
 
 | 方法 | 說明 |
 |------|------|
-| `_check()` | 暫停點：等待 pause event，回傳 True 表示應停止 |
+| `_check()` | 暫停點：等待 pause event，回傳 True 表示應停止（用於循序模式）|
+| `_stopped()` | 非阻塞 stop 查詢（用於並行消費迴圈）|
 | `_emit(...)` | 包裝 on_progress 呼叫 |
 | `_eta(start, done, total)` | 依已用時間估算剩餘秒數 |
-| `_run()` | 執行 3-pass 演算法，回傳 `list[DuplicateGroup]` |
+| `_pass2_sequential(candidates, total_c, t0)` | 循序 Pass 2（HDD 安全，細粒度暫停/停止）|
+| `_pass2_parallel(candidates, total_c, t0, workers)` | 並行 Pass 2（ThreadPoolExecutor，SSD/NVMe）|
+| `_pass3_sequential(candidates2, total2, t0)` | 循序 Pass 3 |
+| `_pass3_parallel(candidates2, total2, t0, workers)` | 並行 Pass 3 |
+| `_run()` | 執行 3-pass 演算法，依 workers 選擇循序或並行路徑 |
+
+**並行模式執行緒安全說明：**
+
+worker thread 只執行 `_partial_hash` / `_full_hash`（純函式，讀檔回傳字串）。
+所有 dict/list 操作（`by_partial[ph].append(fi)`）在 scan thread 消費 `as_completed` 時循序執行，無 data race。
+暫停以 `_pause_event.wait()` 在消費迴圈中阻塞；停止以 `_stopped()` 檢查並呼叫 `f.cancel()` 取消尚未開始的 futures。
 
 ---
 
@@ -182,12 +252,13 @@ Qt 的 worker 包裝，`moveToThread` 到 `QThread` 執行。
 | `progress` | `(str, int, int, int, int, int)` | 進度更新（透傳自 Scanner）|
 | `finished` | `(list)` | 掃描完成，帶入 `list[DuplicateGroup]` |
 | `error` | `(str)` | 發生錯誤 |
+| `detected` | `(str)` | 磁碟偵測完成，帶入 `DiskProfile.summary()` 字串 |
 
 **方法：**
 
 | 方法 | 說明 |
 |------|------|
-| `run()` | 在 worker thread 中執行掃描 |
+| `run()` | 先呼叫 `detect_disk_profile`，emit `detected`，再建立並執行 Scanner |
 | `stop()` | 轉發至 Scanner.stop() |
 | `pause()` | 轉發至 Scanner.pause() |
 | `resume()` | 轉發至 Scanner.resume() |
@@ -485,7 +556,8 @@ def _schedule_batch(self, gen):
 4. **時間節流 Progress Signal**：Pass 2 / Pass 3 使用 `time.monotonic()` 節流，每 `EMIT_INTERVAL`（0.15 秒）最多 emit 一次。掃描數萬個候選時，避免 Qt signal 佇列積壓造成 UI 卡頓（舊做法是每 50 個 / 每個檔案 emit，百萬量級時過於頻繁）。
 5. **UI 分批渲染**：見 [UI 分批渲染](#ui-分批渲染)章節。GroupCard 以 `_RENDER_BATCH = 8` 每批建立，批次間讓出 Qt 事件迴圈，防止 UI 反白。
 6. **Pass 3 I/O 吞吐**：`CHUNK_SIZE` 從 64 KB 提升至 128 KB，減少 `read()` 系統呼叫次數，提升大型檔案的 Hash 速度。
-7. **UI 渲染**：GroupCard 使用固定高度 QTableWidget，避免動態計算帶來的效能問題。
+7. **自適應多執行緒**：掃描前由 `disk_detect` 偵測磁碟類型，SSD/NVMe 啟用 `ThreadPoolExecutor` 並行 I/O；HDD 維持單執行緒順序讀取，避免隨機尋軌損耗。Python GIL 在 file I/O 與 xxhash（C 擴充）期間自動釋放，多執行緒效益可實際發揮。
+8. **UI 渲染**：GroupCard 使用固定高度 QTableWidget，避免動態計算帶來的效能問題。
 
 ---
 
@@ -496,6 +568,8 @@ def _schedule_batch(self, gen):
 | `PARTIAL_READ` | scanner.py | 4096 | Pass 2 讀取 bytes 數 |
 | `CHUNK_SIZE` | scanner.py | 131072 | Pass 3 chunk 大小（128 KB）|
 | `EMIT_INTERVAL` | scanner.py | 0.15 | Pass 2/3 進度 signal 最小間隔（秒）|
+| `BUS_NVME` | disk_detect.py | 17 | STORAGE_BUS_TYPE NVMe 枚舉值（ntddstor.h）|
+| `BUS_SATA` | disk_detect.py | 11 | STORAGE_BUS_TYPE SATA 枚舉值 |
 | `TOTAL_STEPS` | scanner.py | 3 | 掃描步驟總數 |
 | `_RENDER_BATCH` | main_window.py | 8 | 每批建立的 GroupCard 數量 |
 | `_kill_thread` timeout | main_window.py | 5000 ms | 強制等待 thread 結束的上限 |
