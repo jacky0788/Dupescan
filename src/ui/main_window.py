@@ -83,17 +83,26 @@ class ScanWorker(QObject):
     progress = pyqtSignal(str, int, int, int, int, int)
     finished = pyqtSignal(list)
     error    = pyqtSignal(str)
+    detected = pyqtSignal(str)   # emitted with DiskProfile.summary() before scan
 
     def __init__(self, roots: list[str], min_size: int):
         super().__init__()
-        self._roots = roots
+        self._roots    = roots
         self._min_size = min_size
         self._scanner: Scanner | None = None
 
     def run(self):
+        from pathlib import Path
+        from ..disk_detect import detect_disk_profile
+
+        profile = detect_disk_profile(Path(self._roots[0]))
+        self.detected.emit(profile.summary())
+
         self._scanner = Scanner(
             roots=self._roots,
             min_size=self._min_size,
+            pass2_workers=profile.pass2_workers,
+            pass3_workers=profile.pass3_workers,
             on_progress=lambda m, c, t, s, ts, eta: self.progress.emit(m, c, t, s, ts, eta),
             on_done=lambda g: self.finished.emit(g),
             on_error=lambda e: self.error.emit(e),
@@ -741,6 +750,7 @@ class MainWindow(QMainWindow):
         prog_l = QVBoxLayout(self.progress_section)
         prog_l.setContentsMargins(0, 0, 0, 0)
         prog_l.setSpacing(2)
+
         step_row = QHBoxLayout()
         self.step_label = QLabel("")
         self.step_label.setStyleSheet(f"color:{ACCENT};font-weight:bold;font-size:13px;")
@@ -750,11 +760,23 @@ class MainWindow(QMainWindow):
         step_row.addStretch()
         step_row.addWidget(self.eta_label)
         prog_l.addLayout(step_row)
+
         self.progress_bar = QProgressBar()
         prog_l.addWidget(self.progress_bar)
+
+        detail_row = QHBoxLayout()
         self.progress_label = QLabel("")
         self.progress_label.setStyleSheet(f"color:{SUBTEXT};font-size:12px;")
-        prog_l.addWidget(self.progress_label)
+        self.disk_label = QLabel("")
+        self.disk_label.setStyleSheet(
+            f"color:{ACCENT2};font-size:11px;"
+            f"background:{PANEL_BG};border:1px solid {BORDER};"
+            f"border-radius:3px;padding:0px 6px;"
+        )
+        detail_row.addWidget(self.progress_label, 1)
+        detail_row.addWidget(self.disk_label)
+        prog_l.addLayout(detail_row)
+
         self.progress_section.setVisible(False)
         main.addWidget(self.progress_section)
 
@@ -1143,6 +1165,7 @@ class MainWindow(QMainWindow):
         self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._on_done)
         self._worker.error.connect(self._on_error)
+        self._worker.detected.connect(self._on_disk_detected)
         self._thread = QThread()
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -1189,6 +1212,7 @@ class MainWindow(QMainWindow):
         self._sb_qs_body.setVisible(self._sb_qs_open)
         self.progress_section.setVisible(False)
         self.progress_label.setText("")
+        self.disk_label.setText("")
         self.step_label.setText("")
         self.eta_label.setText("")
         self._set_scanning(False)
@@ -1233,9 +1257,15 @@ class MainWindow(QMainWindow):
             self._set_scanning(False)
             self.progress_section.setVisible(False)
             self.progress_label.setText("")
+            self.disk_label.setText("")
             self.step_label.setText("")
             self.eta_label.setText("")
             self.status_bar.showMessage("掃描已取消")
+
+    def _on_disk_detected(self, summary: str):
+        self.disk_label.setText(summary)
+        self.status_bar.showMessage(f"磁碟類型: {summary}")
+        logger.info(f"磁碟偵測: {summary}")
 
     def _on_progress(self, msg: str, cur: int, total: int,
                      step: int, total_steps: int, eta_secs: int):
@@ -1261,6 +1291,7 @@ class MainWindow(QMainWindow):
         self._paused = False
         self.progress_section.setVisible(False)
         self.progress_label.setText("")
+        self.disk_label.setText("")
         self.step_label.setText("")
         self.eta_label.setText("")
         self._all_groups = groups
@@ -1305,6 +1336,7 @@ class MainWindow(QMainWindow):
         self._paused = False
         self.progress_section.setVisible(False)
         self.progress_label.setText("")
+        self.disk_label.setText("")
         logger.error(f"掃描錯誤: {msg}")
         QMessageBox.critical(self, "掃描錯誤", msg)
         self.status_bar.showMessage(f"錯誤: {msg}")
