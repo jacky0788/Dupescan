@@ -22,7 +22,8 @@ except ImportError:
 from .models import DuplicateGroup, FileInfo
 
 PARTIAL_READ = 4096    # bytes read in pass-2
-CHUNK_SIZE   = 65536   # bytes per chunk in full-hash pass
+CHUNK_SIZE   = 131072  # bytes per chunk in full-hash pass (128 KB, better throughput)
+EMIT_INTERVAL = 0.15   # minimum seconds between progress signals
 TOTAL_STEPS  = 3
 STEP_NAMES   = {
     1: "依檔案大小分組",
@@ -204,6 +205,7 @@ class Scanner:
         by_partial: dict[str, list[FileInfo]] = defaultdict(list)
         done = 0
         t0 = time.monotonic()
+        last_emit2 = t0
 
         for files in candidates.values():
             for fi in files:
@@ -213,12 +215,14 @@ class Scanner:
                 if ph:
                     by_partial[ph].append(fi)
                 done += 1
-                if done % 50 == 0 or done == total_c:
+                now = time.monotonic()
+                if now - last_emit2 >= EMIT_INTERVAL or done == total_c:
                     eta = self._eta(t0, done, total_c)
                     self._emit(
                         f"快速比對中... ({done:,}/{total_c:,})",
                         done, total_c, 2, eta,
                     )
+                    last_emit2 = now
 
         candidates2 = {ph: f for ph, f in by_partial.items() if len(f) > 1}
         total2 = sum(len(v) for v in candidates2.values())
@@ -231,6 +235,7 @@ class Scanner:
         by_full: dict[str, list[FileInfo]] = defaultdict(list)
         done = 0
         t0 = time.monotonic()
+        last_emit3 = t0
 
         for files in candidates2.values():
             for fi in files:
@@ -241,11 +246,14 @@ class Scanner:
                     fi.hash_full = fh
                     by_full[fh].append(fi)
                 done += 1
-                eta = self._eta(t0, done, total2) if total2 > 0 else 0
-                self._emit(
-                    f"完整比對中... ({done:,}/{total2:,})",
-                    done, total2, 3, eta,
-                )
+                now = time.monotonic()
+                if now - last_emit3 >= EMIT_INTERVAL or done == total2:
+                    eta = self._eta(t0, done, total2) if total2 > 0 else 0
+                    self._emit(
+                        f"完整比對中... ({done:,}/{total2:,})",
+                        done, total2, 3, eta,
+                    )
+                    last_emit3 = now
 
         # Build and sort result groups
         groups: list[DuplicateGroup] = [

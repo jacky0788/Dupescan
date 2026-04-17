@@ -15,7 +15,7 @@ try:
 except ImportError:
     _HZ = False
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QEvent, QPoint
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QObject, QEvent, QPoint
 from PyQt6.QtGui import QColor, QFont, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFrame,
@@ -393,6 +393,9 @@ class GroupCard(QFrame):
             f"每個 {human_size(group.size)}"
         )
         title_lbl.setStyleSheet(f"color:{TEXT};font-weight:bold;")
+        # Expanding policy + stretch weight: title always fills available space
+        # regardless of how few/many duplicates — consistent proportion across all cards
+        title_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         wasted_lbl = QLabel(f"浪費 {human_size(group.wasted_bytes)}")
         wasted_lbl.setStyleSheet(
             f"background:{DANGER};color:{DARK_BG};border-radius:4px;"
@@ -400,8 +403,7 @@ class GroupCard(QFrame):
         )
         hash_lbl = QLabel(f"Hash: {group.hash_value[:16]}…")
         hash_lbl.setStyleSheet(f"color:{SUBTEXT};font-size:11px;")
-        hdr.addWidget(title_lbl)
-        hdr.addStretch()
+        hdr.addWidget(title_lbl, 1)
         hdr.addWidget(hash_lbl)
         hdr.addWidget(wasted_lbl)
         root.addLayout(hdr)
@@ -645,6 +647,9 @@ class MainWindow(QMainWindow):
         self._sidebar_open:   bool             = True
         self._sb_filter_open: bool             = True
         self._sb_qs_open:     bool             = True
+
+        self._render_pending:    list = []
+        self._render_generation: int  = 0
 
         self._preview_popup = ImagePreviewPopup()
         self._progress_signal.connect(self._on_progress)
@@ -1061,6 +1066,10 @@ class MainWindow(QMainWindow):
         self._cards.clear()
         self._groups = groups
 
+        # Invalidate any in-flight batch render from a previous call
+        self._render_generation += 1
+        self._render_pending = []
+
         if not groups:
             no_match = QLabel("無符合條件的群組")
             no_match.setStyleSheet(f"color:{SUBTEXT};font-size:15px;padding:30px;")
@@ -1068,10 +1077,26 @@ class MainWindow(QMainWindow):
             self.results_layout.insertWidget(0, no_match)
             return
 
-        for i, group in enumerate(groups):
+        # Queue all groups and render in small batches so the Qt event loop
+        # keeps processing sidebar/UI events between batches (avoids UI freeze)
+        self._render_pending = list(enumerate(groups))
+        self._schedule_batch(self._render_generation)
+
+    _RENDER_BATCH = 8   # cards per batch (tunable)
+
+    def _schedule_batch(self, gen: int):
+        """Render one batch of cards, then yield to the event loop via QTimer."""
+        if gen != self._render_generation:
+            return
+        for _ in range(self._RENDER_BATCH):
+            if not self._render_pending:
+                return
+            i, group = self._render_pending.pop(0)
             card = GroupCard(group, i, self._preview_popup, self._font_size)
             self._cards.append(card)
             self.results_layout.insertWidget(i, card)
+        if self._render_pending:
+            QTimer.singleShot(0, lambda g=gen: self._schedule_batch(g))
 
     # ── Actions ───────────────────────────────────────────────────────
     def _browse(self):
