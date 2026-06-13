@@ -74,6 +74,7 @@ dupescan/
 | `size` | `int` | 檔案大小（bytes）|
 | `hash_full` | `str` | 完整 Hash 值（Pass 3 後填入）|
 | `mtime` | `float` | 修改時間（Unix timestamp）|
+| `selected` | `bool` | 是否勾選待刪除（選取狀態存於資料層，與 UI 解耦，使虛擬化樹在群組未展開時仍記住勾選）|
 | `.name` | property | `path.name`（檔名）|
 | `.folder` | property | `str(path.parent)`（所在目錄）|
 
@@ -271,7 +272,7 @@ Qt 的 worker 包裝，`moveToThread` 到 `QThread` 執行。
 
 | 方法 | 說明 |
 |------|------|
-| `show_image(path, global_pos)` | 載入圖片並縮放至 220×220（保持比例），移動到指定螢幕座標後顯示 |
+| `show_image(path, global_pos)` | 載入圖片並縮放至 240×240（保持比例），移動到指定螢幕座標後顯示 |
 | `reset()` | 清除快取路徑並隱藏視窗 |
 
 快取機制：若 `path` 與上次相同且視窗已顯示，只移動位置不重新載入圖片（避免每次 MouseMove 都讀取磁碟）。
@@ -312,43 +313,37 @@ Qt 的 worker 包裝，`moveToThread` 到 `QThread` 執行。
 
 ---
 
-#### `class GroupCard(QFrame)`
+#### `class DuplicateTree(QTreeWidget)`
 
-每個重複群組的 UI 卡片元件。
+**取代舊版的 `GroupCard` / `QTableWidget` 卡片清單**，以單一虛擬化樹呈現所有結果。
 
-| 方法/屬性 | 說明 |
+設計要點：
+
+- **頂層列＝群組摘要列**（`setFirstColumnSpanned(True)`，文字含「群組 #n · N 個重複 · 每個 X · 可省 Y」），**子列＝群組內各檔案**。
+- **虛擬化渲染**：`QTreeWidget` 只繪製 viewport 內可見的列；群組以 `addTopLevelItems` 一次批次加入（避免逐筆插入觸發 view 訊號）。
+- **延遲建立子列（lazy）**：群組頂層列以 `ChildIndicatorPolicy.ShowIndicator` 顯示展開箭頭但不建立子列；`itemExpanded` 首次觸發時才透過 `_fill_file_item` 建立檔案列，並以 `_ROLE_POP` 標記已建立。
+- **選取狀態存於資料層** `FileInfo.selected`，與 widget 解耦——群組未展開時仍記住勾選，批量操作不需先建立所有列。
+- **`_guard` 旗標**：程式化 `setCheckState` 會觸發 `itemChanged`；以 `_guard` 包住所有程式化變更，避免遞迴。
+
+資料角色（掛在 column 0）：`_ROLE_KIND`（"group"/"file"）、`_ROLE_OBJ`（`DuplicateGroup`/`FileInfo`）、`_ROLE_POP`（子列是否已建立）。
+
+| 方法/Signal | 說明 |
 |-----------|------|
-| `__init__(group, index, preview_popup, font_size=13)` | 建立卡片，渲染檔案清單 table；`font_size` 控制行高與表格字體（依比例縮放） |
-| `_apply_conditions()` | 讀取卡片自身 ConditionPanel 的條件，呼叫 `_apply_with` |
-| `_apply_with(conditions, mode)` | 呼叫 `_rank_by_conditions` 取得勝出索引，依 mode 設定 checkbox 狀態 |
-| `checkboxes` | 每行的 QCheckBox 清單 |
-| `selected_paths()` | 回傳所有被勾選的檔案路徑 |
-| `_on_cell_clicked(row, col)` | `cellClicked` 接收者；col=1（檔名欄）時呼叫 `os.startfile` 開啟檔案 |
-| `eventFilter(obj, event)` | 安裝在 `table.viewport()`；MouseMove 時若 col=1 且為圖片副檔名則呼叫 `preview_popup.show_image`；Leave 時呼叫 `reset()` |
-| `_keep_newest()` | 快速選取：勾選除最新以外 |
-| `_keep_oldest()` | 快速選取：勾選除最舊以外 |
-| `_keep_first()` | 快速選取：勾選第 2 筆以後 |
-| `_select_all()` | 全選 |
-| `_deselect_all()` | 全不選 |
+| `checksChanged` | Signal，任何勾選變動時發出，供 MainWindow 更新統計與刪除按鈕 |
+| `populate(groups)` | 清空並重建；只建立群組頂層列（批次加入），子列待展開 |
+| `_on_expanded(item)` | 群組首次展開時 lazy 建立檔案子列 |
+| `_on_item_changed(item, col)` | checkbox 接收者：file 列同步 `fi.selected` 並更新群組三態；group 列一次切換全部子檔案 |
+| `_set_group_state(gi, g)` | 依群組內已勾選比例設定群組列三態（Unchecked/Checked/PartiallyChecked），不發 signal |
+| `refresh_checks()` | 批次修改資料後，刷新所有群組列與已建立子列的勾選顯示 |
+| `select_all(sel)` | 對所有群組的所有檔案設定 `selected`，再 `refresh_checks` |
+| `apply_conditions_all(conditions, mode)` | 對每個群組以 `_apply_selection` 套用條件，再刷新 |
+| `selected_stats()` | 回傳 `(已勾選檔案數, 可釋放 bytes)` |
+| `_on_double_clicked` / `_on_clicked` | 雙擊檔案列 → `os.startfile` 開啟；單擊路徑欄 → `explorer /select` 定位 |
+| `eventFilter(obj, event)` | 安裝在 `viewport()`；MouseMove 於檔名欄且為圖片副檔名時顯示預覽，否則 `reset()` |
+| `_show_menu(pos)` | 右鍵內容選單：開啟/定位（檔案列）、快速選取（保留某條件勝出者）、勾選/取消整個群組 |
+| `set_font_size(size)` | 變更字級並重建（collapsed，成本低）|
 
-**檔名欄樣式**：藍色 (`ACCENT`) + 底線字型，點擊呼叫 `os.startfile` 以預設程式開啟。
-**路徑欄樣式**：橘色 (`ACCENT3`) + 底線字型，點擊呼叫 `subprocess.Popen('explorer /select,"<path>"', shell=True)` 在 Windows 檔案總管中定位並選取檔案。
-
-#### 選取策略一覽
-
-| 方法 | 保留條件 |
-|------|---------|
-| `_keep_newest` | `mtime` 最大 |
-| `_keep_oldest` | `mtime` 最小 |
-| `_keep_shortest_path` | `len(str(path))` 最小 |
-| `_keep_longest_path` | `len(str(path))` 最大 |
-| `_keep_shallowest` | `len(path.parts)` 最小 |
-| `_keep_deepest` | `len(path.parts)` 最大 |
-| `_keep_alpha_first` | `str(path).lower()` 字母序最小 |
-| `_keep_alpha_last` | `str(path).lower()` 字母序最大 |
-| `_keep_first` | 列表索引 0 |
-
-所有方法都透過 `_keep_index(i)` 實作，將除 `i` 以外的 checkbox 全勾選。
+模組層級輔助 `_apply_selection(group, conditions, mode)`：以 `_rank_by_conditions` 取得勝出索引，`mode='keep'` 勾選除勝出者外全部、`mode='delete'` 只勾選勝出者，直接寫入 `FileInfo.selected`。
 
 ---
 
@@ -365,9 +360,8 @@ Qt 的 worker 包裝，`moveToThread` 到 `QThread` 執行。
 | `_scan_id: int` | 掃描流水號（每次 `_start_scan` 遞增），用於防止舊 thread signal 污染 |
 | `_all_groups` | 最新一次掃描的完整結果（未篩選）|
 | `_groups` | 目前顯示中的群組（套用篩選/排序後）|
-| `_cards` | 對應的 GroupCard 元件清單 |
-| `_preview_popup` | 共用的 `ImagePreviewPopup` 實例（所有 GroupCard 共享同一個）|
-| `_font_size: int` | 目前套用的 UI 文字大小（預設 13px，範圍 9–18）|
+| `tree` | `DuplicateTree` 結果檢視（取代舊版 `_cards` GroupCard 清單）|
+| `_preview_popup` | 共用的 `ImagePreviewPopup` 實例 |
 
 **關鍵方法：**
 
@@ -382,22 +376,20 @@ Qt 的 worker 包裝，`moveToThread` 到 `QThread` 執行。
 | `_set_scanning(bool)` | 切換掃描狀態，更新按鈕文字/顏色/可見性 |
 | `_on_thread_finished(scan_id)` | `thread.finished` 接收者；比對 `scan_id` 與 `_scan_id`，若不符則忽略（防止 race condition） |
 | `_on_progress(...)` | 更新步驟標籤、ETA、進度條 |
-| `_on_done(groups)` | 儲存 `_all_groups`，顯示 filter_sort_sec，呼叫 `_apply_filter_sort` 渲染卡片；啟用 `btn_export` |
+| `_on_done(groups)` | 儲存 `_all_groups`，更新摘要列，呼叫 `_apply_filter_sort` 渲染樹；啟用 `btn_export` |
 | `_on_error(msg)` | 顯示錯誤 dialog，記錄 log |
-| `_apply_filter_sort()` | 依 ext_filter_edit 與 sort_combo 篩選/排序 `_all_groups`，呼叫 `_rebuild_cards` |
-| `_rebuild_cards(groups)` | 清除舊 GroupCard，依傳入的 groups 重新建立（傳入 `_font_size`）|
-| `_apply_font_size(size)` | 更新 `_font_size`，只重建卡片（不改全局 stylesheet），僅影響群組內表格字體與行高 |
+| `_apply_filter_sort()` | 依 ext_filter_edit 與 sort_combo 篩選/排序 `_all_groups`，呼叫 `tree.populate(groups)` |
+| `_apply_font_size(size)` | 透過 `tree.set_font_size` 套用群組內容字級 |
+| `_update_selection_ui()` | `tree.checksChanged` 接收者：以 `tree.selected_stats()` 更新「已選 X」與刪除按鈕文字/啟用狀態 |
 | `_export_report()` | 彙整副檔名統計，呼叫 `_make_pie_svg` 產生兩張圓餅圖，輸出 HTML 報表並以瀏覽器開啟 |
 | `_make_pie_svg(slices, title)` | 輸入 `[(label, value), ...]`，回傳含自動配色圓餅圖的 SVG 字串（右側附圖例）|
 | `_toggle_sidebar()` | 切換側邊功能列顯示/隱藏，更新 ◀/▶ 圖示 |
-| `_toggle_filter_panel()` | 切換側邊「篩選與排序」區段展開/收折 |
-| `_toggle_qs_panel()` | 切換側邊「批量快速選取」區段展開/收折 |
-| `_global_apply_conditions()` | 取得全局 ConditionPanel 的條件，套用到所有 GroupCard |
+| `_toggle_filter_panel()` / `_toggle_qs_panel()` | 切換側邊區段展開/收折 |
+| `_global_apply_conditions()` | 取得全局 ConditionPanel 的條件，呼叫 `tree.apply_conditions_all` |
 | `_set_global_mode(mode)` | 設定全局操作模式（保留/刪除），更新按鈕樣式 |
-| `_global_apply(method_name)` | 對 `self._cards` 中每個 GroupCard 呼叫指定選取方法 |
-| `_global_keep_newest()` … | 9 種全域快速選取，各自委派給 `_global_apply` |
-| `_global_select_all/deselect_all()` | 全域全選 / 全不選 |
-| `_delete_selected()` | 確認刪除 → `Path.unlink()` → 記錄 log → 重新掃描 |
+| `_delete_selected()` | 從 `tree._groups` 收集 `fi.selected` 路徑 → 確認 → `Path.unlink()` → 記錄 log → 重新掃描 |
+
+> 全域全選/取消與單一群組快速選取已下放到 `DuplicateTree`（`select_all` / 右鍵選單），MainWindow 只負責叫用與更新摘要。
 
 ---
 
@@ -493,38 +485,36 @@ IDLE ──[開始掃描]──→ SCANNING ──[取消]──→ CANCELING �
 
 ---
 
-## UI 分批渲染
+## UI 虛擬化結果檢視
 
-### 問題描述
+### 問題描述（舊版）
 
-掃描大量檔案（例如整顆磁碟）完成後，`_on_done()` 呼叫 `_apply_filter_sort()` → `_rebuild_cards()`，一次性在主執行緒建立數百個 `GroupCard`（每個含 `QTableWidget`），造成主執行緒長時間阻塞，側邊功能列（篩選、排序、批量選取）反白無回應。
+舊版每個重複群組建立一個 `GroupCard`（內含完整 `QTableWidget`，且每個「刪除」儲存格再以 `QWidget`+`QHBoxLayout` 包一個 `QCheckBox`）。掃描整顆磁碟可能產生數千個群組 → 數千個 table + 數萬個巢狀 widget，記憶體與渲染成本極高、捲動卡頓。即使引入「分批渲染」也只是把建立成本分散到多個事件迴圈 tick，**所有卡片最終仍會被建立**，治標不治本。
 
-### 解法
+### 解法：單一虛擬化 `QTreeWidget`
 
-引入 `_render_pending: list` 與 `_render_generation: int`，並用 `QTimer.singleShot(0, ...)` 將卡片建立分散到多個事件迴圈 tick：
+改用 `DuplicateTree`（見 [main_window.py](#srcuimain_windowpy)）：
+
+1. **原生虛擬化渲染**：`QTreeWidget` 只繪製 viewport 內可見的列，與資料總量無關。
+2. **批次建立頂層列**：群組以 `addTopLevelItems(list)` 一次加入，避免逐筆 `addChild` 觸發 view 的逐筆插入訊號。實測 5,000 個群組的建立時間從約 2,000 ms 降至約 60 ms。
+3. **延遲建立子列（lazy）**：群組頂層列僅以 `ChildIndicatorPolicy.ShowIndicator` 顯示箭頭；`itemExpanded` 首次觸發時才建立檔案子列。未展開的群組幾乎零成本，因此即使數萬個群組也能瞬間顯示。
+4. **選取狀態移入資料層**（`FileInfo.selected`）：與 widget 解耦，是上述虛擬化能成立的關鍵——群組未展開（子列尚未建立）時仍能正確記住勾選，「全選 / 套用到所有群組」只需遍歷資料而非建立所有列。
 
 ```python
-_RENDER_BATCH = 8  # 每批建立的卡片數量
+# 批次建立頂層列（detached → 一次加入），子列待展開才建
+items = [self._make_group_item(idx, g) for idx, g in enumerate(groups)]
+self.addTopLevelItems(items)
+for gi, g in zip(items, groups):
+    gi.setFirstColumnSpanned(True)
+    self._set_group_state(gi, g)   # 三態勾選由資料推導
 
-def _rebuild_cards(self, groups):
-    self._render_generation += 1        # 使舊的 in-flight batch 失效
-    self._render_pending = list(enumerate(groups))
-    self._schedule_batch(self._render_generation)
-
-def _schedule_batch(self, gen):
-    if gen != self._render_generation:  # 已被新的 rebuild 取代，放棄
+def _on_expanded(self, item):       # lazy 建立檔案子列
+    if item.data(0, _ROLE_POP):
         return
-    for _ in range(self._RENDER_BATCH):
-        if not self._render_pending:
-            return
-        i, group = self._render_pending.pop(0)
-        card = GroupCard(...)
-        self.results_layout.insertWidget(i, card)
-    if self._render_pending:
-        QTimer.singleShot(0, lambda g=gen: self._schedule_batch(g))
+    for fi in item.data(0, _ROLE_OBJ).files:
+        self._fill_file_item(QTreeWidgetItem(item), fi)
+    item.setData(0, _ROLE_POP, True)
 ```
-
-`QTimer.singleShot(0, ...)` 將下一批安排在事件佇列末端，使 Qt 能在批次之間處理滑鼠、鍵盤、繪製等事件，側邊列保持可互動。`_render_generation` 計數器確保當篩選條件變更觸發新的 `_rebuild_cards` 時，舊的批次回呼會直接返回，不會與新批次交錯。
 
 ---
 
@@ -554,10 +544,9 @@ def _schedule_batch(self, gen):
 2. **3-Pass 設計**：大幅減少全讀次數。在典型情況下（大量小差異檔案），Pass 3 可能只需處理個位數檔案。
 3. **os.walk 不跟隨 symlink**（`followlinks=False`）：避免循環引用造成無限遍歷。
 4. **時間節流 Progress Signal**：Pass 2 / Pass 3 使用 `time.monotonic()` 節流，每 `EMIT_INTERVAL`（0.15 秒）最多 emit 一次。掃描數萬個候選時，避免 Qt signal 佇列積壓造成 UI 卡頓（舊做法是每 50 個 / 每個檔案 emit，百萬量級時過於頻繁）。
-5. **UI 分批渲染**：見 [UI 分批渲染](#ui-分批渲染)章節。GroupCard 以 `_RENDER_BATCH = 8` 每批建立，批次間讓出 Qt 事件迴圈，防止 UI 反白。
+5. **UI 虛擬化結果檢視**：見 [UI 虛擬化結果檢視](#ui-虛擬化結果檢視)章節。單一 `QTreeWidget` 只渲染可見列、群組子列延遲建立、選取狀態存於資料層，數萬個群組仍能瞬間顯示且滑順捲動（取代舊版每群組一個 `QTableWidget` 的做法）。
 6. **Pass 3 I/O 吞吐**：`CHUNK_SIZE` 從 64 KB 提升至 128 KB，減少 `read()` 系統呼叫次數，提升大型檔案的 Hash 速度。
 7. **自適應多執行緒**：掃描前由 `disk_detect` 偵測磁碟類型，SSD/NVMe 啟用 `ThreadPoolExecutor` 並行 I/O；HDD 維持單執行緒順序讀取，避免隨機尋軌損耗。Python GIL 在 file I/O 與 xxhash（C 擴充）期間自動釋放，多執行緒效益可實際發揮。
-8. **UI 渲染**：GroupCard 使用固定高度 QTableWidget，避免動態計算帶來的效能問題。
 
 ---
 
@@ -571,10 +560,10 @@ def _schedule_batch(self, gen):
 | `BUS_NVME` | disk_detect.py | 17 | STORAGE_BUS_TYPE NVMe 枚舉值（ntddstor.h）|
 | `BUS_SATA` | disk_detect.py | 11 | STORAGE_BUS_TYPE SATA 枚舉值 |
 | `TOTAL_STEPS` | scanner.py | 3 | 掃描步驟總數 |
-| `_RENDER_BATCH` | main_window.py | 8 | 每批建立的 GroupCard 數量 |
+| `_ROLE_KIND/OBJ/POP` | main_window.py | Qt.UserRole(+1/+2) | 樹狀 item 上掛載的角色（種類/物件/子列是否已建立）|
 | `_kill_thread` timeout | main_window.py | 5000 ms | 強制等待 thread 結束的上限 |
 | `IMAGE_EXTENSIONS` | main_window.py | set of str | 支援懸停預覽的圖片副檔名集合 |
-| `DARK_BG` / `ACCENT` etc. | main_window.py | hex colors | 深色主題配色，集中在檔案頂部 |
+| `BG` / `ACCENT` / `DANGER` etc. | main_window.py | hex colors | 現代化深色主題配色，集中在檔案頂部 |
 
 ---
 
