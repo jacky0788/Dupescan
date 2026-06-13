@@ -10,6 +10,8 @@ class FileInfo:
     size:      int          # 檔案大小（bytes）
     hash_full: str  = ""    # 完整 Hash（Pass 3 後填入，空字串表示尚未計算）
     mtime:     float = 0.0  # 修改時間（Unix timestamp）
+    selected:  bool  = False  # 是否被勾選待刪除（選取狀態存於資料層，與 UI widget 解耦，
+                              # 使虛擬化樹狀檢視在群組未展開時仍能正確記住勾選結果）
 
     @property
     def name(self) -> str:
