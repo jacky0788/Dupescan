@@ -12,15 +12,18 @@
 # Pass 2 / Pass 3 支援多執行緒（由 disk_detect.DiskProfile 提供執行緒數）：
 #   SSD/NVMe → ThreadPoolExecutor 並行 I/O，大幅縮短比對時間
 #   HDD      → 單執行緒循序讀取，避免磁頭隨機尋軌造成更大損耗
+#
+# 暫停／停止：讀檔迴圈每讀一個區塊就經過一次暫停點（_checkpoint），worker 執行緒也一樣，
+# 所以暫停會真的停住磁碟讀取，停止也不必等目前這個大檔讀完。
 
 import os
 import threading
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 try:
     import xxhash
@@ -34,6 +37,7 @@ from .models import DuplicateGroup, FileInfo
 PARTIAL_READ  = 4096    # Pass 2 每個檔案讀取的前綴長度（bytes）
 CHUNK_SIZE    = 131072  # Pass 3 每次 read() 的 chunk 大小（128 KB，減少系統呼叫次數）
 EMIT_INTERVAL = 0.15    # 進度 signal 最小發送間隔（秒），避免 Qt 事件佇列積壓
+IN_FLIGHT_PER_WORKER = 4   # 平行模式下每個執行緒最多預先排入的工作數
 TOTAL_STEPS   = 3
 STEP_NAMES    = {
     1: "依檔案大小分組",
@@ -60,6 +64,8 @@ MAX_ERROR_SAMPLES = 200   # 無法讀取的檔案最多保留幾筆明細供 UI 
 # on_progress 回調簽名：(訊息, 目前進度, 總數, 步驟號, 總步驟數, 預估剩餘秒數)
 # eta_secs = -1 表示尚無法估算
 ProgressCallback = Callable[[str, int, int, int, int, int], None]
+# 暫停點：讀檔函式每讀一個區塊呼叫一次，參數是剛讀到的位元組數
+Checkpoint = Callable[[int], None]
 
 
 @dataclass
@@ -83,7 +89,7 @@ class ScanStats:
 
 
 class _Stopped(Exception):
-    """使用者停止掃描時，用來從深層迴圈直接跳出。"""
+    """使用者停止掃描時，用來從深層迴圈（含 worker 執行緒）直接跳出。"""
 
 
 def _format_eta(seconds: int) -> str:
@@ -101,31 +107,48 @@ def _format_eta(seconds: int) -> str:
     return f"約 {h} 小時 {m2} 分"
 
 
-def _partial_hash(path: Path) -> str:
+def _format_bytes(n: float) -> str:
+    """進度訊息用的簡短容量字串（不依賴 humanize）。"""
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def _new_hasher(partial: bool):
+    if _FAST_HASH:
+        return xxhash.xxh64()
+    import hashlib
+    return hashlib.blake2b(digest_size=8 if partial else 32)
+
+
+def _partial_hash(path: Path, checkpoint: Checkpoint | None = None) -> str:
     """讀取檔案前 PARTIAL_READ bytes 並計算 hash；讀取失敗時拋出 OSError。
-    此函式在 ThreadPoolExecutor worker thread 中執行，設計為純函式（無共用狀態）。
+    可在 worker 執行緒執行（無共用狀態）；checkpoint 在讀檔前呼叫，暫停時會在此阻塞。
     """
+    if checkpoint:
+        checkpoint(0)
     with open(path, "rb") as f:
         data = f.read(PARTIAL_READ)
-    if _FAST_HASH:
-        return xxhash.xxh64(data).hexdigest()
-    return __import__("hashlib").blake2b(data, digest_size=8).hexdigest()
+    h = _new_hasher(partial=True)
+    h.update(data)
+    return h.hexdigest()
 
 
-def _full_hash(path: Path) -> str:
+def _full_hash(path: Path, checkpoint: Checkpoint | None = None) -> str:
     """讀取整個檔案計算完整 hash；讀取失敗時拋出 OSError。
-    此函式在 ThreadPoolExecutor worker thread 中執行，設計為純函式（無共用狀態）。
+    每讀一個區塊就呼叫 checkpoint：暫停時阻塞、停止時拋出 _Stopped，大檔也能立刻中斷。
     """
-    if _FAST_HASH:
-        h = xxhash.xxh64()
-    else:
-        h = __import__("hashlib").blake2b(digest_size=32)
+    h = _new_hasher(partial=False)
     with open(path, "rb") as f:
         while True:
             chunk = f.read(CHUNK_SIZE)
             if not chunk:
                 break
             h.update(chunk)
+            if checkpoint:
+                checkpoint(len(chunk))
     return h.hexdigest()
 
 
@@ -168,7 +191,7 @@ class Scanner:
     """3-Pass 重複檔案掃描引擎，執行緒安全。
 
     應在 worker thread 呼叫 scan()；
-    stop() / pause() / resume() 可從任意執行緒安全呼叫。
+    stop() / pause() / resume() 可從任意執行緒安全呼叫，也可以在 scan() 開始前呼叫。
 
     pass2_workers / pass3_workers > 1 啟用並行 I/O（適合 SSD/NVMe）。
     HDD 請保持 workers=1 以維持循序讀取。
@@ -201,15 +224,23 @@ class Scanner:
         self._pause_event = threading.Event()
         self._pause_event.set()   # 初始為「執行中」狀態（Event set = 不阻塞）
 
+        # 目前這個比對階段的進度（worker 執行緒會累加 _bytes_done，以 lock 保護）
+        self._lock        = threading.Lock()
+        self._bytes_done  = 0
+        self._stage: tuple | None = None   # (step, label, total_files, total_bytes, t0)
+        self._files_done  = 0
+        self._last_emit   = 0.0
+        self._scan_thread = 0
+
     # ── 控制方法（可從任意執行緒安全呼叫）────────────────────────────
     def stop(self):
         self._stop_event.set()
         # 若目前處於暫停狀態，必須同時 set pause_event，
-        # 否則 scan thread 永遠阻塞在 _check() 的 wait() 而無法收到 stop 訊號
+        # 否則阻塞在 _checkpoint() 的 wait() 永遠收不到 stop 訊號
         self._pause_event.set()
 
     def pause(self):
-        self._pause_event.clear()   # clear → _check() 的 wait() 開始阻塞
+        self._pause_event.clear()   # clear → _checkpoint() 的 wait() 開始阻塞
 
     def resume(self):
         self._pause_event.set()     # set → 解除阻塞，繼續掃描
@@ -226,6 +257,7 @@ class Scanner:
         被停止 → 只呼叫 on_cancel() 並回傳 None（不會被當成「沒有重複」）；
         發生例外 → 呼叫 on_error(msg) 並回傳 None。
         """
+        self._scan_thread = threading.get_ident()
         try:
             groups = self._run()
         except Exception as exc:
@@ -240,17 +272,22 @@ class Scanner:
             self.on_done(groups, self.stats)
         return groups
 
-    # ── 內部工具 ───────────────────────────────────────────────────────
-    def _check(self) -> bool:
-        """循序模式的暫停點：若已暫停則在此阻塞，回傳 True 表示應停止掃描。
-        只能在 scan thread 呼叫（不適合在 worker thread 內使用）。
-        """
-        self._pause_event.wait()
-        return self._stop_event.is_set()
+    # ── 暫停點與進度 ───────────────────────────────────────────────────
+    def _checkpoint(self, nbytes: int = 0):
+        """暫停點（任何執行緒都可呼叫）：暫停時阻塞，停止時拋出 _Stopped。
 
-    def _stopped(self) -> bool:
-        """非阻塞的停止查詢，供並行消費迴圈在 as_completed 之後快速檢查。"""
-        return self._stop_event.is_set()
+        讀檔函式每讀一個區塊呼叫一次並帶入位元組數，用來估算大檔的進度；
+        在 scan thread 上呼叫時順便發送進度（循序模式讀大檔時進度列也會動）。
+        """
+        if nbytes:
+            with self._lock:
+                self._bytes_done += nbytes
+        if not self._pause_event.is_set():
+            self._pause_event.wait()
+        if self._stop_event.is_set():
+            raise _Stopped
+        if nbytes and threading.get_ident() == self._scan_thread:
+            self._report()
 
     def _emit(self, msg: str, current: int, total: int,
               step: int, eta_secs: int = -1):
@@ -259,7 +296,7 @@ class Scanner:
             self.on_progress(msg, current, total, step, TOTAL_STEPS, eta_secs)
 
     @staticmethod
-    def _eta(start_time: float, done: int, total: int) -> int:
+    def _eta(start_time: float, done: float, total: float) -> int:
         """依已耗時間與完成比例線性估算剩餘秒數。
         開始不足 0.5 秒時樣本太少，回傳 -1（顯示「計算中」）。
         """
@@ -271,16 +308,36 @@ class Scanner:
         rate = done / elapsed
         return int((total - done) / rate)
 
+    def _report(self, force: bool = False):
+        """依目前階段的進度發送訊息（時間節流）。Pass 3 以位元組估算 ETA，大檔才準。"""
+        if self._stage is None:
+            return
+        now = time.monotonic()
+        if not force and now - self._last_emit < EMIT_INTERVAL:
+            return
+        self._last_emit = now
+        step, label, total_files, total_bytes, t0 = self._stage
+        done = self._files_done
+        if step == 3 and total_bytes > 0:
+            with self._lock:
+                done_bytes = min(self._bytes_done, total_bytes)
+            msg = (f"{label}... ({done:,}/{total_files:,} 個檔案・"
+                   f"{_format_bytes(done_bytes)} / {_format_bytes(total_bytes)})")
+            self._emit(msg, int(1000 * done_bytes / total_bytes), 1000, step,
+                       self._eta(t0, done_bytes, total_bytes))
+        else:
+            self._emit(f"{label}... ({done:,}/{total_files:,})", done, total_files, step,
+                       self._eta(t0, done, total_files))
+
     # ── Pass 1：遍歷 ───────────────────────────────────────────────────
-    def _walk(self):
+    def _walk(self) -> Iterator[FileInfo]:
         """依序產生每個符合條件的檔案（FileInfo）。停止時拋出 _Stopped。"""
         stats = self.stats
         last_emit = time.monotonic()
         for root in self.roots:
             stack = [str(root)]
             while stack:
-                if self._check():
-                    raise _Stopped
+                self._checkpoint()
                 current = stack.pop()
                 try:
                     it = os.scandir(current)
@@ -327,8 +384,7 @@ class Scanner:
                                        mtime=st.st_mtime, mtime_ns=st.st_mtime_ns)
 
                         if stats.files_seen % 512 == 0:
-                            if self._check():
-                                raise _Stopped
+                            self._checkpoint()
                             now = time.monotonic()
                             if now - last_emit >= EMIT_INTERVAL:
                                 self._emit(f"掃描中... 已找到 {stats.files_seen:,} 個檔案",
@@ -349,8 +405,8 @@ class Scanner:
             unique: list[FileInfo] = []
             for fi in files:
                 checked += 1
-                if checked % 256 == 0 and self._check():
-                    raise _Stopped
+                if checked % 256 == 0:
+                    self._checkpoint()
                 try:
                     st = os.stat(fi.path)
                 except OSError as exc:
@@ -368,182 +424,118 @@ class Scanner:
                 merged[size] = unique
         return merged
 
-    # ── Pass 2 路徑選擇 ────────────────────────────────────────────────
-    def _pass2_sequential(self, candidates, total_c, t0) -> dict | None:
-        """HDD 安全的循序 Pass 2：細粒度暫停/停止，維持順序讀取。
-        回傳 by_partial dict；若使用者停止則回傳 None。
+    # ── Pass 2 / Pass 3：雜湊比對 ──────────────────────────────────────
+    def _hash_stage(self, files: list[FileInfo], fn, workers: int,
+                    step: int, label: str) -> Iterator[tuple[FileInfo, str]]:
+        """對每個檔案呼叫 fn(path, checkpoint)，依完成順序產生 (FileInfo, digest)。
+
+        讀取失敗的檔案記入統計後略過；使用者停止時拋出 _Stopped。
+        workers > 1 時以執行緒池並行，但同時排入的工作不超過 workers × IN_FLIGHT_PER_WORKER 個
+        （不會一次建立數十萬個 future），暫停／停止由 worker 在讀檔區塊之間自行檢查。
         """
-        by_partial: dict[tuple[int, str], list[FileInfo]] = defaultdict(list)
-        done = 0
-        last_emit = t0
+        self._stage = (step, label, len(files), sum(fi.size for fi in files), time.monotonic())
+        self._files_done = 0
+        with self._lock:
+            self._bytes_done = 0
+        self._report(force=True)
 
-        for files in candidates.values():
+        if workers <= 1:
             for fi in files:
-                if self._check():
-                    return None     # 使用者已停止，中斷掃描
+                self._checkpoint()
                 try:
-                    by_partial[(fi.size, _partial_hash(fi.path))].append(fi)
+                    digest = fn(fi.path, self._checkpoint)
                 except OSError as exc:
                     self.stats.add_unreadable(fi.path, exc)
-                done += 1
-                now = time.monotonic()
-                if now - last_emit >= EMIT_INTERVAL or done == total_c:
-                    self._emit(f"快速比對中... ({done:,}/{total_c:,})",
-                               done, total_c, 2, self._eta(t0, done, total_c))
-                    last_emit = now
+                else:
+                    yield fi, digest
+                self._files_done += 1
+                self._report()
+            self._report(force=True)
+            return
 
-        return by_partial
+        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dupescan-hash")
+        pending: dict = {}
+        queue = iter(files)
+        completed = False
 
-    def _pass2_parallel(self, candidates, total_c, t0, workers) -> dict | None:
-        """SSD/NVMe 並行 Pass 2：ThreadPoolExecutor 同時發出多個讀取請求。
+        def submit_next():
+            fi = next(queue, None)
+            if fi is not None:
+                pending[pool.submit(fn, fi.path, self._checkpoint)] = fi
 
-        執行緒安全說明：
-        - worker thread 只執行 _partial_hash（純函式，只讀磁碟回傳字串）
-        - 所有 dict/list 操作在本方法的 as_completed 迴圈中循序執行（scan thread）
-        - 無共用可變狀態，不需要 lock
-
-        暫停：在消費迴圈呼叫 _pause_event.wait()，已提交的 future 繼續跑完
-        停止：呼叫 f.cancel() 嘗試取消尚未開始的 future，已在跑的等完即捨棄
-        """
-        by_partial: dict[tuple[int, str], list[FileInfo]] = defaultdict(list)
-        done = 0
-        last_emit = t0
-        # 展平成一維 list，方便一次性提交給 executor
-        flat = [fi for files in candidates.values() for fi in files]
-
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(_partial_hash, fi.path): fi for fi in flat}
-            for fut in as_completed(futs):
-                self._pause_event.wait()    # 暫停時在此阻塞，等待 resume()
-                if self._stopped():
-                    for f in futs:
-                        f.cancel()          # 嘗試取消尚未開始的 future
-                    return None
-                fi = futs[fut]
-                try:
-                    by_partial[(fi.size, fut.result())].append(fi)
-                except OSError as exc:
-                    self.stats.add_unreadable(fi.path, exc)
-                done += 1
-                now = time.monotonic()
-                if now - last_emit >= EMIT_INTERVAL or done == total_c:
-                    self._emit(f"快速比對中... ({done:,}/{total_c:,})",
-                               done, total_c, 2, self._eta(t0, done, total_c))
-                    last_emit = now
-
-        return by_partial
-
-    # ── Pass 3 路徑選擇 ────────────────────────────────────────────────
-    def _pass3_sequential(self, candidates2, total2, t0) -> dict | None:
-        """HDD 安全的循序 Pass 3。"""
-        by_full: dict[tuple[int, str], list[FileInfo]] = defaultdict(list)
-        done = 0
-        last_emit = t0
-
-        for files in candidates2.values():
-            for fi in files:
-                if self._check():
-                    return None
-                try:
-                    fh = _full_hash(fi.path)
-                    fi.hash_full = fh
-                    by_full[(fi.size, fh)].append(fi)
-                except OSError as exc:
-                    self.stats.add_unreadable(fi.path, exc)
-                done += 1
-                now = time.monotonic()
-                if now - last_emit >= EMIT_INTERVAL or done == total2:
-                    eta = self._eta(t0, done, total2) if total2 > 0 else 0
-                    self._emit(f"完整比對中... ({done:,}/{total2:,})",
-                               done, total2, 3, eta)
-                    last_emit = now
-
-        return by_full
-
-    def _pass3_parallel(self, candidates2, total2, t0, workers) -> dict | None:
-        """SSD/NVMe 並行 Pass 3，執行緒安全說明同 _pass2_parallel。"""
-        by_full: dict[tuple[int, str], list[FileInfo]] = defaultdict(list)
-        done = 0
-        last_emit = t0
-        flat = [fi for files in candidates2.values() for fi in files]
-
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(_full_hash, fi.path): fi for fi in flat}
-            for fut in as_completed(futs):
-                self._pause_event.wait()
-                if self._stopped():
-                    for f in futs:
-                        f.cancel()
-                    return None
-                fi = futs[fut]
-                try:
-                    fh = fut.result()
-                    fi.hash_full = fh
-                    by_full[(fi.size, fh)].append(fi)
-                except OSError as exc:
-                    self.stats.add_unreadable(fi.path, exc)
-                done += 1
-                now = time.monotonic()
-                if now - last_emit >= EMIT_INTERVAL or done == total2:
-                    eta = self._eta(t0, done, total2) if total2 > 0 else 0
-                    self._emit(f"完整比對中... ({done:,}/{total2:,})",
-                               done, total2, 3, eta)
-                    last_emit = now
-
-        return by_full
+        try:
+            for _ in range(workers * IN_FLIGHT_PER_WORKER):
+                submit_next()
+            while pending:
+                # 逾時醒來發送進度：單一大檔要讀很久時進度列也會動
+                finished, _ = wait(pending, timeout=EMIT_INTERVAL, return_when=FIRST_COMPLETED)
+                for fut in finished:
+                    fi = pending.pop(fut)
+                    try:
+                        digest = fut.result()
+                    except OSError as exc:
+                        self.stats.add_unreadable(fi.path, exc)
+                    else:
+                        yield fi, digest
+                    self._files_done += 1
+                    submit_next()
+                self._checkpoint()
+                self._report()
+            completed = True
+            self._report(force=True)
+        finally:
+            if not completed:
+                # 停止或發生例外：讓執行中的 worker 在下一個讀檔區塊就結束
+                self._stop_event.set()
+                self._pause_event.set()
+                for fut in pending:
+                    fut.cancel()
+            pool.shutdown(wait=True)
 
     # ── 3-Pass 主流程 ──────────────────────────────────────────────────
     def _run(self) -> list[DuplicateGroup] | None:
         """執行 3-pass 演算法；使用者停止時回傳 None。"""
+        try:
+            return self._run_passes()
+        except _Stopped:
+            return None
+        finally:
+            self._stage = None
 
+    def _run_passes(self) -> list[DuplicateGroup]:
         # ── Pass 1：遍歷目錄，依檔案大小分組 ──────────────────────────
         self._emit("掃描檔案中...", 0, 0, 1)
         by_size: dict[int, list[FileInfo]] = defaultdict(list)
-        try:
-            for fi in self._walk():
-                by_size[fi.size].append(fi)
-            # 只保留大小有重複的群組，其他不可能是重複檔案；再合併同一實體檔的路徑
-            candidates = self._merge_same_files(
-                {s: f for s, f in by_size.items() if len(f) > 1})
-        except _Stopped:
-            return None
+        for fi in self._walk():
+            by_size[fi.size].append(fi)
+        # 只保留大小有重複的群組，其他不可能是重複檔案；再合併同一實體檔的路徑
+        candidates = self._merge_same_files({s: f for s, f in by_size.items() if len(f) > 1})
         by_size.clear()
-        total_c = sum(len(v) for v in candidates.values())
-        self.stats.candidates = total_c
+        flat = [fi for files in candidates.values() for fi in files]
+        self.stats.candidates = len(flat)
         scanned = self.stats.files_seen
         self._emit(
-            f"大小分組完成 — 共掃描 {scanned:,} 個檔案，{total_c:,} 個候選",
+            f"大小分組完成 — 共掃描 {scanned:,} 個檔案，{len(flat):,} 個候選",
             scanned, scanned, 1, 0,
         )
 
-        # ── Pass 2：前 4 KB 快速 Hash（循序 or 並行）─────────────────
-        t0 = time.monotonic()
-        if self.pass2_workers > 1:
-            by_partial = self._pass2_parallel(candidates, total_c, t0, self.pass2_workers)
-        else:
-            by_partial = self._pass2_sequential(candidates, total_c, t0)
+        # ── Pass 2：前 4 KB 快速 Hash ────────────────────────────────
+        # 以「大小＋前段 hash」分組：大小相同但前 4 KB 不同的一定不是重複，
+        # 大小不同但開頭相同的檔案也不會被送去完整比對
+        by_partial: dict[tuple[int, str], list[FileInfo]] = defaultdict(list)
+        for fi, digest in self._hash_stage(flat, _partial_hash, self.pass2_workers,
+                                           2, "快速比對中"):
+            by_partial[(fi.size, digest)].append(fi)
+        flat2 = [fi for files in by_partial.values() if len(files) > 1 for fi in files]
+        self._emit(f"快速比對完成 — {len(flat2):,} 個檔案需完整比對",
+                   len(flat), len(flat), 2, 0)
 
-        if by_partial is None:
-            return None   # 使用者中止
-
-        # 大小相同但前 4 KB 不同的一定不是重複，直接刪除
-        # （以「大小＋前段 hash」分組，避免不同大小但開頭相同的檔案被送去完整比對）
-        candidates2 = {k: f for k, f in by_partial.items() if len(f) > 1}
-        total2 = sum(len(v) for v in candidates2.values())
-        self._emit(
-            f"快速比對完成 — {total2:,} 個檔案需完整比對",
-            total_c, total_c, 2, 0,
-        )
-
-        # ── Pass 3：完整 Hash（循序 or 並行）─────────────────────────
-        t0 = time.monotonic()
-        if self.pass3_workers > 1:
-            by_full = self._pass3_parallel(candidates2, total2, t0, self.pass3_workers)
-        else:
-            by_full = self._pass3_sequential(candidates2, total2, t0)
-
-        if by_full is None:
-            return None   # 使用者中止
+        # ── Pass 3：完整 Hash ────────────────────────────────────────
+        by_full: dict[tuple[int, str], list[FileInfo]] = defaultdict(list)
+        for fi, digest in self._hash_stage(flat2, _full_hash, self.pass3_workers,
+                                           3, "完整比對中"):
+            fi.hash_full = digest
+            by_full[(fi.size, digest)].append(fi)
 
         # 建立結果群組：群組內依路徑排序（平手規則的結果才會固定），
         # 群組依可釋放空間由大到小排序（最值得刪除的排最前面）

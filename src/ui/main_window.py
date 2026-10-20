@@ -11,6 +11,7 @@
 import os
 import subprocess
 import datetime
+import functools
 import math
 import tempfile
 import webbrowser
@@ -62,52 +63,59 @@ def human_size(n: int) -> str:
 class ScanWorker(QObject):
     """Qt worker 包裝器，透過 moveToThread 搬到 QThread 執行掃描。
 
-    Signal 是跨執行緒通訊的唯一介面：
+    Signal 是跨執行緒通訊的唯一介面，第一個參數都是 scan_id（主視窗據此忽略舊掃描的訊號）：
       progress  → 更新進度條與步驟標籤
       finished  → 掃描完成，帶回結果群組清單與 ScanStats
       cancelled → 使用者停止掃描（不是「沒有重複」）
       error     → 掃描引擎例外，帶回錯誤訊息字串
       detected  → 磁碟偵測完成，帶回 DiskProfile.summary() 字串
+      ended     → run() 結束（不論結果），接到 QThread.quit 讓執行緒收尾
     """
-    progress  = pyqtSignal(str, int, int, int, int, int)
-    finished  = pyqtSignal(list, object)
-    cancelled = pyqtSignal()
-    error     = pyqtSignal(str)
-    detected  = pyqtSignal(str)
+    progress  = pyqtSignal(int, str, int, int, int, int, int)
+    finished  = pyqtSignal(int, list, object)
+    cancelled = pyqtSignal(int)
+    error     = pyqtSignal(int, str)
+    detected  = pyqtSignal(int, str)
+    ended     = pyqtSignal()
 
-    def __init__(self, roots: list[str], min_size: int):
+    def __init__(self, scan_id: int, roots: list[str], min_size: int):
         super().__init__()
-        self._roots    = roots
-        self._min_size = min_size
-        self._scanner: Scanner | None = None
+        self.scan_id = scan_id
+        self._roots  = roots
+        # Scanner 在建構時就建立：run() 開始前呼叫 stop() 也會生效
+        self._scanner = Scanner(
+            roots=roots,
+            min_size=min_size,
+            on_progress=lambda m, c, t, s, ts, eta: self.progress.emit(scan_id, m, c, t, s, ts, eta),
+            on_done=lambda g, st: self.finished.emit(scan_id, g, st),
+            on_error=lambda e: self.error.emit(scan_id, e),
+            on_cancel=lambda: self.cancelled.emit(scan_id),
+        )
 
     def run(self):
-        """在 worker thread 執行：先偵測磁碟類型，再建立並啟動 Scanner。"""
-        from ..disk_detect import detect_disk_profile
-
-        profile = detect_disk_profile(Path(self._roots[0]))
-        self.detected.emit(profile.summary())
-
-        self._scanner = Scanner(
-            roots=self._roots,
-            min_size=self._min_size,
-            pass2_workers=profile.pass2_workers,
-            pass3_workers=profile.pass3_workers,
-            on_progress=lambda m, c, t, s, ts, eta: self.progress.emit(m, c, t, s, ts, eta),
-            on_done=lambda g, st: self.finished.emit(g, st),
-            on_error=lambda e: self.error.emit(e),
-            on_cancel=lambda: self.cancelled.emit(),
-        )
-        self._scanner.scan()
+        """在 worker thread 執行：先偵測磁碟類型決定執行緒數，再啟動 Scanner。"""
+        try:
+            from ..disk_detect import detect_disk_profile
+            profile = detect_disk_profile(Path(self._roots[0]))
+            self.detected.emit(self.scan_id, profile.summary())
+            self._scanner.pass2_workers = profile.pass2_workers
+            self._scanner.pass3_workers = profile.pass3_workers
+            self._scanner.scan()
+        finally:
+            self.ended.emit()
 
     def stop(self):
-        if self._scanner: self._scanner.stop()
+        self._scanner.stop()
 
     def pause(self):
-        if self._scanner: self._scanner.pause()
+        self._scanner.pause()
 
     def resume(self):
-        if self._scanner: self._scanner.resume()
+        self._scanner.resume()
+
+
+# 關閉視窗時仍未結束的掃描執行緒：保留參照到程式結束，避免 QThread 在執行中被回收而閃退
+_UNFINISHED_THREADS: list = []
 
 
 # ── 現代化深色主題配色 ────────────────────────────────────────────────────────
@@ -710,8 +718,10 @@ class DuplicateTree(QTreeWidget):
 class MainWindow(QMainWindow):
     """應用程式主視窗，負責掃描流程管理、結果篩選排序、批次選取、刪除與報表匯出。
 
-    掃描 Race Condition 防護：每次 _start_scan 遞增 _scan_id；thread.finished
-    以 lambda 捕捉當時 scan_id，_on_thread_finished 比對不符則忽略舊 signal。
+    掃描 Race Condition 防護：每次 _start_scan 遞增 _scan_id，ScanWorker 的每個 signal
+    都帶著自己的 scan_id，與目前的 _scan_id 不符就忽略（舊掃描的遲到訊號不會蓋掉新結果）。
+    執行緒生命週期：worker.ended → thread.quit；(thread, worker) 存在 _threads，
+    直到該執行緒的 finished 送達 _on_thread_finished 才釋放，絕不讓執行中的 QThread 被回收。
     """
 
     def __init__(self):
@@ -728,6 +738,9 @@ class MainWindow(QMainWindow):
         self._scanning: bool = False
         self._paused:   bool = False
         self._scan_id:  int  = 0
+        # 每次掃描的 (thread, worker)，以 scan_id 為鍵；一律等 finished 訊號送達才釋放：
+        # 執行中的 QThread 被回收，或 finished 送達前就刪掉它，Qt 都會直接終止程式
+        self._threads: dict[int, tuple[QThread, ScanWorker]] = {}
 
         self._global_qs_mode: str  = "keep"
         self._sidebar_open:   bool = True
@@ -1114,7 +1127,7 @@ class MainWindow(QMainWindow):
         if not Path(path).exists():
             QMessageBox.warning(self, "路徑錯誤", f"路徑不存在：{path}"); return
 
-        self._kill_thread()
+        self._stop_worker()
         self._clear_results()
         self.summary_widget.setVisible(False)
         self._sb_filter_body.setVisible(False)
@@ -1125,22 +1138,23 @@ class MainWindow(QMainWindow):
         self._paused = False
 
         self._scan_id += 1
-        current_scan_id = self._scan_id
         min_bytes = self.min_size_spin.value() * 1024
         logger.info(f"掃描開始 — 路徑: {path}, 最小大小: {min_bytes} B")
 
-        self._worker = ScanWorker(roots=[path], min_size=min_bytes)
-        self._worker.progress.connect(self._on_progress)
-        self._worker.finished.connect(self._on_done)
-        self._worker.cancelled.connect(self._on_cancelled)
-        self._worker.error.connect(self._on_error)
-        self._worker.detected.connect(self._on_disk_detected)
-        self._thread = QThread()
-        self._worker.moveToThread(self._thread)
-        self._thread.started.connect(self._worker.run)
-        self._thread.finished.connect(
-            lambda sid=current_scan_id: self._on_thread_finished(sid))
-        self._thread.start()
+        worker = ScanWorker(self._scan_id, roots=[path], min_size=min_bytes)
+        worker.progress.connect(self._on_progress)
+        worker.finished.connect(self._on_done)
+        worker.cancelled.connect(self._on_cancelled)
+        worker.error.connect(self._on_error)
+        worker.detected.connect(self._on_disk_detected)
+        thread = QThread()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.ended.connect(thread.quit)          # 掃描結束 → 執行緒的事件迴圈也結束
+        thread.finished.connect(functools.partial(self._on_thread_finished, self._scan_id))
+        self._threads[self._scan_id] = (thread, worker)
+        self._worker, self._thread = worker, thread
+        thread.start()
 
     def _cancel_scan(self):
         if self._worker: self._worker.stop()
@@ -1172,7 +1186,7 @@ class MainWindow(QMainWindow):
             logger.info("掃描已暫停")
 
     def _reset_all(self):
-        self._kill_thread()
+        self._stop_worker()
         self._clear_results()
         self.summary_widget.setVisible(False)
         self._sb_filter_body.setVisible(self._sb_filter_open)
@@ -1183,13 +1197,28 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage("已重置")
         logger.info("已重置（使用者操作）")
 
-    def _kill_thread(self):
-        if self._worker: self._worker.stop()
-        if self._thread and self._thread.isRunning():
-            self._thread.quit()
-            self._thread.wait(5000)
-        self._thread = None
-        self._worker = None
+    def _stop_worker(self, wait_ms: int = 2000):
+        """停止目前的掃描並等它結束（讀檔區塊之間就會停，通常不到 0.1 秒）。
+
+        若在時限內等不到（例如網路磁碟卡住）也不會強行處理：參照留在 _threads，
+        等它自己結束、finished 送達後再釋放；之後的訊號會因 scan_id 不符而被忽略。
+        """
+        worker, thread = self._worker, self._thread
+        self._worker = self._thread = None
+        if worker is not None:
+            worker.stop()
+        if thread is not None and thread.isRunning() and not thread.wait(wait_ms):
+            logger.warning("背景掃描執行緒未在時限內結束，改在背景等待它結束")
+
+    def closeEvent(self, event):
+        """關閉視窗前先停止掃描；仍未結束的執行緒保留參照到程式結束，避免閃退。"""
+        self._stop_worker(wait_ms=5000)
+        for thread, worker in list(self._threads.values()):
+            worker.stop()
+            thread.wait(3000)
+        _UNFINISHED_THREADS.extend(p for p in self._threads.values() if p[0].isRunning())
+        self._preview_popup.close()
+        super().closeEvent(event)
 
     def _set_scanning(self, scanning: bool):
         self._scanning = scanning
@@ -1210,14 +1239,18 @@ class MainWindow(QMainWindow):
 
     # ── Signal 接收者（Slots）────────────────────────────────────────
     def _on_thread_finished(self, scan_id: int):
-        if scan_id != self._scan_id: return
-        self._thread = None
-        self._worker = None
-        self._paused = False
-        if self._scanning:
-            self._set_scanning(False)
-            self._hide_progress()
-            self.status_bar.showMessage("掃描已取消")
+        """掃描執行緒結束：此時才釋放 (thread, worker) 的參照。"""
+        pair = self._threads.pop(scan_id, None)
+        if pair is None:
+            return
+        thread, _ = pair
+        thread.wait()                              # finished 發出後執行緒還在收尾，等它真正結束
+        if thread is self._thread:
+            self._thread = self._worker = None
+            if self._scanning:                     # 正常不會發生：沒收到結果訊號就結束了
+                self._set_scanning(False)
+                self._hide_progress()
+                self.status_bar.showMessage("掃描已中止")
 
     def _hide_progress(self):
         """隱藏進度區並清空各標籤（掃描結束、取消、錯誤、重置共用）。"""
@@ -1227,13 +1260,14 @@ class MainWindow(QMainWindow):
         self.step_label.setText("")
         self.eta_label.setText("")
 
-    def _on_disk_detected(self, summary: str):
+    def _on_disk_detected(self, sid: int, summary: str):
+        if sid != self._scan_id: return
         self.disk_label.setText(f"💽 {summary}")
         self.status_bar.showMessage(f"磁碟類型: {summary}")
         logger.info(f"磁碟偵測: {summary}")
 
-    def _on_progress(self, msg, cur, total, step, total_steps, eta_secs):
-        if not self._scanning: return
+    def _on_progress(self, sid, msg, cur, total, step, total_steps, eta_secs):
+        if sid != self._scan_id or not self._scanning: return
         step_name = STEP_NAMES.get(step, f"步驟 {step}")
         self.step_label.setText(f"步驟 {step}/{total_steps} · {step_name}")
         if eta_secs == 0:
@@ -1249,8 +1283,8 @@ class MainWindow(QMainWindow):
         else:
             self.progress_bar.setRange(0, 0)
 
-    def _on_done(self, groups: list, stats: ScanStats):
-        if not self._scanning: return
+    def _on_done(self, sid: int, groups: list, stats: ScanStats):
+        if sid != self._scan_id or not self._scanning: return
         self._set_scanning(False)
         self._paused = False
         self._hide_progress()
@@ -1297,9 +1331,9 @@ class MainWindow(QMainWindow):
         for line in stats.unreadable_samples:
             logger.info(f"  無法讀取: {line}")
 
-    def _on_cancelled(self):
+    def _on_cancelled(self, sid: int):
         """使用者停止掃描：回到閒置狀態，明確顯示「已取消」而不是「沒有重複」。"""
-        if not self._scanning: return
+        if sid != self._scan_id or not self._scanning: return
         self._set_scanning(False)
         self._paused = False
         self._hide_progress()
@@ -1307,8 +1341,8 @@ class MainWindow(QMainWindow):
         self.tree.populate([])
         self.status_bar.showMessage("掃描已取消")
 
-    def _on_error(self, msg: str):
-        if not self._scanning: return
+    def _on_error(self, sid: int, msg: str):
+        if sid != self._scan_id or not self._scanning: return
         self._set_scanning(False)
         self._paused = False
         self._hide_progress()

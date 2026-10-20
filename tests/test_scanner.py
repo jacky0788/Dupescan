@@ -222,7 +222,7 @@ def test_same_head_but_different_size_not_fully_hashed(tree, monkeypatch):
     import src.scanner as sc
     calls = []
     orig = sc._full_hash
-    monkeypatch.setattr(sc, "_full_hash", lambda p: calls.append(p) or orig(p))
+    monkeypatch.setattr(sc, "_full_hash", lambda p, cp=None: calls.append(p) or orig(p, cp))
     head = blob(8 * KB, 1)
     tree("a1.bin", head + b"1" * 10)
     tree("a2.bin", blob(8 * KB + 10, 2))        # 與 a1 同大小、開頭不同
@@ -230,3 +230,74 @@ def test_same_head_but_different_size_not_fully_hashed(tree, monkeypatch):
     tree("b2.bin", blob(8 * KB + 20, 3))
     assert Scanner([str(tree.root)], min_size=1).scan() == []
     assert calls == []
+
+
+# ── 掃描控制：暫停真的停住讀取、停止不必等大檔讀完 ──────────────────────
+def test_pause_really_stops_parallel_reads(tree, monkeypatch):
+    import src.scanner as sc
+    lock = threading.Lock()
+    reads = [0]
+    orig = sc._partial_hash
+
+    def counting(path, checkpoint=None):
+        if checkpoint:
+            checkpoint(0)
+        with lock:
+            reads[0] += 1
+        time.sleep(0.004)
+        return orig(path, checkpoint)
+
+    monkeypatch.setattr(sc, "_partial_hash", counting)
+    payload = blob(2040, 1)
+    n = 1200
+    for i in range(n):
+        tree(f"f{i:04d}.bin", payload + i.to_bytes(8, "little"))   # 同大小、內容不同
+    in_pass2 = threading.Event()
+    s = Scanner([str(tree.root)], min_size=1, pass2_workers=8, pass3_workers=1,
+                on_progress=lambda m, c, t, st, ts, eta:
+                    in_pass2.set() if st == 2 and c > 0 else None)
+    th = threading.Thread(target=s.scan)
+    th.start()
+    assert in_pass2.wait(10)
+    s.pause()
+    time.sleep(0.1)                     # 已經在讀的檔案讓它讀完
+    with lock:
+        before = reads[0]
+    time.sleep(1.0)
+    with lock:
+        during = reads[0] - before
+    s.resume()
+    th.join(20)
+    assert during == 0
+    assert reads[0] == n
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+def test_stop_interrupts_large_file(tree, monkeypatch, workers):
+    import src.scanner as sc
+    monkeypatch.setattr(sc, "CHUNK_SIZE", 4096)
+    data = blob(4 * 1024 * 1024, 1)     # 4 MB → 1,024 個讀檔區塊
+    tree("a.bin", data)
+    tree("b.bin", data)
+    orig = sc._full_hash
+
+    def slow_full(path, checkpoint=None):
+        def slow_checkpoint(n=0):
+            time.sleep(0.002)           # 每個區塊 2 ms → 一個檔約 2 秒
+            checkpoint(n)
+        return orig(path, slow_checkpoint)
+
+    monkeypatch.setattr(sc, "_full_hash", slow_full)
+    in_pass3 = threading.Event()
+    s = Scanner([str(tree.root)], min_size=1, pass2_workers=workers, pass3_workers=workers,
+                on_progress=lambda m, c, t, st, ts, eta: in_pass3.set() if st == 3 else None)
+    result = []
+    th = threading.Thread(target=lambda: result.append(s.scan()))
+    th.start()
+    assert in_pass3.wait(10)
+    time.sleep(0.2)
+    t0 = time.monotonic()
+    s.stop()
+    th.join(10)
+    assert time.monotonic() - t0 < 0.5
+    assert result == [None]
