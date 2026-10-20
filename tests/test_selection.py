@@ -199,11 +199,11 @@ def test_folder_scores_follow_list_order_and_deepest_match():
 
 
 def test_folder_priority_keep_and_delete_mode():
-    rules = RuleSet(conditions=["folders"], keep_dirs=["D:\\SD\\models"], remove_dirs=["_trash", "_bak"])
-    g = group_of("D:/SD/models/_bak/m.safetensors", "D:/SD/models/m.safetensors",
+    rules = RuleSet(conditions=["folders"], keep_dirs=["D:\\Models"], remove_dirs=["_trash", "_bak"])
+    g = group_of("D:/Models/_bak/m.safetensors", "D:/Models/m.safetensors",
                  "E:/_trash/m.safetensors")
     assert apply_selection(g, rules.build(), "keep") == "folders"
-    assert paths_selected(g) == ["D:/SD/models/_bak/m.safetensors", "E:/_trash/m.safetensors"]
+    assert paths_selected(g) == ["D:/Models/_bak/m.safetensors", "E:/_trash/m.safetensors"]
     # 刪除模式：只勾最該移除的（_trash 排在 _bak 前面）
     apply_selection(g, rules.build(), "delete")
     assert paths_selected(g) == ["E:/_trash/m.safetensors"]
