@@ -29,7 +29,7 @@ from PyQt6.QtGui import QColor, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QProgressDialog,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
-    QMessageBox, QPushButton, QProgressBar, QScrollArea,
+    QMessageBox, QPlainTextEdit, QPushButton, QProgressBar, QScrollArea,
     QSizePolicy, QSpinBox, QStatusBar, QStyledItemDelegate, QVBoxLayout, QWidget,
     QTreeWidget, QTreeWidgetItem, QMenu, QGraphicsDropShadowEffect,
 )
@@ -636,8 +636,15 @@ class DuplicateTree(QTreeWidget):
         has_dirs = bool(rules.keep_dirs or rules.remove_dirs)
         add_quick(quick, "依資料夾優先序" if has_dirs else "依資料夾優先序（請先在側邊列設定資料夾）",
                   [_condition("folders", rules)]).setEnabled(has_dirs)
+        custom, custom_errors = rules.custom_rules()
+        custom_text = ("依自訂規則（有錯誤，請先修正）" if custom_errors else
+                       "依自訂規則" if custom else "依自訂規則（請先在側邊列設定）")
+        add_quick(quick, custom_text, [_condition("custom", rules)]).setEnabled(
+            bool(custom) and not custom_errors)
         active = rules.build()
-        add_quick(menu, "套用側邊列的條件到此群組", active, rules.mode).setEnabled(bool(active))
+        blocked = "custom" in rules.conditions and bool(custom_errors)
+        add_quick(menu, "套用側邊列的條件到此群組" + ("（自訂規則有錯誤）" if blocked else ""),
+                  active, rules.mode).setEnabled(bool(active) and not blocked)
         menu.addSeparator()
         a_all = menu.addAction("勾選此群組全部")
         a_all.triggered.connect(lambda: self._toggle_group(group_item, g, True))
@@ -1190,6 +1197,7 @@ class MainWindow(QMainWindow):
         self._global_cond.keep_dirs_edit.setText(st.value("select/keep_dirs", "", str))
         self._global_cond.remove_dirs_edit.setText(st.value("select/remove_dirs", "", str))
         self._global_cond.reference_edit.setText(st.value("select/reference_dirs", "", str))
+        self._global_cond.custom_edit.setPlainText(st.value("select/custom_rules", "", str))
         self._sync_reference()
         for cond_id in st.value("select/conditions", [], list) or []:
             cb = self._global_cond._checkboxes.get(cond_id)
@@ -1222,6 +1230,7 @@ class MainWindow(QMainWindow):
         st.setValue("select/keep_dirs", self._global_cond.keep_dirs_edit.text())
         st.setValue("select/remove_dirs", self._global_cond.remove_dirs_edit.text())
         st.setValue("select/reference_dirs", self._global_cond.reference_edit.text())
+        st.setValue("select/custom_rules", self._global_cond.custom_edit.toPlainText())
         st.setValue("ui/sidebar_open", self._sidebar_open)
         st.setValue("ui/scan_panel_open", self._sb_scan_open)
         st.setValue("ui/filter_panel_open", self._sb_filter_open)
@@ -1267,6 +1276,11 @@ class MainWindow(QMainWindow):
         conditions = rules.build()
         if not conditions:
             QMessageBox.information(self, "提示", "請先勾選至少一個條件。")
+            return
+        errors = rules.custom_rules()[1]
+        if "custom" in rules.conditions and errors:
+            # 有錯的行會被略過，套用到所有群組前先擋下，免得留下錯的那份
+            QMessageBox.warning(self, "自訂規則有誤", "請先修正自訂規則：\n\n" + "\n".join(errors[:10]))
             return
         decided = self.tree.apply_conditions_all(conditions, rules.mode, rules.reference())
         self.status_bar.showMessage(_describe_decisions(decided, conditions))
@@ -2000,17 +2014,42 @@ class ConditionPanel(QWidget):
         self.keep_dirs_edit = QLineEdit()
         self.keep_dirs_edit.setPlaceholderText("例如 D:\\Models; 收藏")
         fl.addWidget(self.keep_dirs_edit)
-        fl.addWidget(self._hint("優先移除（; 分隔，越前面越優先移除）"))
+        fl.addWidget(self._hint("優先移除（; 分隔，越前面越優先）"))
         self.remove_dirs_edit = QLineEdit()
         self.remove_dirs_edit.setPlaceholderText("例如 _trash; _bak; 備份; Downloads")
         fl.addWidget(self.remove_dirs_edit)
         lay.addWidget(self._folders_box)
 
-        ref_hint = self._hint("參考資料夾（裡面的檔案不會被勾選，; 分隔）")
+        custom_cb = self._make_cb("custom")
+        custom_cb.setToolTip(
+            "以正規表示式比對完整路徑（不分大小寫；資料夾分隔寫 / 就好，也接受 \\\\）。\n"
+            "每行一條：- 開頭＝符合的優先移除，+ 開頭＝符合的優先保留；# 開頭是註解。\n"
+            "由上往下，第一條符合的規則決定，越上面越優先。")
+        lay.addWidget(custom_cb)
+        self._custom_box = QWidget()
+        cl = QVBoxLayout(self._custom_box)
+        cl.setContentsMargins(20, 0, 0, 2)
+        cl.setSpacing(3)
+        cl.addWidget(self._hint("每行一條：- 優先移除、+ 優先保留"))
+        self.custom_edit = QPlainTextEdit()
+        self.custom_edit.setPlaceholderText("- \\.dup\\d+$\n- /舊版本/\n+ ^D:/Models/")
+        self.custom_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.custom_edit.setTabChangesFocus(True)
+        self.custom_edit.setFixedHeight(84)
+        self.custom_edit.textChanged.connect(self._check_custom)
+        cl.addWidget(self.custom_edit)
+        self._custom_error = QLabel()
+        self._custom_error.setWordWrap(True)
+        self._custom_error.setStyleSheet(f"font-size:11px;color:{DANGER};")
+        self._custom_error.setVisible(False)
+        cl.addWidget(self._custom_error)
+        lay.addWidget(self._custom_box)
+
+        ref_hint = self._hint("參考資料夾（裡面的檔案不會被勾選）")
         ref_hint.setStyleSheet(ref_hint.styleSheet() + "padding-top:4px;")
         lay.addWidget(ref_hint)
         self.reference_edit = QLineEdit()
-        self.reference_edit.setPlaceholderText("例如 D:\\Master; 正本")
+        self.reference_edit.setPlaceholderText("例如 D:\\Master; 正本（; 分隔）")
         self.reference_edit.setToolTip(
             "放正本的資料夾：套用規則、右鍵快速選取、「全部勾選」都不會勾選裡面的檔案；\n"
             "群組裡有參考資料夾的檔案時，其他地方的副本照常勾選。手動勾了也會在移除前預覽\n"
@@ -2048,6 +2087,17 @@ class ConditionPanel(QWidget):
         else:
             self._order_label.setText("優先序：（尚未勾選條件）")
         self._folders_box.setVisible("folders" in self._checked_order)
+        self._custom_box.setVisible("custom" in self._checked_order)
+
+    def custom_errors(self) -> list[str]:
+        return self.rule_set().custom_rules()[1]
+
+    def _check_custom(self):
+        """自訂規則一邊打一邊檢查，有錯的行列在輸入框下方。"""
+        errors = self.custom_errors()
+        shown = errors[:5] + ([f"…另外 {len(errors) - 5} 行有誤"] if len(errors) > 5 else [])
+        self._custom_error.setText("\n".join(shown))
+        self._custom_error.setVisible(bool(errors))
 
     def _on_toggle(self, cond_id: str, state: int):
         checked = (state == Qt.CheckState.Checked.value)
@@ -2075,7 +2125,8 @@ class ConditionPanel(QWidget):
         return RuleSet(conditions=list(self._checked_order),
                        keep_dirs=split_dirs(self.keep_dirs_edit.text()),
                        remove_dirs=split_dirs(self.remove_dirs_edit.text()),
-                       reference_dirs=split_dirs(self.reference_edit.text()))
+                       reference_dirs=split_dirs(self.reference_edit.text()),
+                       custom=self.custom_edit.toPlainText())
 
     def get_active(self) -> list:
         return self.rule_set().build()

@@ -31,9 +31,10 @@ CONDITIONS_DEF = [
     ("list_1st", "列表第一", None,                             False, None),
     ("copy_name", "像副本的檔名優先移除", None,               None,  None),
     ("folders",   "資料夾優先序",         None,               None,  None),
+    ("custom",    "自訂規則（正規表示式）", None,             None,  None),
 ]
 COND_BY_ID = {c[0]: c for c in CONDITIONS_DEF}
-SMART_IDS = ("copy_name", "folders")
+SMART_IDS = ("copy_name", "folders", "custom")
 
 
 @dataclass(frozen=True)
@@ -178,6 +179,71 @@ def folder_scores(files: list[FileInfo], keep: FolderList, remove: FolderList) -
     return scores
 
 
+# ── 自訂規則 ─────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class CustomRule:
+    """以正規表示式比對完整路徑（不分大小寫；資料夾分隔寫 / 或 \\\\ 都可以）。"""
+    action: str        # "+"＝優先保留、"-"＝優先移除
+    pattern: str
+
+
+def parse_custom_rules(text: str) -> tuple[list[CustomRule], list[str]]:
+    """每行一條：「- 樣式」符合的優先移除、「+ 樣式」符合的優先保留；空行與 # 開頭的行略過。
+
+    +／- 後面的空白會忽略（要比對開頭的空白請寫 \\s）。回傳 (規則, 錯誤訊息)，有錯的行不會出現在規則裡。
+    """
+    rules, errors = [], []
+    for no, line in enumerate(text.splitlines(), 1):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        action = {"+": "+", "＋": "+", "-": "-", "－": "-"}.get(s[0])
+        pattern = s[1:].strip()
+        if action is None:
+            errors.append(f"第 {no} 行：要以 +（優先保留）或 -（優先移除）開頭")
+            continue
+        if not pattern:
+            errors.append(f"第 {no} 行：+／- 後面要接正規表示式")
+            continue
+        try:
+            re.compile(pattern, re.IGNORECASE)
+        except re.error as exc:
+            errors.append(f"第 {no} 行：正規表示式有誤（{exc}）")
+            continue
+        rules.append(CustomRule(action, pattern))
+    return rules, errors
+
+
+def _compile_custom(rules: list[CustomRule]) -> list[tuple[str, re.Pattern]]:
+    compiled = []
+    for r in rules:
+        try:
+            compiled.append((r.action, re.compile(r.pattern, re.IGNORECASE)))
+        except re.error:
+            pass                       # parse_custom_rules 已經擋下；這裡只是保險
+    return compiled
+
+
+def custom_scores(files: list[FileInfo], compiled: list[tuple[str, re.Pattern]]) -> list[int]:
+    """每個檔案「該移除」的程度：由上往下第一條符合的規則決定——優先移除為正、優先保留為負，
+    越上面的規則分數絕對值越大；都不符合為 0。
+
+    路徑同時以原本的形式（D:\\a\\b.png）與 / 分隔的形式（D:/a/b.png）比對，任一個符合就算。
+    """
+    n = len(compiled)
+    scores = []
+    for fi in files:
+        native = str(fi.path)
+        slash = native.replace("\\", "/")
+        score = 0
+        for i, (action, rx) in enumerate(compiled):
+            if rx.search(native) or (slash != native and rx.search(slash)):
+                score = (n - i) if action == "-" else -(n - i)
+                break
+        scores.append(score)
+    return scores
+
+
 # ── 規則組合 ─────────────────────────────────────────────────────────────
 @dataclass
 class RuleSet:
@@ -187,6 +253,7 @@ class RuleSet:
     keep_dirs: list[str] = field(default_factory=list)         # 優先保留的資料夾（越前面越優先）
     remove_dirs: list[str] = field(default_factory=list)       # 優先移除的資料夾（越前面越優先移除）
     reference_dirs: list[str] = field(default_factory=list)    # 參考資料夾：裡面的檔案不會被勾選
+    custom: str = ""                                           # 自訂規則原文，每行一條（含註解）
 
     def build(self) -> list[Condition]:
         """依優先序建立排序條件（不認得的 id 略過）。"""
@@ -194,6 +261,10 @@ class RuleSet:
 
     def reference(self) -> FolderList:
         return FolderList(self.reference_dirs)
+
+    def custom_rules(self) -> tuple[list[CustomRule], list[str]]:
+        """(自訂規則, 錯誤訊息)，見 parse_custom_rules。"""
+        return parse_custom_rules(self.custom)
 
 
 # ── 套用條件 ─────────────────────────────────────────────────────────────
@@ -205,6 +276,9 @@ def condition(cond_id: str, rules: RuleSet | None = None) -> Condition:
         rules = rules or RuleSet()
         keep, remove = FolderList(rules.keep_dirs), FolderList(rules.remove_dirs)
         return Condition(cond_id, lambda files: folder_scores(files, keep, remove), smart=True)
+    if cond_id == "custom":
+        compiled = _compile_custom((rules or RuleSet()).custom_rules()[0])
+        return Condition(cond_id, lambda files: custom_scores(files, compiled), smart=True)
     _, _, key_fn, rev, _ = COND_BY_ID[cond_id]
     if key_fn is None:                          # 列表第一：維持群組內原本的順序
         return Condition(cond_id, lambda files: list(range(len(files))))

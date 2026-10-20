@@ -5,8 +5,8 @@ import pytest
 
 from src.models import DuplicateGroup, FileInfo
 from src.selection import (
-    FolderList, RuleSet, apply_selection, condition, copy_info, copy_scores, folder_scores,
-    rank_by_conditions, split_dirs,
+    CustomRule, FolderList, RuleSet, apply_selection, condition, copy_info, copy_scores,
+    folder_scores, parse_custom_rules, rank_by_conditions, split_dirs,
 )
 
 
@@ -264,3 +264,36 @@ def test_empty_reference_changes_nothing():
     g = group_of("D:/a/x.png", "D:/b/x.png")
     assert apply_selection(g, [condition("sh_path")], "keep", FolderList([])) is None
     assert paths_selected(g) == ["D:/b/x.png"]
+
+
+# ── 自訂規則 ───────────────────────────────────────────────────────────────
+def test_parse_custom_rules():
+    text = "# 註解\n- \\.dup\\d+$\n\n+   ^D:/Models/\n－ /old/\n* 開頭不對\n-\n- (broken"
+    rules, errors = parse_custom_rules(text)
+    assert rules == [CustomRule("-", "\\.dup\\d+$"), CustomRule("+", "^D:/Models/"),
+                     CustomRule("-", "/old/")]
+    assert [e.split("：")[0] for e in errors] == ["第 6 行", "第 7 行", "第 8 行"]
+    assert "正規表示式有誤" in errors[2]
+
+
+def test_custom_rules_first_match_wins_and_both_separators_work():
+    # 第 1 條用 / 寫、第 3 條用 \\ 寫，兩種都要能比對；不分大小寫
+    rules = RuleSet(conditions=["custom"], custom="+ ^d:/models/\n- \\.dup\\d+$\n- \\\\old\\\\")
+    g = group_of("D:/Models/m.safetensors.dup1", "E:/old/m.safetensors",
+                 "F:/x/m.safetensors.dup1", "G:/y/m.safetensors")
+    # 由上往下第一條符合的為準：D:/Models 那份同時符合第 1、2 條 → 算優先保留
+    assert condition("custom", rules).keys(g.files) == [-3, 1, 2, 0]
+    assert apply_selection(g, rules.build(), "keep") == "custom"
+    assert paths_selected(g) == ["E:/old/m.safetensors", "F:/x/m.safetensors.dup1",
+                                 "G:/y/m.safetensors"]
+    apply_selection(g, rules.build(), "delete")
+    assert paths_selected(g) == ["F:/x/m.safetensors.dup1"]
+
+
+def test_custom_rules_skip_lines_with_errors():
+    rules = RuleSet(conditions=["custom"], custom="- (broken\n- _bak")
+    assert rules.custom_rules()[1]
+    g = group_of("D:/_bak/a.bin", "D:/main/a.bin")
+    apply_selection(g, rules.build(), "keep")
+    assert paths_selected(g) == ["D:/_bak/a.bin"]
+    assert condition("custom").keys(g.files) == [0, 0]          # 沒有規則 → 平手

@@ -518,6 +518,7 @@ def test_rule_settings_are_remembered(qapp, tmp_path):
     first._global_cond.keep_dirs_edit.setText("D:\\Models; 收藏")
     first._global_cond.remove_dirs_edit.setText("_trash; 備份")
     first._global_cond.reference_edit.setText("E:\\正本")
+    first._global_cond.custom_edit.setPlainText("# 模型備份\n- \\.dup\\d+$\n+ ^D:/Models/, 第二版")
     first.close()
 
     second = MainWindow(QSettings(ini, QSettings.Format.IniFormat))
@@ -526,6 +527,7 @@ def test_rule_settings_are_remembered(qapp, tmp_path):
     assert rules.keep_dirs == ["D:\\Models", "收藏"]
     assert rules.remove_dirs == ["_trash", "備份"]
     assert rules.reference_dirs == ["E:\\正本"]
+    assert rules.custom == "# 模型備份\n- \\.dup\\d+$\n+ ^D:/Models/, 第二版"   # 多行、逗號都原樣保留
     assert second.tree._reference                           # 啟動時就套用到結果樹的標示
     assert second._global_cond._folders_box.isVisibleTo(second._global_cond)
     second.close()
@@ -575,3 +577,33 @@ def test_reference_folder_is_never_auto_selected(qapp, window, tree, monkeypatch
     assert (entries["正本"].status, entries["正本"].note) == (PROTECTED, REFERENCE_NOTE)
     assert "參考" in seen["text"]
     assert [e.file.path.parent.name for _, e in seen["plan"].removable()] == ["copy1"]
+
+
+def test_custom_rules_from_sidebar(qapp, window, tree, monkeypatch):
+    from src.ui import main_window
+    data = blob(4 * KB, 24)
+    for n in ("main/m.bin", "dl/m.bin.dup1", "old/m.bin"):
+        tree(n, data)
+    run_scan(qapp, window, tree.root)
+    g = window._all_groups[0]
+    kept = lambda: {fi.path.parent.name for fi in g.files if not fi.selected}
+    panel = window._global_cond
+
+    panel._checkboxes["custom"].setChecked(True)
+    assert panel._custom_box.isVisibleTo(panel)
+    panel.custom_edit.setPlainText("- \\.dup\\d+$\n- [\\\\/]old[\\\\/]\n- (broken")
+    assert panel._custom_error.isVisibleTo(panel) and "第 3 行" in panel._custom_error.text()
+    warnings = []
+    monkeypatch.setattr(main_window.QMessageBox, "warning", lambda *a, **k: warnings.append(a[2]))
+    window._global_apply_conditions()                   # 有錯誤 → 擋下，不套用
+    assert warnings and "第 3 行" in warnings[0]
+    assert not any(fi.selected for fi in g.files)
+    assert not quick_action(window, 0, "依自訂規則").isEnabled()
+
+    panel.custom_edit.setPlainText("- \\.dup\\d+$\n- [\\\\/]old[\\\\/]")
+    assert not panel._custom_error.isVisibleTo(panel)
+    window._global_apply_conditions()
+    assert kept() == {"main"}
+    window.tree.select_all(False)
+    quick_action(window, 0, "依自訂規則").trigger()
+    assert kept() == {"main"}
