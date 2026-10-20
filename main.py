@@ -1,7 +1,6 @@
 # 程式進入點：建立 Qt 應用程式與主視窗，進入事件迴圈
 import sys
 from PyQt6.QtWidgets import QApplication
-from PyQt6.QtGui import QIcon
 from src.logger import setup_logging
 from src.ui.main_window import MainWindow
 

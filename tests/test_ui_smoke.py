@@ -430,3 +430,19 @@ def test_save_and_reopen_results_keeps_selection(qapp, window, tree, tmp_path):
     assert "掃描於" in other.status_bar.currentMessage()
     assert other.path_edit.text() == str(tree.root)
     other.close()
+
+
+def test_export_report_is_saved_and_escaped(qapp, window, tree, monkeypatch, isolated_data_dir):
+    import webbrowser
+    opened = []
+    monkeypatch.setattr(webbrowser, "open", lambda url: opened.append(url))
+    data = blob(4 * KB, 1)
+    tree("R&D/a.dat", data)
+    tree("R&D/b.dat", data)
+    run_scan(qapp, window, tree.root / "R&D")
+    window._export_report()
+    report = sorted((isolated_data_dir / "reports").glob("dupescan_report_*.html"))[-1]
+    page = report.read_text(encoding="utf-8")
+    assert "<strong>.dat</strong>" in page
+    assert "R&amp;D" in page and "R&D<" not in page          # 路徑中的 & 有跳脫
+    assert opened and opened[0].startswith("file:")

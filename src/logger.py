@@ -8,6 +8,7 @@ from pathlib import Path
 
 # log 檔放在專案根目錄的 logs/ 子目錄（已加入 .gitignore）
 LOG_DIR = Path(__file__).parent.parent / "logs"
+KEEP_LOGS = 30   # 只保留最近幾份 log（每次啟動一份）
 
 # 模組層級單例，其他模組直接 from src.logger import logger 使用；
 # 尚未 setup_logging() 前只掛 NullHandler，訊息直接丟棄
@@ -33,6 +34,13 @@ def setup_logging(log_dir: Path = LOG_DIR) -> str:
         datefmt="%Y-%m-%d %H:%M:%S",
     ))
     logger.addHandler(fh)
+
+    # 清掉較舊的 log，只留最近 KEEP_LOGS 份（都是 DupeScan 自己產生的紀錄檔）
+    for old in sorted(log_dir.glob("dupescan_*.log"))[:-KEEP_LOGS]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
 
     # 將本次 log 路徑掛在 logger 上，UI 若需要顯示可直接讀取
     logger.log_file = str(log_file)   # type: ignore[attr-defined]

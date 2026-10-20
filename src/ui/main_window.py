@@ -12,8 +12,8 @@ import os
 import subprocess
 import datetime
 import functools
+from html import escape
 import math
-import tempfile
 import webbrowser
 from collections import defaultdict
 from pathlib import Path
@@ -25,7 +25,7 @@ except ImportError:
     _HZ = False  # 未安裝時退回自製格式化函式
 
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QObject, QEvent, QPoint, QSettings
-from PyQt6.QtGui import QColor, QFont, QPixmap, QAction
+from PyQt6.QtGui import QColor, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QProgressDialog,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
@@ -34,21 +34,21 @@ from PyQt6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QMenu, QGraphicsDropShadowEffect,
 )
 
-from .. import file_ops
+from .. import __version__
+from ..app_paths import data_dir
 from ..delete_plan import SKIP, build_plan
 from . import delete_dialog
 from .theme import (
     BG, PANEL, SURFACE, SURFACE_HI, BORDER, BORDER_HI, TEXT, SUBTEXT, FAINT,
-    ACCENT, ACCENT_HI, GREEN, DANGER, DANGER_HI, ORANGE, STYLE,
+    ACCENT, GREEN, DANGER, ORANGE, STYLE,
 )
 from ..hash_cache import HashCache, clear_cache
 from ..results_io import RESULT_SUFFIX, export_csv, load_results, save_results
-from ..scanner import Scanner, ScanStats, STEP_NAMES, TOTAL_STEPS, _format_eta
+from ..scanner import Scanner, ScanStats, STEP_NAMES, _format_eta
 from ..models import DuplicateGroup, FileInfo
 from ..logger import logger
 from ..selection import (
-    CONDITIONS_DEF, COND_BY_ID as _COND_BY_ID,
-    rank_by_conditions as _rank_by_conditions,
+    COND_BY_ID as _COND_BY_ID,
     apply_selection as _apply_selection,
 )
 
@@ -581,7 +581,6 @@ class DuplicateTree(QTreeWidget):
         # 快速選取子選單（保留某條件勝出者，其餘標記待刪）
         quick = menu.addMenu("快速選取（保留…）")
         for cid in ("newer", "older", "sh_path", "shallow", "lo_path"):
-            label = _COND_BY_ID[cid][1].replace("修改", "修改").replace("路徑", "路徑")
             act = quick.addAction(f"保留{_COND_BY_ID[cid][1]}者")
             cond = [(cid, _COND_BY_ID[cid][2], _COND_BY_ID[cid][3])]
             act.triggered.connect(
@@ -637,7 +636,7 @@ class MainWindow(QMainWindow):
     def __init__(self, settings: QSettings | None = None):
         super().__init__()
         self._settings = settings if settings is not None else default_settings()
-        self.setWindowTitle("DupeScan — 重複檔案掃描工具")
+        self.setWindowTitle(f"DupeScan {__version__} — 重複檔案掃描工具")
         self.resize(1320, 840)
         self.setMinimumSize(960, 600)
 
@@ -1716,7 +1715,7 @@ class MainWindow(QMainWindow):
         if title:
             lines.append(
                 f'<text x="{W // 2}" y="16" text-anchor="middle" '
-                f'font-size="13" fill="#e4e7ee" font-weight="bold">{title}</text>')
+                f'font-size="13" fill="#e4e7ee" font-weight="bold">{escape(title)}</text>')
         start = -math.pi / 2
         legend_y = 36
         for i, (label, value) in enumerate(slices):
@@ -1745,7 +1744,7 @@ class MainWindow(QMainWindow):
             short = (label[:12] + "…") if len(label) > 13 else label
             lines.append(
                 f'<text x="344" y="{legend_y}" font-size="11" fill="#e4e7ee">'
-                f'{short} ({pct:.1f}%)</text>')
+                f'{escape(short)} ({pct:.1f}%)</text>')
             legend_y += 20
             start = end
 
@@ -1798,7 +1797,7 @@ class MainWindow(QMainWindow):
         for ext, d in rows:
             pct = d["wasted"] / total_wasted * 100 if total_wasted > 0 else 0
             tbl_rows += (
-                f"<tr><td><strong>{ext}</strong></td>"
+                f"<tr><td><strong>{escape(ext)}</strong></td>"
                 f"<td>{d['groups']}</td><td>{d['files']}</td>"
                 f"<td>{human_size(d['total_size'])}</td>"
                 f"<td style='color:#f87171'>{human_size(d['wasted'])}</td>"
@@ -1806,7 +1805,7 @@ class MainWindow(QMainWindow):
                 f"<div class='pb'><div class='pf' style='width:{min(pct,100):.1f}%'></div></div>"
                 f"<span>{pct:.1f}%</span></div></td></tr>\n")
 
-        html = f"""<!DOCTYPE html>
+        page = f"""<!DOCTYPE html>
 <html lang="zh-TW"><head><meta charset="UTF-8"><title>DupeScan 分析報表</title>
 <style>
 *{{box-sizing:border-box;}}
@@ -1829,7 +1828,7 @@ tr:hover td{{background:#1a1e28;}}
 footer{{color:#6b7280;font-size:11px;margin-top:30px;}}
 </style></head><body>
 <h1>DupeScan 分析報表</h1>
-<div class="meta">掃描路徑：{scan_path}&nbsp;&nbsp;|&nbsp;&nbsp;產生時間：{scan_time}</div>
+<div class="meta">掃描路徑：{escape(scan_path)}&nbsp;&nbsp;|&nbsp;&nbsp;產生時間：{scan_time}</div>
 <div class="grid">
   <div class="card"><div class="val">{total_groups}</div><div class="lbl">重複群組數</div></div>
   <div class="card"><div class="val">{total_files}</div><div class="lbl">重複檔案總數</div></div>
@@ -1850,15 +1849,17 @@ footer{{color:#6b7280;font-size:11px;margin-top:30px;}}
 <footer>由 DupeScan 自動產生</footer>
 </body></html>"""
 
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".html", delete=False,
-            encoding="utf-8", prefix="dupescan_report_") as f:
-            f.write(html)
-            tmp_path = f.name
+        # 報表存到固定位置（%LOCALAPPDATA%\DupeScan\reports），只保留最近 20 份
+        reports = data_dir() / "reports"
+        reports.mkdir(exist_ok=True)
+        report_path = reports / f"dupescan_report_{datetime.datetime.now():%Y%m%d_%H%M%S}.html"
+        report_path.write_text(page, encoding="utf-8")
+        for old in sorted(reports.glob("dupescan_report_*.html"))[:-20]:
+            old.unlink(missing_ok=True)
 
-        webbrowser.open(f"file:///{tmp_path.replace(os.sep, '/')}")
-        self.status_bar.showMessage(f"報表已匯出並開啟: {tmp_path}")
-        logger.info(f"匯出報表: {tmp_path}")
+        webbrowser.open(report_path.as_uri())
+        self.status_bar.showMessage(f"報表已匯出並開啟: {report_path}")
+        logger.info(f"匯出報表: {report_path}")
 
 
 # ── ConditionPanel（側邊列批量快速選取用的多條件勾選面板）────────────────────
@@ -1919,11 +1920,3 @@ class ConditionPanel(QWidget):
     def get_active(self) -> list:
         return [(cid, _COND_BY_ID[cid][2], _COND_BY_ID[cid][3])
                 for cid in self._checked_order]
-
-    def clear_all(self):
-        for cb in self._checkboxes.values():
-            cb.blockSignals(True)
-            cb.setChecked(False)
-            cb.setEnabled(True)
-            cb.blockSignals(False)
-        self._checked_order.clear()

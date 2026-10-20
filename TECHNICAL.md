@@ -1,6 +1,6 @@
 # TECHNICAL.md — DupeScan 技術參考手冊
 
-> 供技術人員維護、擴充、除錯時參考。
+> 供技術人員維護、擴充、除錯時參考。對應版本：v0.9.0。
 
 ---
 
@@ -10,12 +10,17 @@
 - [專案架構](#專案架構)
 - [模組說明](#模組說明)
 - [掃描演算法](#掃描演算法)
+- [雜湊快取](#雜湊快取)
 - [Threading 模型](#threading-模型)
 - [狀態機設計](#狀態機設計)
-- [UI 分批渲染](#ui-分批渲染)
+- [移除流程](#移除流程)
+- [UI 虛擬化結果檢視](#ui-虛擬化結果檢視)
+- [設定與資料位置](#設定與資料位置)
 - [日誌系統](#日誌系統)
+- [測試](#測試)
 - [效能考量](#效能考量)
 - [關鍵常數](#關鍵常數)
+- [歷史問題與修正](#歷史問題與修正)
 
 ---
 
@@ -23,10 +28,13 @@
 
 | 技術 | 版本 | 用途 |
 |------|------|------|
-| Python | 3.11+ | 主要語言 |
-| PyQt6 | 6.6+ | GUI 框架（視窗、元件、事件迴圈）|
-| xxhash | 3.4+ | 高速 Hash 演算法（備援：hashlib.blake2b）|
-| humanize | 4.9+ | 人性化顯示檔案大小（如 1.2 MiB）|
+| Python | 3.11+（開發環境 3.14） | 主要語言 |
+| PyQt6 | 6.6+ | GUI 框架 |
+| xxhash | 3.4+ | 高速 Hash（備援：hashlib.blake2b）|
+| humanize | 4.9+ | 人性化顯示檔案大小 |
+| sqlite3 | 內建 | 雜湊快取 |
+| ctypes（Win32 API） | 內建 | 磁碟偵測、資源回收筒、磁碟區資訊 |
+| pytest | 8+（開發用） | 自動化測試 |
 
 ---
 
@@ -34,35 +42,34 @@
 
 ```
 dupescan/
-├── main.py              # 入口：建立 QApplication 與 MainWindow
-├── run.bat              # 一鍵啟動腳本（自動安裝依賴）
-├── requirements.txt     # pip 依賴清單
-├── .gitignore
-├── README.md            # 使用者操作說明
-├── TECHNICAL.md         # 本檔案（技術手冊）
-├── logs/                # 執行日誌，每次啟動產生新檔案（gitignore）
-└── src/
-    ├── __init__.py
-    ├── models.py        # 資料結構定義
-    ├── scanner.py       # 掃描引擎（3-pass + 多執行緒）
-    ├── disk_detect.py   # 磁碟類型偵測（ctypes，決定執行緒策略）
-    ├── logger.py        # 日誌設定（單例）
-    └── ui/
-        ├── __init__.py
-        └── main_window.py   # 主視窗（Qt UI + 事件邏輯）
+├── main.py                  # 入口：setup_logging → QApplication → MainWindow
+├── run.bat                  # 一鍵啟動
+├── requirements.txt / requirements-dev.txt / pytest.ini
+├── src/
+│   ├── __init__.py          # __version__
+│   ├── models.py            # FileInfo、DuplicateGroup
+│   ├── scanner.py           # 掃描引擎（不依賴 Qt）
+│   ├── hash_cache.py        # SQLite 雜湊快取
+│   ├── disk_detect.py       # 磁碟類型偵測（ctypes）
+│   ├── selection.py         # 快速選取條件（不依賴 Qt）
+│   ├── delete_plan.py       # 移除前檢查（不依賴 Qt）
+│   ├── file_ops.py          # 資源回收筒／隔離資料夾／還原／操作紀錄（不依賴 Qt）
+│   ├── results_io.py        # 結果 CSV、儲存與開啟（不依賴 Qt）
+│   ├── app_paths.py         # %LOCALAPPDATA%\DupeScan
+│   ├── logger.py            # 日誌
+│   └── ui/
+│       ├── main_window.py   # ScanWorker、ImagePreviewPopup、DuplicateTree、MainWindow、ConditionPanel
+│       ├── delete_dialog.py # DeletePlanDialog、RemovalWorker
+│       ├── history_dialog.py# HistoryDialog
+│       └── theme.py         # 配色常數與全域 StyleSheet
+└── tests/                   # pytest
 ```
+
+原則：**掃描、選取、移除檢查、檔案動作、結果存檔都不依賴 Qt**，UI 只負責呼叫與顯示。這些模組可以直接被其他專案（例如音樂管理專案）import。
 
 ---
 
 ## 模組說明
-
-### `main.py`
-
-| 函式 | 說明 |
-|------|------|
-| `main()` | 建立 `QApplication`、`MainWindow`，進入 Qt 事件迴圈 |
-
----
 
 ### `src/models.py`
 
@@ -72,481 +79,374 @@ dupescan/
 |------|------|------|
 | `path` | `Path` | 檔案絕對路徑 |
 | `size` | `int` | 檔案大小（bytes）|
-| `hash_full` | `str` | 完整 Hash 值（Pass 3 後填入）|
-| `mtime` | `float` | 修改時間（Unix timestamp）|
-| `selected` | `bool` | 是否勾選待刪除（選取狀態存於資料層，與 UI 解耦，使虛擬化樹在群組未展開時仍記住勾選）|
-| `.name` | property | `path.name`（檔名）|
-| `.folder` | property | `str(path.parent)`（所在目錄）|
+| `hash_full` | `str` | 完整 Hash（Pass 3 後填入）|
+| `mtime` / `mtime_ns` | `float` / `int` | 修改時間（秒／奈秒；奈秒用於快取與移除前複驗）|
+| `selected` | `bool` | 是否勾選待移除（存在資料層，與 UI 解耦）|
+| `dev` / `ino` | `int` | 磁碟區序號與檔案 ID（`st_dev`／`st_ino`），只對候選檔查詢；`ino=0` 表示檔案系統不提供 |
+| `aliases` | `list[str]` | 指向同一個實體檔的其他路徑（硬連結），不列為重複 |
+| `.name` / `.folder` | property | 檔名／所在目錄字串 |
 
 #### `DuplicateGroup`
 
-| 欄位 | 型別 | 說明 |
-|------|------|------|
-| `hash_value` | `str` | 群組共同 Hash 值 |
-| `size` | `int` | 單一檔案大小（bytes）|
-| `files` | `list[FileInfo]` | 同一群組的所有重複檔案 |
-| `.wasted_bytes` | property | `size × (len(files) - 1)`（可釋放空間）|
-
----
-
-### `src/disk_detect.py`
-
-磁碟類型偵測模組。掃描開始前由 `ScanWorker.run()` 呼叫，結果決定 Scanner 的執行緒數量。
-
-#### `class DiskProfile`
-
-| 欄位 | 型別 | 說明 |
-|------|------|------|
-| `type_name` | `str` | 顯示名稱（"NVMe SSD" / "SATA SSD" / "HDD" / "未知磁碟"）|
-| `pass2_workers` | `int` | Pass 2 執行緒數 |
-| `pass3_workers` | `int` | Pass 3 執行緒數 |
-| `summary()` | method | 回傳 UI 顯示字串 |
-
-**預設策略對照：**
-
-| 磁碟類型 | Pass 2 threads | Pass 3 threads |
-|---------|---------------|---------------|
-| NVMe SSD | 8 | 4 |
-| SATA SSD | 4 | 2 |
-| HDD | 1 | 1 |
-| 未知/網路 | 2 | 1 |
-
-#### `detect_disk_profile(path: Path) -> DiskProfile`
-
-入口函式。任何例外（網路磁碟、虛擬磁碟、非 Windows）自動 fallback 到保守值，不影響掃描主流程。
-
-**Windows 偵測流程（純 ctypes，無需管理員權限）：**
-
-```
-path → drive letter → \\.\C: 裝置路徑
-    │
-    ├─ IOCTL_STORAGE_QUERY_PROPERTY
-    │   PropertyId=7 (StorageDeviceSeekPenaltyProperty)
-    │   → IncursSeekPenalty=True  → HDD
-    │   → IncursSeekPenalty=False → SSD (繼續查 BusType)
-    │
-    └─ IOCTL_STORAGE_QUERY_PROPERTY
-        PropertyId=0 (StorageDeviceProperty)
-        → BusType=17 (NVMe) → NVMe SSD
-        → BusType=11 (SATA) → SATA SSD
-        → 其他           → SSD (generic)
-```
-
-**關鍵內部函式：**
-
-| 函式 | 說明 |
+| 欄位 | 說明 |
 |------|------|
-| `_volume_device_path(path)` | `path.resolve().drive` → `\\\\.\\C:` |
-| `_open_volume(device)` | `CreateFileW` 開啟磁碟卷（0 access，僅供 IOCTL）|
-| `_ioctl(h, ctl, in, out)` | 包裝 `DeviceIoControl` 呼叫，回傳 bool |
-| `_query_seek_penalty(device)` | SeekPenalty 查詢，回傳 `True/False/None` |
-| `_query_bus_type(device)` | BusType 查詢，回傳 `'nvme'/'sata'/'other'` |
+| `hash_value` | 群組共同的完整 Hash |
+| `size` | 單一檔案大小 |
+| `files` | 群組內所有副本（依路徑排序）|
+| `.wasted_bytes` | `size × (len(files) - 1)` |
 
 ---
 
 ### `src/scanner.py`
 
-#### 模組層級常數
+#### `Scanner`
 
-| 常數 | 值 | 說明 |
-|------|----|------|
-| `PARTIAL_READ` | `4096` | Pass 2 讀取的前幾 bytes |
-| `CHUNK_SIZE` | `65536` | Pass 3 每次讀取的 chunk 大小 |
-| `TOTAL_STEPS` | `3` | 掃描步驟總數 |
-| `STEP_NAMES` | dict | `{1: "依檔案大小分組", 2: "快速 Hash...", 3: "完整 Hash..."}` |
-| `_FAST_HASH` | bool | `True` 若 xxhash 已安裝，否則 `False`（退回 blake2b）|
-
-#### 模組層級函式
-
-| 函式 | 簽名 | 說明 |
-|------|------|------|
-| `_format_eta` | `(seconds: int) -> str` | 將秒數格式化為中文時間（"約 X 分 Y 秒"）|
-| `_partial_hash` | `(path: Path) -> str \| None` | 讀取前 `PARTIAL_READ` bytes 計算 hash，IO 失敗回傳 None |
-| `_full_hash` | `(path: Path) -> str \| None` | 讀取整個檔案計算 hash，IO 失敗回傳 None |
-
-#### `class Scanner`
-
-**建構子參數：**
-
-| 參數 | 型別 | 說明 |
-|------|------|------|
-| `roots` | `list[str]` | 要掃描的根路徑清單 |
-| `min_size` | `int` | 最小檔案大小（bytes），小於此值的檔案跳過 |
-| `include_hidden` | `bool` | 是否包含隱藏檔案/目錄（預設 False）|
-| `pass2_workers` | `int` | Pass 2 執行緒數（預設 1，由 DiskProfile 提供）|
-| `pass3_workers` | `int` | Pass 3 執行緒數（預設 1，由 DiskProfile 提供）|
-| `on_progress` | `ProgressCallback \| None` | 進度回調，簽名見下方 |
-| `on_done` | `Callable[[list[DuplicateGroup]], None] \| None` | 掃描完成回調 |
-| `on_error` | `Callable[[str], None] \| None` | 錯誤回調 |
-
-**`ProgressCallback` 簽名：**
 ```python
-(msg: str, current: int, total: int, step: int, total_steps: int, eta_secs: int) -> None
+Scanner(roots, min_size=1, include_hidden=False, pass2_workers=1, pass3_workers=1,
+        on_progress=None, on_done=None, on_error=None, on_cancel=None,
+        cache=None, max_size=None, include_exts=(), exclude_exts=(), exclude_dirs=(),
+        workers_by_dev=None)
 ```
-- `msg`: 人類可讀的狀態訊息
-- `current` / `total`: 當前進度（total = 0 表示不確定）
-- `step`: 目前執行到第幾步（1–3）
-- `total_steps`: 總步驟數（固定為 3）
-- `eta_secs`: 預估剩餘秒數，-1 表示無法估算
 
-**公開方法：**
+| 參數 | 說明 |
+|------|------|
+| `roots` | 掃描路徑；經 `normalize_roots()` 轉成絕對路徑並去掉重複或互相包含的路徑 |
+| `min_size` / `max_size` | 大小範圍（bytes）；`max_size=None` 表示不限 |
+| `include_hidden` | 是否包含「.」開頭與 Windows 隱藏／系統屬性的檔案和資料夾 |
+| `include_exts` / `exclude_exts` | 只比對／不比對的副檔名（不含點、不分大小寫）|
+| `exclude_dirs` | 排除資料夾：相對名稱（任何位置）或絕對路徑 |
+| `pass2_workers` / `pass3_workers` | 預設執行緒數 |
+| `workers_by_dev` | `{st_dev: (pass2, pass3)}`，多顆磁碟時各用各的執行緒數 |
+| `cache` | `HashCache`；`None` 表示不使用快取 |
+| `on_progress(msg, cur, total, step, total_steps, eta)` | 進度；`eta=-1` 表示無法估算 |
+| `on_done(groups, stats)` | 完成 |
+| `on_cancel()` | 被停止（**不會**呼叫 `on_done`）|
+| `on_error(msg)` | 例外 |
 
 | 方法 | 說明 |
 |------|------|
-| `scan()` | 執行掃描，呼叫 on_done/on_error，應在 worker thread 執行 |
-| `stop()` | 設定 stop event（同時 set pause event 避免死鎖）|
-| `pause()` | 清除 pause event，使掃描 thread 在下一個暫停點阻塞 |
-| `resume()` | 設定 pause event，解除暫停 |
-| `is_paused` | property，回傳當前是否暫停中 |
+| `scan()` | 執行掃描；完成回傳 groups，停止或錯誤回傳 `None` |
+| `stop()` / `pause()` / `resume()` | 可從任意執行緒呼叫，也可在 `scan()` 開始前呼叫 |
 
-**私有方法：**
+#### `ScanStats`
+
+`files_seen`、`candidates`、`same_file_merged`、`skipped_links`、`skipped_hidden`、`skipped_cloud`、`skipped_excluded`、`skipped_changing`、`unreadable`（含最多 200 筆 `unreadable_samples`）、`cache_hits_partial`、`cache_hits_full`。
+
+#### 內部結構
 
 | 方法 | 說明 |
 |------|------|
-| `_check()` | 暫停點：等待 pause event，回傳 True 表示應停止（用於循序模式）|
-| `_stopped()` | 非阻塞 stop 查詢（用於並行消費迴圈）|
-| `_emit(...)` | 包裝 on_progress 呼叫 |
-| `_eta(start, done, total)` | 依已用時間估算剩餘秒數 |
-| `_pass2_sequential(candidates, total_c, t0)` | 循序 Pass 2（HDD 安全，細粒度暫停/停止）|
-| `_pass2_parallel(candidates, total_c, t0, workers)` | 並行 Pass 2（ThreadPoolExecutor，SSD/NVMe）|
-| `_pass3_sequential(candidates2, total2, t0)` | 循序 Pass 3 |
-| `_pass3_parallel(candidates2, total2, t0, workers)` | 並行 Pass 3 |
-| `_run()` | 執行 3-pass 演算法，依 workers 選擇循序或並行路徑 |
+| `_checkpoint(nbytes=0)` | 暫停點：暫停時阻塞、停止時拋出 `_Stopped`；累加已讀位元組供 Pass 3 估算進度 |
+| `_walk()` | Pass 1 遍歷：`os.scandir` 堆疊式走訪；略過符號連結與 junction／掛載點、排除資料夾、隱藏／系統、雲端佔位檔；檔案資訊用 `DirEntry.stat()`（Windows 上不必開檔）|
+| `_merge_same_files(candidates)` | 對大小相同的候選 `os.stat` 取得 `st_dev`／`st_ino`，合併同一個實體檔；目錄列舉後大小又變的檔案略過 |
+| `_hash_stage(files, fn, step, label)` | Pass 2／3：依 `fi.dev` 分批，每顆磁碟用自己的執行緒數 |
+| `_hash_batch(files, fn, workers)` | 單一磁碟：循序或 `ThreadPoolExecutor`（在途工作上限 `workers × IN_FLIGHT_PER_WORKER`）|
+| `_report(force=False)` | 時間節流的進度；Pass 3 以位元組估算 ETA |
+| `_run()` / `_run_passes()` | 開關快取、執行 3-pass；`_Stopped` → 回傳 `None` |
 
-**並行模式執行緒安全說明：**
-
-worker thread 只執行 `_partial_hash` / `_full_hash`（純函式，讀檔回傳字串）。
-所有 dict/list 操作（`by_partial[ph].append(fi)`）在 scan thread 消費 `as_completed` 時循序執行，無 data race。
-暫停以 `_pause_event.wait()` 在消費迴圈中阻塞；停止以 `_stopped()` 檢查並呼叫 `f.cancel()` 取消尚未開始的 futures。
+讀檔函式 `_partial_hash(path, checkpoint)`、`_full_hash(path, checkpoint)`：讀取失敗拋 `OSError`（記入 `unreadable`）；`_full_hash` 每讀一個 `CHUNK_SIZE` 區塊呼叫一次 checkpoint。
 
 ---
 
-### `src/logger.py`
+### `src/hash_cache.py`
+
+見[雜湊快取](#雜湊快取)。
 
 | 名稱 | 說明 |
 |------|------|
-| `LOG_DIR` | `logs/` 目錄（相對於專案根目錄）|
-| `logger` | 模組層級 Logger 單例，直接 `from src.logger import logger` 使用 |
-| `logger.log_file` | 本次執行的日誌檔案路徑（字串）|
+| `HashCache(path=None)` | `open()` → `lookup(files, algo, partial_len)` → `store(fi, algo, partial=…, full=…)` → `close()`；全部在掃描執行緒呼叫 |
+| `cache_key(fi)` | `i:<dev>:<ino>`（本機 NTFS／ReFS）或 `p:<normcase(path)>` |
+| `clear_cache()` | 刪除快取檔（DupeScan 自己的檔案）|
 
-**日誌等級使用原則：**
+---
 
-| 等級 | 使用場景 |
-|------|---------|
-| `INFO` | 掃描開始/結束、Pass 完成、刪除操作 |
-| `DEBUG` | 重複群組詳細資訊（hash、路徑等）|
-| `WARNING` | 刪除失敗 |
-| `ERROR` | 掃描引擎例外 |
+### `src/disk_detect.py`
+
+掃描開始前由 `ScanWorker.run()` 對每個掃描路徑呼叫一次，結果決定該磁碟的執行緒數。
+
+| 磁碟類型 | Pass 2 | Pass 3 |
+|---------|--------|--------|
+| NVMe SSD | 8 | 4 |
+| SATA SSD／其他 SSD | 4 | 2 |
+| HDD | 1 | 1 |
+| 未知／網路 | 2 | 1 |
+
+偵測方式：`CreateFileW`（access=0，不需系統管理員）→ `IOCTL_STORAGE_QUERY_PROPERTY`：PropertyId=7（SeekPenalty）區分 HDD／SSD，PropertyId=0（BusType：NVMe=17、SATA=11）區分 NVMe／SATA。任何例外都回傳保守的「未知磁碟」。
+
+---
+
+### `src/selection.py`
+
+`CONDITIONS_DEF`（9 條：id、標籤、key 函式、reverse、互斥 id）、`condition(id)`、`rank_by_conditions(files, conditions)`（多條件穩定排序，回傳勝出索引）、`apply_selection(group, conditions, mode)`（`keep`＝勝出者不勾選；`delete`＝只勾選勝出者）。
+
+---
+
+### `src/delete_plan.py`
+
+見[移除流程](#移除流程)。
+
+| 名稱 | 說明 |
+|------|------|
+| `build_plan(groups, protected=None, verify_head=True)` | `groups` 為 `(顯示編號, DuplicateGroup)`；回傳 `DeletePlan` |
+| `DeletePlan.removable(allow_whole_group, allow_protected)` | 實際要移除的 `(PlanGroup, PlanEntry)` |
+| `PlanEntry.status` | `keep`／`ok`（會移除）／`skip`（自動略過）／`protected` |
+| `DEFAULT_PROTECTED` | 受保護資料夾的 fnmatch 樣式 |
+| `is_protected(path)` | 是否位於受保護資料夾 |
+
+---
+
+### `src/file_ops.py`
+
+| 名稱 | 說明 |
+|------|------|
+| `remove_files(items, method, hwnd, progress)` | `items` 為 `(Path, size)`；`method="recycle"` 或 `"quarantine"`；回傳 `list[OpResult]` 並寫入操作紀錄 |
+| `recycle_obstacle(path, size)` | 進不了回收筒的原因（路徑 > 259 字元、網路／卸除式磁碟、回收筒停用 `NukeOnDelete`、超過 `MaxCapacity`）|
+| `quarantine(paths, batch_id)` | 搬到 `<磁碟根目錄>\.dupescan_quarantine\<batch>\<原路徑>` 並寫 `manifest.json` |
+| `restore_batch(manifest)` | 搬回原位置；原位置已有檔案時不覆蓋 |
+| `read_journal()` | 讀 `journal.jsonl`（新的在前）|
+
+資源回收筒使用 `SHFileOperationW(FO_DELETE)`，旗標 `FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT | FOF_WANTNUKEWARNING`：若 Windows 判斷某個檔案只能永久刪除，會先跳出警告讓使用者拒絕。每 50 個檔案一批；整批失敗時逐一重試，仍失敗的改走隔離資料夾。
+
+---
+
+### `src/results_io.py`
+
+`export_csv(path, groups)`（UTF-8 BOM，Excel 可直接開）、`save_results(path, groups, roots, scanned_at)`（gzip JSON，`format="dupescan-results"`、`version=1`）、`load_results(path)`（格式不符拋 `ValueError`）。
+
+---
+
+### `src/logger.py`、`src/app_paths.py`
+
+- `setup_logging()`：由 `main.py` 呼叫才建立 log 檔（單純 import 不建立）；保留最近 `KEEP_LOGS` 份
+- `data_dir()`：`%LOCALAPPDATA%\DupeScan`，可用環境變數 `DUPESCAN_DATA_DIR` 改位置
 
 ---
 
 ### `src/ui/main_window.py`
 
-#### `class ScanWorker(QObject)`
+#### `ScanWorker(QObject)`
 
-Qt 的 worker 包裝，`moveToThread` 到 `QThread` 執行。
+`moveToThread` 到 `QThread` 執行。建構時就建立 `Scanner`，所以 `run()` 開始前呼叫 `stop()` 也有效。
 
-**Signals：**
-
-| Signal | 型別 | 說明 |
+| Signal | 參數 | 說明 |
 |--------|------|------|
-| `progress` | `(str, int, int, int, int, int)` | 進度更新（透傳自 Scanner）|
-| `finished` | `(list)` | 掃描完成，帶入 `list[DuplicateGroup]` |
-| `error` | `(str)` | 發生錯誤 |
-| `detected` | `(str)` | 磁碟偵測完成，帶入 `DiskProfile.summary()` 字串 |
+| `progress` | `(scan_id, msg, cur, total, step, total_steps, eta)` | 進度 |
+| `finished` | `(scan_id, list, ScanStats)` | 完成 |
+| `cancelled` | `(scan_id)` | 被停止 |
+| `error` | `(scan_id, str)` | 例外 |
+| `detected` | `(scan_id, str)` | 磁碟偵測結果（多顆磁碟時合併顯示）|
+| `ended` | `()` | `run()` 結束，接到 `thread.quit` |
 
-**方法：**
+#### `DuplicateTree(QTreeWidget)`
 
-| 方法 | 說明 |
-|------|------|
-| `run()` | 先呼叫 `detect_disk_profile`，emit `detected`，再建立並執行 Scanner |
-| `stop()` | 轉發至 Scanner.stop() |
-| `pause()` | 轉發至 Scanner.pause() |
-| `resume()` | 轉發至 Scanner.resume() |
+頂層列＝群組、子列＝檔案（展開時才建立）；勾選狀態存在 `FileInfo.selected`。字型由 `_FontDelegate` 依 `_font_size` 繪製，改字級只需重新排版。重點方法：`populate(groups, expanded=None)`、`expanded_group_ids()`、`refresh_checks()`、`select_all()`、`apply_conditions_all()`、`selected_stats()`、`set_font_size()`、`keyPressEvent()`（空白鍵切換勾選）、`_on_clicked()`（Ctrl＋點擊路徑定位）。
 
----
-
-#### `class ImagePreviewPopup(QLabel)`
-
-圖片懸停預覽浮動視窗（`Qt.WindowType.ToolTip | FramelessWindowHint`）。
-
-| 方法 | 說明 |
-|------|------|
-| `show_image(path, global_pos)` | 載入圖片並縮放至 240×240（保持比例），移動到指定螢幕座標後顯示 |
-| `reset()` | 清除快取路徑並隱藏視窗 |
-
-快取機制：若 `path` 與上次相同且視窗已顯示，只移動位置不重新載入圖片（避免每次 MouseMove 都讀取磁碟）。
-
----
-
-#### 模組層級：Condition 系統
-
-| 名稱 | 說明 |
-|------|------|
-| `CONDITIONS_DEF` | 條件定義列表 `[(id, label, key_fn, reverse, conflict_id), ...]`，共 9 條 |
-| `_COND_BY_ID` | `{id: condition_tuple}` 快速查找字典 |
-| `_rank_by_conditions(files, conditions)` | 多條件穩定排序，回傳「勝出」檔案索引；`conditions = [(id, key_fn, reverse), ...]` |
-
-條件 ID 對照表：
-
-| ID | 標籤 | 排序邏輯 | 互斥 |
-|----|------|---------|------|
-| `newer` | 修改較新 | mtime 降序 | `older` |
-| `older` | 修改較舊 | mtime 升序 | `newer` |
-| `sh_path` | 路徑較短 | path 長度升序 | `lo_path` |
-| `lo_path` | 路徑較長 | path 長度降序 | `sh_path` |
-| `shallow` | 目錄較淺 | depth 升序 | `deep` |
-| `deep` | 目錄較深 | depth 降序 | `shallow` |
-| `al_first` | 字母較前 | path 字串升序 | `al_last` |
-| `al_last` | 字母較後 | path 字串降序 | `al_first` |
-| `list_1st` | 列表第一 | 原始索引升序 | 無 |
-
-#### `class ConditionPanel(QWidget)`
-
-可重用的多條件勾選面板。條件以互斥對排列（4對 + 1單項）。
-
-| 方法 | 說明 |
-|------|------|
-| `get_active()` | 回傳 `[(id, key_fn, reverse), ...]`，依使用者勾選順序排列 |
-| `clear_all()` | 清除所有勾選並重新啟用所有選項 |
-| `_on_toggle(cond_id, state)` | 勾選時將衝突條件 disable 並移出優先清單；取消時恢復 |
-
----
-
-#### `class DuplicateTree(QTreeWidget)`
-
-**取代舊版的 `GroupCard` / `QTableWidget` 卡片清單**，以單一虛擬化樹呈現所有結果。
-
-設計要點：
-
-- **頂層列＝群組摘要列**（`setFirstColumnSpanned(True)`，文字含「群組 #n · N 個重複 · 每個 X · 可省 Y」），**子列＝群組內各檔案**。
-- **虛擬化渲染**：`QTreeWidget` 只繪製 viewport 內可見的列；群組以 `addTopLevelItems` 一次批次加入（避免逐筆插入觸發 view 訊號）。
-- **延遲建立子列（lazy）**：群組頂層列以 `ChildIndicatorPolicy.ShowIndicator` 顯示展開箭頭但不建立子列；`itemExpanded` 首次觸發時才透過 `_fill_file_item` 建立檔案列，並以 `_ROLE_POP` 標記已建立。
-- **選取狀態存於資料層** `FileInfo.selected`，與 widget 解耦——群組未展開時仍記住勾選，批量操作不需先建立所有列。
-- **`_guard` 旗標**：程式化 `setCheckState` 會觸發 `itemChanged`；以 `_guard` 包住所有程式化變更，避免遞迴。
-
-資料角色（掛在 column 0）：`_ROLE_KIND`（"group"/"file"）、`_ROLE_OBJ`（`DuplicateGroup`/`FileInfo`）、`_ROLE_POP`（子列是否已建立）。
-
-| 方法/Signal | 說明 |
-|-----------|------|
-| `checksChanged` | Signal，任何勾選變動時發出，供 MainWindow 更新統計與刪除按鈕 |
-| `populate(groups)` | 清空並重建；只建立群組頂層列（批次加入），子列待展開 |
-| `_on_expanded(item)` | 群組首次展開時 lazy 建立檔案子列 |
-| `_on_item_changed(item, col)` | checkbox 接收者：file 列同步 `fi.selected` 並更新群組三態；group 列一次切換全部子檔案 |
-| `_set_group_state(gi, g)` | 依群組內已勾選比例設定群組列三態（Unchecked/Checked/PartiallyChecked），不發 signal |
-| `refresh_checks()` | 批次修改資料後，刷新所有群組列與已建立子列的勾選顯示 |
-| `select_all(sel)` | 對所有群組的所有檔案設定 `selected`，再 `refresh_checks` |
-| `apply_conditions_all(conditions, mode)` | 對每個群組以 `_apply_selection` 套用條件，再刷新 |
-| `selected_stats()` | 回傳 `(已勾選檔案數, 可釋放 bytes)` |
-| `_on_double_clicked` / `_on_clicked` | 雙擊檔案列 → `os.startfile` 開啟；單擊路徑欄 → `explorer /select` 定位 |
-| `eventFilter(obj, event)` | 安裝在 `viewport()`；MouseMove 於檔名欄且為圖片副檔名時顯示預覽，否則 `reset()` |
-| `_show_menu(pos)` | 右鍵內容選單：開啟/定位（檔案列）、快速選取（保留某條件勝出者）、勾選/取消整個群組 |
-| `set_font_size(size)` | 變更字級並重建（collapsed，成本低）|
-
-模組層級輔助 `_apply_selection(group, conditions, mode)`：以 `_rank_by_conditions` 取得勝出索引，`mode='keep'` 勾選除勝出者外全部、`mode='delete'` 只勾選勝出者，直接寫入 `FileInfo.selected`。
-
----
-
-#### `class MainWindow(QMainWindow)`
-
-**狀態欄位：**
+#### `MainWindow(QMainWindow)`
 
 | 欄位 | 說明 |
 |------|------|
-| `_scanning: bool` | 目前是否有掃描正在進行 |
-| `_paused: bool` | 目前是否暫停中 |
-| `_thread: QThread \| None` | 當前 worker thread |
-| `_worker: ScanWorker \| None` | 當前 worker 物件 |
-| `_scan_id: int` | 掃描流水號（每次 `_start_scan` 遞增），用於防止舊 thread signal 污染 |
-| `_all_groups` | 最新一次掃描的完整結果（未篩選）|
-| `_groups` | 目前顯示中的群組（套用篩選/排序後）|
-| `tree` | `DuplicateTree` 結果檢視（取代舊版 `_cards` GroupCard 清單）|
-| `_preview_popup` | 共用的 `ImagePreviewPopup` 實例 |
-
-**關鍵方法：**
+| `_scan_id` | 掃描流水號，用來忽略舊掃描的遲到訊號 |
+| `_threads` | `{scan_id: (QThread, ScanWorker)}`，等 `finished` 送達才釋放 |
+| `_thread` / `_worker` | 目前這次掃描 |
+| `_removal` | 背景移除中的 `(QThread, RemovalWorker, QProgressDialog)` |
+| `_all_groups` / `_groups` | 完整結果／篩選排序後顯示的結果 |
+| `_settings` | `QSettings`（INI）|
 
 | 方法 | 說明 |
 |------|------|
-| `_toggle_scan()` | 掃描按鈕的點擊處理：閒置時開始，掃描中時取消 |
-| `_start_scan()` | 驗證路徑 → kill 舊 thread → 遞增 `_scan_id` → 建立 worker/thread → 開始掃描 |
-| `_cancel_scan()` | 送 stop 訊號，等待 thread.finished 恢復 UI |
-| `_toggle_pause()` | 暫停/繼續切換，更新按鈕外觀與 logger |
-| `_reset_all()` | 強制 kill thread，清空所有 UI 狀態 |
-| `_kill_thread()` | 同步等待 thread 結束（最多 5 秒），清除 worker/thread 參照 |
-| `_set_scanning(bool)` | 切換掃描狀態，更新按鈕文字/顏色/可見性 |
-| `_on_thread_finished(scan_id)` | `thread.finished` 接收者；比對 `scan_id` 與 `_scan_id`，若不符則忽略（防止 race condition） |
-| `_on_progress(...)` | 更新步驟標籤、ETA、進度條 |
-| `_on_done(groups)` | 儲存 `_all_groups`，更新摘要列，呼叫 `_apply_filter_sort` 渲染樹；啟用 `btn_export` |
-| `_on_error(msg)` | 顯示錯誤 dialog，記錄 log |
-| `_apply_filter_sort()` | 依 ext_filter_edit 與 sort_combo 篩選/排序 `_all_groups`，呼叫 `tree.populate(groups)` |
-| `_apply_font_size(size)` | 透過 `tree.set_font_size` 套用群組內容字級 |
-| `_update_selection_ui()` | `tree.checksChanged` 接收者：以 `tree.selected_stats()` 更新「已選 X」與刪除按鈕文字/啟用狀態 |
-| `_export_report()` | 彙整副檔名統計，呼叫 `_make_pie_svg` 產生兩張圓餅圖，輸出 HTML 報表並以瀏覽器開啟 |
-| `_make_pie_svg(slices, title)` | 輸入 `[(label, value), ...]`，回傳含自動配色圓餅圖的 SVG 字串（右側附圖例）|
-| `_toggle_sidebar()` | 切換側邊功能列顯示/隱藏，更新 ◀/▶ 圖示 |
-| `_toggle_filter_panel()` / `_toggle_qs_panel()` | 切換側邊區段展開/收折 |
-| `_global_apply_conditions()` | 取得全局 ConditionPanel 的條件，呼叫 `tree.apply_conditions_all` |
-| `_set_global_mode(mode)` | 設定全局操作模式（保留/刪除），更新按鈕樣式 |
-| `_delete_selected()` | 從 `tree._groups` 收集 `fi.selected` 路徑 → 確認 → `Path.unlink()` → 記錄 log → 重新掃描 |
+| `_start_scan()` | 驗證路徑 → `_stop_worker()` → 建立 worker／thread → 開始 |
+| `_stop_worker(wait_ms)` | 要求停止並等待；等不到也不釋放參照 |
+| `_on_thread_finished(scan_id)` | 該執行緒 `finished` 送達：此時才釋放 |
+| `_on_done` / `_on_cancelled` / `_on_error` | 只處理 `scan_id` 相符的訊號 |
+| `_delete_selected()` | `build_plan` → `DeletePlanDialog` → `_run_removal()` |
+| `_on_removal_done(results)` | `_apply_removal()`（就地更新結果，不重掃）→ `_report_removal()` |
+| `_load_settings()` / `_save_settings()` | 啟動時還原、關閉時記住 |
+| `_export_csv()` / `_save_results()` / `_open_results()` | 結果匯出與存檔 |
+| `_export_report()` | HTML 報表（存到 `%LOCALAPPDATA%\DupeScan\reports`，保留 20 份）|
+| `closeEvent()` | 記住設定、停止掃描、等待背景執行緒 |
 
-> 全域全選/取消與單一群組快速選取已下放到 `DuplicateTree`（`select_all` / 右鍵選單），MainWindow 只負責叫用與更新摘要。
+---
+
+### `src/ui/delete_dialog.py`、`history_dialog.py`、`theme.py`
+
+- `DeletePlanDialog(plan)`：預覽與確認；呼叫端取 `selected()`、`method()`、`full_verify()`
+- `RemovalWorker(items, method, hwnd, full_verify)`：背景執行；`full_verify` 時先重算完整 Hash，與掃描結果不符的略過
+- `HistoryDialog`：列出 `journal.jsonl`，可還原隔離的檔案
+- `theme.py`：配色常數與 `STYLE`。注意 `QTreeWidget::item` 不設定 `color`，否則會蓋掉各列的 `ForegroundRole`
 
 ---
 
 ## 掃描演算法
 
-### 3-Pass 策略
-
 ```
 所有檔案 (N 個)
     │
-    ▼ Pass 1：os.walk 遍歷，依 size 分組
-    │  dict[int, list[FileInfo]]
-    │  ── 刪除 size 唯一的 key（無重複可能）
-    │  剩餘：M 個候選（M << N）
+    ▼ Pass 1：os.scandir 遍歷，DirEntry.stat() 取大小（不開檔），依 size 分組
+    │  ── 刪除 size 唯一的 key
+    │  ── 候選 os.stat 取 (st_dev, st_ino)，合併同一實體檔（硬連結）
     │
-    ▼ Pass 2：讀取前 PARTIAL_READ (4KB) 計算 hash
-    │  dict[str, list[FileInfo]]
-    │  ── 刪除 hash 唯一的 key
-    │  剩餘：K 個候選（K << M，通常過濾 90%+）
+    ▼ 快取查詢：大小、修改時間（ns）、演算法都相同 → 直接沿用 partial／full
     │
-    ▼ Pass 3：讀取整個檔案計算 xxHash
-    │  dict[str, list[FileInfo]]
-    │  ── 只保留 hash 重複的 key
+    ▼ Pass 2：讀前 PARTIAL_READ (4KB) 算 hash，以 (size, partial) 分組
+    │  ── 刪除只有一個成員的組
     │
-    └─→ 建立 list[DuplicateGroup]，依 wasted_bytes 排序
+    ▼ Pass 3：讀整個檔案算 hash，以 (size, full) 分組
+    │
+    └─→ list[DuplicateGroup]：群組內依路徑排序，群組依 wasted_bytes 由大到小
 ```
-
-### 複雜度分析
 
 | Pass | 磁碟 I/O | 說明 |
 |------|---------|------|
-| Pass 1 | 0（只讀 stat）| 純記憶體操作，O(N) |
-| Pass 2 | 每個候選讀 4KB | 成本低，可過濾大量偽候選 |
-| Pass 3 | 只對剩餘候選全讀 | 最耗時，但通常檔案數極少 |
+| Pass 1 | 只列目錄；候選另做一次 stat | 每檔約 4 µs（暖快取）|
+| Pass 2 | 每個未命中快取的候選讀 4 KB | HDD 上以尋軌時間為主 |
+| Pass 3 | 未命中快取的候選完整讀取 | 真正的重複檔一定要完整讀過一次；第二次起由快取省掉 |
+
+---
+
+## 雜湊快取
+
+- 位置：`%LOCALAPPDATA%\DupeScan\hashcache.sqlite3`（WAL 模式）
+- 資料表 `files(key, size, mtime_ns, algo, partial, partial_len, full, seen)`
+- **鍵**：本機 NTFS／ReFS（`GetDriveTypeW` 為 FIXED／REMOVABLE 且 `GetVolumeInformationW` 的檔案系統為 NTFS／ReFS）用 `i:<dev>:<ino>`，改名、搬移仍認得；其他（FAT／exFAT、網路磁碟）的檔案 ID 可能被重複使用，用 `p:<路徑>`
+- **有效條件**：`size`、`mtime_ns`、`algo` 都相同；`partial` 另需 `partial_len == PARTIAL_READ`
+- **寫入**：在掃描執行緒累積，每 `FLUSH_EVERY` 筆或掃描結束時寫入；**取消時也會寫入**
+- **清理**：`seen` 超過 `PRUNE_AFTER_DAYS`（365 天）的紀錄在掃描結束時刪除
+- 風險：內容改了但大小與修改時間都沒變（極少見）→ 由移除前的開頭 4 KB 複驗與可選的完整比對把關
 
 ---
 
 ## Threading 模型
 
 ```
-Main Thread (Qt Event Loop)
-    │
-    │  QThread.start()
-    ▼
-Worker Thread
-    └─ ScanWorker.run()
-        └─ Scanner._run()  ← 實際執行 os.walk / hash
+Main Thread（Qt 事件迴圈）
+  ├─ QThread「掃描」── ScanWorker.run() ── Scanner.scan()
+  │                                          └─ ThreadPoolExecutor（Pass 2／3，SSD／NVMe）
+  └─ QThread「移除」── RemovalWorker.run() ── file_ops.remove_files()
 
-Thread 通訊（thread-safe）：
-  Worker → Main：Qt signals (progress / finished / error)
-  Main → Worker：threading.Event (stop_event / pause_event)
+Worker → Main：Qt signals（第一個參數是 scan_id）
+Main → Worker：Scanner 的 threading.Event（stop／pause）
 ```
 
-**暫停機制：**
-
-```python
-# pause_event: threading.Event
-# set()   → 繼續（事件已設定，wait() 立即返回）
-# clear() → 暫停（wait() 阻塞直到 set()）
-
-def _check(self) -> bool:
-    self._pause_event.wait()   # 若已 clear()，在此阻塞
-    return self._stop_event.is_set()
-```
-
-> **重要**：`stop()` 必須同時呼叫 `_pause_event.set()`，否則暫停中的 thread 永遠無法收到 stop 訊號，導致死鎖。
+- **暫停／停止**：`_checkpoint()` 在每個讀檔區塊之間呼叫（worker 執行緒也一樣），所以暫停會真的停住 I/O，停止不必等大檔讀完
+- **`stop()` 必須同時 set pause_event**，否則暫停中的執行緒收不到停止訊號
+- **執行緒生命週期**：`worker.ended → thread.quit`；`(thread, worker)` 存在 `_threads[scan_id]`，直到該執行緒的 `finished` 送達 `_on_thread_finished(scan_id)` 才釋放。執行中的 QThread 被回收，或 `finished` 還在排隊時就被回收，Qt 都會直接終止程式
+- **關閉視窗**：先停止掃描並等待；仍未結束的執行緒放進 `_UNFINISHED_THREADS` 保留到程式結束
 
 ---
 
 ## 狀態機設計
 
 ```
-                    ┌─────────────────────────────────────────┐
-                    ▼                                         │
-IDLE ──[開始掃描]──→ SCANNING ──[取消]──→ CANCELING ──[thread.finished]──┘
-                       │  ▲
+IDLE ──[開始掃描]──→ SCANNING ──[取消]──→ CANCELING ──[cancelled(scan_id)]──→ IDLE
+                       │  ▲                                  （顯示「掃描已取消」）
                    [暫停]  [繼續]
-                       │  │
                        ▼  │
                      PAUSED
-
-任何狀態 ──[重置]──→ IDLE（強制 _kill_thread）
+SCANNING ──[finished(scan_id)]──→ IDLE（顯示結果）
+任何狀態 ──[重置／重新開始]──→ _stop_worker() → IDLE（舊掃描的訊號因 scan_id 不符被忽略）
 ```
 
-**按鈕可見性對照：**
+| 狀態 | btn_scan | btn_pause | 路徑與掃描設定 |
+|------|---------|-----------|---------------|
+| IDLE | ▶ 開始掃描 | 隱藏 | 可編輯 |
+| SCANNING | ✕ 取消掃描 | ⏸ 暫停 | 停用 |
+| PAUSED | ✕ 取消掃描 | ▶ 繼續 | 停用 |
+| CANCELING | 取消中…（停用）| 隱藏 | 停用 |
 
-| 狀態 | btn_scan | btn_pause | btn_reset |
-|------|---------|-----------|-----------|
-| IDLE | ▶ 開始掃描 | 隱藏 | 顯示 |
-| SCANNING | ✕ 取消掃描 | ⏸ 暫停 | 顯示 |
-| PAUSED | ✕ 取消掃描 | ▶ 繼續 | 顯示 |
-| CANCELING | 取消中...（disabled）| 隱藏 | 顯示 |
+---
+
+## 移除流程
+
+```
+勾選 → _delete_selected()
+        └─ build_plan()：每個有勾選的群組
+             ├─ 找比對基準：保留的檔案中「仍存在且大小、時間沒變」的第一份
+             ├─ 整組全選 → whole_group（預設不移除）
+             ├─ 已不存在／大小或時間變了／開頭 4 KB 與基準不同 → skip
+             ├─ 沒有可用的基準 → 整組 skip
+             └─ 位於受保護資料夾 → protected（預設不移除）
+        └─ DeletePlanDialog：預覽、選方式、勾「仍要移除」、匯出 CSV
+        └─ RemovalWorker（背景）：可選完整比對 → file_ops.remove_files()
+             ├─ recycle：事先判斷進不了回收筒的 → 隔離資料夾；其餘 SHFileOperationW
+             └─ quarantine：同碟搬移 + manifest.json
+        └─ _apply_removal()：從結果拿掉已移除的檔案（保留展開與捲動位置），不重掃
+        └─ journal.jsonl：操作紀錄（HistoryDialog 可還原隔離的檔案）
+```
 
 ---
 
 ## UI 虛擬化結果檢視
 
-### 問題描述（舊版）
+- `QTreeWidget` 只繪製可見的列；群組以 `addTopLevelItems` 批次加入；子列在 `itemExpanded` 首次觸發時才建立
+- 勾選狀態存在 `FileInfo.selected`，批次操作只改資料再 `refresh_checks()`
+- 字型由 `_FontDelegate` 繪製：群組列加粗、大 1px；改字級只切換 `uniformRowHeights` 讓 view 重算列高，不重建
+- 副檔名篩選以 300 ms 防抖後才 `populate()`（67,792 個群組時重建一次約 1.2 秒）
+- 長路徑 `ElideMiddle`，保留結尾的資料夾名稱
 
-舊版每個重複群組建立一個 `GroupCard`（內含完整 `QTableWidget`，且每個「刪除」儲存格再以 `QWidget`+`QHBoxLayout` 包一個 `QCheckBox`）。掃描整顆磁碟可能產生數千個群組 → 數千個 table + 數萬個巢狀 widget，記憶體與渲染成本極高、捲動卡頓。即使引入「分批渲染」也只是把建立成本分散到多個事件迴圈 tick，**所有卡片最終仍會被建立**，治標不治本。
+---
 
-### 解法：單一虛擬化 `QTreeWidget`
+## 設定與資料位置
 
-改用 `DuplicateTree`（見 [main_window.py](#srcuimain_windowpy)）：
-
-1. **原生虛擬化渲染**：`QTreeWidget` 只繪製 viewport 內可見的列，與資料總量無關。
-2. **批次建立頂層列**：群組以 `addTopLevelItems(list)` 一次加入，避免逐筆 `addChild` 觸發 view 的逐筆插入訊號。實測 5,000 個群組的建立時間從約 2,000 ms 降至約 60 ms。
-3. **延遲建立子列（lazy）**：群組頂層列僅以 `ChildIndicatorPolicy.ShowIndicator` 顯示箭頭；`itemExpanded` 首次觸發時才建立檔案子列。未展開的群組幾乎零成本，因此即使數萬個群組也能瞬間顯示。
-4. **選取狀態移入資料層**（`FileInfo.selected`）：與 widget 解耦，是上述虛擬化能成立的關鍵——群組未展開（子列尚未建立）時仍能正確記住勾選，「全選 / 套用到所有群組」只需遍歷資料而非建立所有列。
-
-```python
-# 批次建立頂層列（detached → 一次加入），子列待展開才建
-items = [self._make_group_item(idx, g) for idx, g in enumerate(groups)]
-self.addTopLevelItems(items)
-for gi, g in zip(items, groups):
-    gi.setFirstColumnSpanned(True)
-    self._set_group_state(gi, g)   # 三態勾選由資料推導
-
-def _on_expanded(self, item):       # lazy 建立檔案子列
-    if item.data(0, _ROLE_POP):
-        return
-    for fi in item.data(0, _ROLE_OBJ).files:
-        self._fill_file_item(QTreeWidgetItem(item), fi)
-    item.setData(0, _ROLE_POP, True)
-```
+| 位置 | 內容 | 覆寫用環境變數 |
+|------|------|---------------|
+| `%APPDATA%\DupeScan\DupeScan.ini` | QSettings（INI）| `DUPESCAN_SETTINGS` |
+| `%LOCALAPPDATA%\DupeScan\hashcache.sqlite3` | 雜湊快取 | `DUPESCAN_DATA_DIR` |
+| `%LOCALAPPDATA%\DupeScan\journal.jsonl` | 操作紀錄 | `DUPESCAN_DATA_DIR` |
+| `%LOCALAPPDATA%\DupeScan\reports\` | HTML 報表 | `DUPESCAN_DATA_DIR` |
+| `<磁碟根目錄>\.dupescan_quarantine\` | 隔離資料夾（掃描時一律排除）| — |
+| `logs\` | 執行日誌 | — |
 
 ---
 
 ## 日誌系統
 
-**日誌位置：** `logs/dupescan_YYYYMMDD_HHMMSS.log`
-
-每次程式啟動產生一個新的 log 檔案，不覆蓋舊的。`logs/` 目錄已加入 `.gitignore`。
-
-**典型日誌範例：**
+每次啟動產生 `logs/dupescan_YYYYMMDD_HHMMSS.log`，保留最近 30 份。
 
 ```
-2026-04-01 09:30:00 [INFO ] 掃描開始 — 路徑: D:\Photos, 最小大小: 1024 B
-2026-04-01 09:30:02 [INFO ] 掃描完成 — 3 個重複群組，共浪費 12.4 MiB（13,000,000 B）
-2026-04-01 09:30:02 [DEBUG] 群組 hash=a1b2c3d4e5f6ff01  size=4.2 MiB  files=2  wasted=4.2 MiB
-2026-04-01 09:30:02 [DEBUG] 群組 hash=beef1234abcd5678  size=2.1 MiB  files=3  wasted=4.2 MiB
-2026-04-01 09:30:15 [INFO ] 開始刪除 2 個檔案
-2026-04-01 09:30:15 [INFO ]   刪除: D:\Photos\backup\vacation.jpg
-2026-04-01 09:30:15 [INFO ] 刪除完成 — 成功 2 個，失敗 0 個
+2026-10-20 21:30:00 [INFO ] 掃描開始 — 路徑: G:\Downloads；最小大小: 1,024 B，略過隱藏檔，使用快取
+2026-10-20 21:30:00 [INFO ] 磁碟偵測: HDD（單執行緒）
+2026-10-20 21:31:12 [INFO ] 掃描統計 — 比對 52,310 個檔案、候選 8,120 個；略過：無法讀取 2、…；快取沿用：前段 8,000、完整 1,950
+2026-10-20 21:31:12 [INFO ]   無法讀取: G:\Downloads\locked.bin（另一個程式正在使用此檔案）
+2026-10-20 21:31:12 [INFO ] 掃描完成 — 1,061 個重複群組，共浪費 2.4 GiB
+2026-10-20 21:32:40 [INFO ] 開始移除 24 個檔案（資源回收筒）
+2026-10-20 21:32:41 [INFO ]   移到資源回收筒: G:\Downloads\photo (1).png
+2026-10-20 21:32:41 [INFO ] 移除完成 — 資源回收筒 24 個、隔離資料夾 0 個、沒有移除 0 個
+2026-10-20 21:32:41 [INFO ] 結果已更新（未重新掃描）— 剩 1,040 個群組
 ```
+
+---
+
+## 測試
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
+| 檔案 | 內容 |
+|------|------|
+| `test_scanner.py` | 重複判定、排序、大小與副檔名篩選、junction／硬連結、排除、隱藏與雲端屬性、取消、暫停真的停、停止不必等大檔、各磁碟執行緒數 |
+| `test_hash_cache.py` | 重掃不讀檔、檔案變了重算、改名仍認得、取消後保留進度、演算法變更、舊紀錄清理 |
+| `test_selection.py` | 9 種條件與疊加優先序 |
+| `test_delete_plan.py` | 整組全刪、掃描後變動、保留的那份不見、受保護資料夾 |
+| `test_file_ops.py` | 隔離與還原、不覆蓋、回收筒障礙判斷、失敗改走隔離區、使用者取消 |
+| `test_results_io.py` | 儲存／開啟結果、CSV |
+| `test_ui_smoke.py` | 主視窗 offscreen：掃描、取消、重新開始、重置與關閉不閃退（子程序）、預覽與背景移除、就地更新、鍵盤與 Ctrl＋點擊、掃描設定、多路徑、拖放、記住設定、報表 |
+
+隔離：`conftest.py` 把 `DUPESCAN_DATA_DIR`、`DUPESCAN_SETTINGS` 指到暫存資料夾；隔離資料夾在測試中改到 `tmp_path`。pytest 的暫存資料夾位於 `AppData\Local\Temp`，測試期間停用「AppData 受保護」規則。真的送資源回收筒的測試需設定 `DUPESCAN_TEST_RECYCLE=1`。
 
 ---
 
 ## 效能考量
 
-1. **xxHash 優先**：比 MD5 快 ~10x、比 SHA256 快 ~20x。若未安裝自動退回 `hashlib.blake2b`。
-2. **3-Pass 設計**：大幅減少全讀次數。在典型情況下（大量小差異檔案），Pass 3 可能只需處理個位數檔案。
-3. **os.walk 不跟隨 symlink**（`followlinks=False`）：避免循環引用造成無限遍歷。
-4. **時間節流 Progress Signal**：Pass 2 / Pass 3 使用 `time.monotonic()` 節流，每 `EMIT_INTERVAL`（0.15 秒）最多 emit 一次。掃描數萬個候選時，避免 Qt signal 佇列積壓造成 UI 卡頓（舊做法是每 50 個 / 每個檔案 emit，百萬量級時過於頻繁）。
-5. **UI 虛擬化結果檢視**：見 [UI 虛擬化結果檢視](#ui-虛擬化結果檢視)章節。單一 `QTreeWidget` 只渲染可見列、群組子列延遲建立、選取狀態存於資料層，數萬個群組仍能瞬間顯示且滑順捲動（取代舊版每群組一個 `QTableWidget` 的做法）。
-6. **Pass 3 I/O 吞吐**：`CHUNK_SIZE` 從 64 KB 提升至 128 KB，減少 `read()` 系統呼叫次數，提升大型檔案的 Hash 速度。
-7. **自適應多執行緒**：掃描前由 `disk_detect` 偵測磁碟類型，SSD/NVMe 啟用 `ThreadPoolExecutor` 並行 I/O；HDD 維持單執行緒順序讀取，避免隨機尋軌損耗。Python GIL 在 file I/O 與 xxhash（C 擴充）期間自動釋放，多執行緒效益可實際發揮。
+1. **雜湊快取**：重掃同一個地方時，沒變的檔案完全不讀內容（2 萬個小檔實測 8.79 秒 → 1.05 秒）
+2. **Pass 1 不開檔**：`DirEntry.stat()` 直接使用目錄列舉的資料（實測每檔 37.1 µs → 4.1 µs）
+3. **(size, partial) 分組**：大小不同但開頭相同的檔案不會進 Pass 3
+4. **自適應多執行緒**：依磁碟類型；xxhash 計算時會釋放 GIL，多執行緒有效
+5. **在途工作上限**：平行模式不一次建立所有 future
+6. **時間節流進度**：`EMIT_INTERVAL` 0.15 秒；Pass 3 以位元組估算 ETA
+7. **移除後就地更新**：不必整顆重掃
+8. **UI 虛擬化**：見上節
 
 ---
 
@@ -555,37 +455,37 @@ def _on_expanded(self, item):       # lazy 建立檔案子列
 | 常數 | 位置 | 值 | 說明 |
 |------|------|----|------|
 | `PARTIAL_READ` | scanner.py | 4096 | Pass 2 讀取 bytes 數 |
-| `CHUNK_SIZE` | scanner.py | 131072 | Pass 3 chunk 大小（128 KB）|
-| `EMIT_INTERVAL` | scanner.py | 0.15 | Pass 2/3 進度 signal 最小間隔（秒）|
-| `BUS_NVME` | disk_detect.py | 17 | STORAGE_BUS_TYPE NVMe 枚舉值（ntddstor.h）|
-| `BUS_SATA` | disk_detect.py | 11 | STORAGE_BUS_TYPE SATA 枚舉值 |
-| `TOTAL_STEPS` | scanner.py | 3 | 掃描步驟總數 |
-| `_ROLE_KIND/OBJ/POP` | main_window.py | Qt.UserRole(+1/+2) | 樹狀 item 上掛載的角色（種類/物件/子列是否已建立）|
-| `_kill_thread` timeout | main_window.py | 5000 ms | 強制等待 thread 結束的上限 |
-| `IMAGE_EXTENSIONS` | main_window.py | set of str | 支援懸停預覽的圖片副檔名集合 |
-| `BG` / `ACCENT` / `DANGER` etc. | main_window.py | hex colors | 現代化深色主題配色，集中在檔案頂部 |
+| `CHUNK_SIZE` | scanner.py | 131072 | Pass 3 每次讀取（128 KB）|
+| `EMIT_INTERVAL` | scanner.py | 0.15 | 進度最小間隔（秒）|
+| `IN_FLIGHT_PER_WORKER` | scanner.py | 4 | 平行模式每執行緒最多在途工作數 |
+| `HASH_ALGO` | scanner.py | `xxh64`／`blake2b` | 寫入快取，變更時舊紀錄作廢 |
+| `EXCLUDED_DIR_NAMES` | scanner.py | `$recycle.bin` 等 | 一律不掃描的資料夾 |
+| `MAX_ERROR_SAMPLES` | scanner.py | 200 | 無法讀取的明細上限 |
+| `PRUNE_AFTER_DAYS` | hash_cache.py | 365 | 快取紀錄保存天數 |
+| `FLUSH_EVERY` | hash_cache.py | 2000 | 快取寫入批次 |
+| `HEAD_BYTES` | delete_plan.py | 4096 | 移除前比對的開頭長度 |
+| `DEFAULT_PROTECTED` | delete_plan.py | fnmatch 樣式 | 受保護資料夾 |
+| `RECYCLE_BATCH` | file_ops.py | 50 | 每次送回收筒的檔案數 |
+| `MAX_SHELL_PATH` | file_ops.py | 259 | 回收筒支援的最長路徑 |
+| `QUARANTINE_DIR_NAME` | file_ops.py | `.dupescan_quarantine` | 隔離資料夾名稱 |
+| `KEEP_LOGS` | logger.py | 30 | 保留的 log 份數 |
 
 ---
 
-## 掃描 Race Condition 修正
+## 歷史問題與修正
 
-### 問題描述
+### 掃描 Race Condition（v0.2）
 
-舊版本中，`_on_thread_finished` 無條件將 `self._thread` 與 `self._worker` 設為 `None`。
-當掃描結束後使用者立即點擊「開始掃描」，`_start_scan` 會建立新的 thread/worker 並開始運行；
-但此時舊 thread 尚未發送 `finished` signal（signal 排入 Qt event queue），等排到時便覆蓋了新掃描的參照，導致閃退或狀態異常。
+舊版 `_on_thread_finished` 無條件清空 `_thread`／`_worker`，掃描結束後立刻重新開始會被舊執行緒的遲到訊號覆蓋。v0.2 以 `_scan_id` 修正；v0.9 起所有 ScanWorker 訊號都帶 `scan_id`。
 
-### 解法
+### 重置閃退（v0.9 修正）
 
-引入 `_scan_id: int`（每次 `_start_scan` 遞增），並在連接 `thread.finished` 時以 lambda 捕捉當時的 `_scan_id`：
+舊版 `_kill_thread()` 等待 5 秒後就丟掉 QThread 參照；若背景還在算大檔（雜湊迴圈不檢查停止），QThread 在執行中被回收，Qt 直接終止程式（`QThread: Destroyed while thread is still running`）。修正：讀檔區塊之間檢查停止、執行緒參照保留到 `finished` 送達才釋放。
 
-```python
-self._scan_id += 1
-current_scan_id = self._scan_id
-self._thread.finished.connect(
-    lambda sid=current_scan_id: self._on_thread_finished(sid)
-)
-```
+### junction 讓同一個檔案變成「兩份重複」（v0.9 修正）
 
-`_on_thread_finished` 收到 signal 後，先比對 `scan_id == self._scan_id`；
-若不符（表示這是舊 thread 的 stale signal）則直接返回，不修改任何狀態。
+`os.walk(followlinks=False)` 不會跟隨符號連結，但**會走進 junction**（Python 不把 junction 當符號連結）。同一個實體檔經由兩條路徑出現，被分成一組「重複」，刪掉任一份就等於刪掉唯一的一份。修正：遍歷時以 `DirEntry.is_junction()` 略過，並以 `(st_dev, st_ino)` 合併同一實體檔作為最後防線。
+
+### 取消被當成「未發現重複」（v0.9 修正）
+
+舊版停止時 `scan()` 仍呼叫 `on_done([])`，畫面顯示「✅ 未發現重複檔案」。修正：停止改呼叫 `on_cancel()`。
