@@ -214,6 +214,12 @@ class Scanner:
         on_error: Callable[[str], None] | None = None,
         on_cancel: Callable[[], None] | None = None,
         cache: HashCache | None = None,   # 雜湊快取；None 表示每次都重新讀檔
+        max_size: int | None = None,      # 大於此大小的檔案不比對（None＝不限）
+        include_exts=(),                  # 只比對這些副檔名（不含點；空＝全部）
+        exclude_exts=(),                  # 不比對這些副檔名
+        exclude_dirs=(),                  # 排除的資料夾：名稱（任何位置）或完整路徑
+        workers_by_dev: dict[int, tuple[int, int]] | None = None,
+                                          # 各磁碟（st_dev）的 (Pass2, Pass3) 執行緒數
     ):
         self.roots          = normalize_roots(roots)
         self.min_size       = min_size
@@ -225,6 +231,14 @@ class Scanner:
         self.on_error       = on_error
         self.on_cancel      = on_cancel
         self.cache          = cache
+        self.max_size       = max_size or None
+        self.include_exts   = {e.strip().lower().lstrip(".") for e in include_exts if e.strip()}
+        self.exclude_exts   = {e.strip().lower().lstrip(".") for e in exclude_exts if e.strip()}
+        self.exclude_dir_names = {d.strip().casefold() for d in exclude_dirs
+                                  if d.strip() and not os.path.isabs(d.strip())}
+        self.exclude_dir_paths = {os.path.normcase(os.path.abspath(d.strip())) for d in exclude_dirs
+                                  if d.strip() and os.path.isabs(d.strip())}
+        self.workers_by_dev = workers_by_dev or {}
         self.stats          = ScanStats()
 
         self._stop_event  = threading.Event()
@@ -361,7 +375,9 @@ class Scanner:
                             if entry.is_dir(follow_symlinks=False):
                                 if _is_junction(entry):
                                     stats.skipped_links += 1
-                                elif name.casefold() in EXCLUDED_DIR_NAMES:
+                                elif (name.casefold() in EXCLUDED_DIR_NAMES
+                                      or name.casefold() in self.exclude_dir_names
+                                      or os.path.normcase(entry.path) in self.exclude_dir_paths):
                                     stats.skipped_excluded += 1
                                 elif not self.include_hidden and _is_hidden(
                                         name, getattr(entry.stat(follow_symlinks=False),
@@ -386,8 +402,13 @@ class Scanner:
                         if attrs & _CLOUD_ATTRS:
                             stats.skipped_cloud += 1
                             continue
-                        if st.st_size < self.min_size:
+                        if st.st_size < self.min_size or (self.max_size and st.st_size > self.max_size):
                             continue
+                        if self.include_exts or self.exclude_exts:
+                            ext = os.path.splitext(name)[1][1:].lower()
+                            if ((self.include_exts and ext not in self.include_exts)
+                                    or ext in self.exclude_exts):
+                                continue
                         stats.files_seen += 1
                         yield FileInfo(path=Path(entry.path), size=st.st_size,
                                        mtime=st.st_mtime, mtime_ns=st.st_mtime_ns)
@@ -438,13 +459,19 @@ class Scanner:
         return merged
 
     # ── Pass 2 / Pass 3：雜湊比對 ──────────────────────────────────────
-    def _hash_stage(self, files: list[FileInfo], fn, workers: int,
+    def _workers_for(self, dev: int, step: int) -> int:
+        """這顆磁碟在 Pass 2／Pass 3 要用幾個執行緒（沒有個別設定時用預設值）。"""
+        pair = self.workers_by_dev.get(dev)
+        if pair is not None:
+            return pair[0] if step == 2 else pair[1]
+        return self.pass2_workers if step == 2 else self.pass3_workers
+
+    def _hash_stage(self, files: list[FileInfo], fn,
                     step: int, label: str) -> Iterator[tuple[FileInfo, str]]:
         """對每個檔案呼叫 fn(path, checkpoint)，依完成順序產生 (FileInfo, digest)。
 
         讀取失敗的檔案記入統計後略過；使用者停止時拋出 _Stopped。
-        workers > 1 時以執行緒池並行，但同時排入的工作不超過 workers × IN_FLIGHT_PER_WORKER 個
-        （不會一次建立數十萬個 future），暫停／停止由 worker 在讀檔區塊之間自行檢查。
+        依磁碟分批處理：每顆磁碟用自己的執行緒策略（HDD 循序、SSD 平行），進度合併計算。
         """
         self._stage = (step, label, len(files), sum(fi.size for fi in files), time.monotonic())
         self._files_done = 0
@@ -452,6 +479,18 @@ class Scanner:
             self._bytes_done = 0
         self._report(force=True)
 
+        batches: dict[int, list[FileInfo]] = defaultdict(list)
+        for fi in files:
+            batches[fi.dev].append(fi)
+        for dev, batch in batches.items():
+            yield from self._hash_batch(batch, fn, self._workers_for(dev, step))
+        self._report(force=True)
+
+    def _hash_batch(self, files: list[FileInfo], fn, workers: int) -> Iterator[tuple[FileInfo, str]]:
+        """同一顆磁碟上的一批檔案。workers > 1 時以執行緒池並行，但同時排入的工作不超過
+        workers × IN_FLIGHT_PER_WORKER 個（不會一次建立數十萬個 future），
+        暫停／停止由 worker 在讀檔區塊之間自行檢查。
+        """
         if workers <= 1:
             for fi in files:
                 self._checkpoint()
@@ -463,7 +502,6 @@ class Scanner:
                     yield fi, digest
                 self._files_done += 1
                 self._report()
-            self._report(force=True)
             return
 
         pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dupescan-hash")
@@ -495,7 +533,6 @@ class Scanner:
                 self._checkpoint()
                 self._report()
             completed = True
-            self._report(force=True)
         finally:
             if not completed:
                 # 停止或發生例外：讓執行中的 worker 在下一個讀檔區塊就結束
@@ -549,8 +586,7 @@ class Scanner:
                 self.stats.cache_hits_partial += 1
             else:
                 todo.append(fi)
-        for fi, digest in self._hash_stage(todo, _partial_hash, self.pass2_workers,
-                                           2, "快速比對中"):
+        for fi, digest in self._hash_stage(todo, _partial_hash, 2, "快速比對中"):
             by_partial[(fi.size, digest)].append(fi)
             if self.cache:
                 self.cache.store(fi, HASH_ALGO, partial=digest, partial_len=PARTIAL_READ)
@@ -569,8 +605,7 @@ class Scanner:
                 self.stats.cache_hits_full += 1
             else:
                 todo.append(fi)
-        for fi, digest in self._hash_stage(todo, _full_hash, self.pass3_workers,
-                                           3, "完整比對中"):
+        for fi, digest in self._hash_stage(todo, _full_hash, 3, "完整比對中"):
             fi.hash_full = digest
             by_full[(fi.size, digest)].append(fi)
             if self.cache:

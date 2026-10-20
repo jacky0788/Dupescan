@@ -41,7 +41,7 @@ from .theme import (
     BG, PANEL, SURFACE, SURFACE_HI, BORDER, BORDER_HI, TEXT, SUBTEXT, FAINT,
     ACCENT, ACCENT_HI, GREEN, DANGER, DANGER_HI, ORANGE, STYLE,
 )
-from ..hash_cache import HashCache
+from ..hash_cache import HashCache, clear_cache
 from ..scanner import Scanner, ScanStats, STEP_NAMES, TOTAL_STEPS, _format_eta
 from ..models import DuplicateGroup, FileInfo
 from ..logger import logger
@@ -53,6 +53,18 @@ from ..selection import (
 
 # 支援懸停圖片預覽的副檔名集合
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif', '.ico'}
+
+
+SIZE_UNITS = {"KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3}
+
+
+def _unit_combo(default: str) -> QComboBox:
+    """大小單位下拉選單（KB／MB／GB）。"""
+    combo = QComboBox()
+    combo.addItems(list(SIZE_UNITS))
+    combo.setCurrentText(default)
+    combo.setFixedWidth(70)
+    return combo
 
 
 def human_size(n: int) -> str:
@@ -86,10 +98,10 @@ class ScanWorker(QObject):
     detected  = pyqtSignal(int, str)
     ended     = pyqtSignal()
 
-    def __init__(self, scan_id: int, roots: list[str], min_size: int, use_cache: bool = True):
+    def __init__(self, scan_id: int, roots: list[str], min_size: int = 1,
+                 use_cache: bool = True, **options):
         super().__init__()
         self.scan_id = scan_id
-        self._roots  = roots
         # Scanner 在建構時就建立：run() 開始前呼叫 stop() 也會生效
         self._scanner = Scanner(
             roots=roots,
@@ -99,16 +111,31 @@ class ScanWorker(QObject):
             on_done=lambda g, st: self.finished.emit(scan_id, g, st),
             on_error=lambda e: self.error.emit(scan_id, e),
             on_cancel=lambda: self.cancelled.emit(scan_id),
+            **options,
         )
 
     def run(self):
-        """在 worker thread 執行：先偵測磁碟類型決定執行緒數，再啟動 Scanner。"""
+        """在 worker thread 執行：偵測每個掃描路徑所在磁碟的類型決定執行緒數，再啟動 Scanner。"""
         try:
             from ..disk_detect import detect_disk_profile
-            profile = detect_disk_profile(Path(self._roots[0]))
-            self.detected.emit(self.scan_id, profile.summary())
-            self._scanner.pass2_workers = profile.pass2_workers
-            self._scanner.pass3_workers = profile.pass3_workers
+            workers: dict[int, tuple[int, int]] = {}
+            labels: list[tuple[str, str]] = []
+            for root in self._scanner.roots:
+                try:
+                    dev = os.stat(root).st_dev
+                except OSError:
+                    continue
+                if dev in workers:
+                    continue
+                profile = detect_disk_profile(root)
+                workers[dev] = (profile.pass2_workers, profile.pass3_workers)
+                labels.append((root.anchor.rstrip("\\") or str(root), profile.summary()))
+            if labels:
+                self._scanner.workers_by_dev = workers
+                self._scanner.pass2_workers, self._scanner.pass3_workers = next(iter(workers.values()))
+                summary = (labels[0][1] if len(labels) == 1
+                           else "・".join(f"{drive} {text}" for drive, text in labels))
+                self.detected.emit(self.scan_id, summary)
             self._scanner.scan()
         finally:
             self.ended.emit()
@@ -621,11 +648,13 @@ class MainWindow(QMainWindow):
         self._sidebar_open:   bool = True
         self._sb_filter_open: bool = True
         self._sb_qs_open:     bool = True
+        self._sb_scan_open:   bool = True
 
         self._preview_popup = ImagePreviewPopup()
 
         self._build_ui()
         self.setStyleSheet(STYLE)
+        self.setAcceptDrops(True)        # 可以把資料夾拖進視窗加入掃描路徑
 
     # ── UI 建構 ───────────────────────────────────────────────────────
     def _build_ui(self):
@@ -703,14 +732,21 @@ class MainWindow(QMainWindow):
         lbl.setStyleSheet(f"color:{SUBTEXT};")
         row.addWidget(lbl)
         self.path_edit = QLineEdit()
-        self.path_edit.setPlaceholderText("選擇要掃描的資料夾或磁碟機…")
+        self.path_edit.setPlaceholderText(
+            "選擇要掃描的資料夾或磁碟機…（多個路徑用 ; 分隔，也可以把資料夾拖進視窗）")
         self.path_edit.setMinimumWidth(220)
         self.path_edit.returnPressed.connect(self._toggle_scan)
         row.addWidget(self.path_edit, 1)
 
-        browse_btn = QPushButton("瀏覽")
-        browse_btn.clicked.connect(self._browse)
-        row.addWidget(browse_btn)
+        self.btn_browse = QPushButton("瀏覽")
+        self.btn_browse.setToolTip("選擇要掃描的資料夾（取代目前的路徑）")
+        self.btn_browse.clicked.connect(lambda: self._browse(append=False))
+        row.addWidget(self.btn_browse)
+        self.btn_add_path = QPushButton("＋")
+        self.btn_add_path.setToolTip("再加一個資料夾一起掃描（可找出不同資料夾、不同磁碟之間的重複）")
+        self.btn_add_path.setFixedWidth(36)
+        self.btn_add_path.clicked.connect(lambda: self._browse(append=True))
+        row.addWidget(self.btn_add_path)
 
         row.addSpacing(6)
         min_lbl = QLabel("最小")
@@ -719,9 +755,10 @@ class MainWindow(QMainWindow):
         self.min_size_spin = QSpinBox()
         self.min_size_spin.setRange(0, 1_000_000)
         self.min_size_spin.setValue(1)
-        self.min_size_spin.setSuffix(" KB")
-        self.min_size_spin.setFixedWidth(96)
+        self.min_size_spin.setFixedWidth(84)
         row.addWidget(self.min_size_spin)
+        self.min_unit_combo = _unit_combo("KB")
+        row.addWidget(self.min_unit_combo)
 
         row.addSpacing(10)
         self.btn_reset = QPushButton("重置")
@@ -835,6 +872,53 @@ class MainWindow(QMainWindow):
         bl.setContentsMargins(0, 0, 4, 0)
         bl.setSpacing(8)
 
+        # ── 區段：掃描設定 ────────────────────────────────────────────
+        self._sb_scan_hdr = QPushButton("▾  掃描設定")
+        self._sb_scan_hdr.setStyleSheet(_SECTION_HDR)
+        self._sb_scan_hdr.clicked.connect(self._toggle_scan_panel)
+        bl.addWidget(self._sb_scan_hdr)
+
+        self._sb_scan_body = QWidget()
+        sl = QVBoxLayout(self._sb_scan_body)
+        sl.setContentsMargins(4, 2, 4, 4)
+        sl.setSpacing(6)
+        sl.addWidget(self._mini_label("只掃這些副檔名"))
+        self.include_ext_edit = QLineEdit()
+        self.include_ext_edit.setPlaceholderText("例如 jpg, png, mp4（留空＝全部）")
+        sl.addWidget(self.include_ext_edit)
+        sl.addWidget(self._mini_label("排除副檔名"))
+        self.exclude_ext_edit = QLineEdit()
+        self.exclude_ext_edit.setPlaceholderText("例如 tmp, log")
+        sl.addWidget(self.exclude_ext_edit)
+        sl.addWidget(self._mini_label("排除資料夾（名稱或完整路徑，以 ; 分隔）"))
+        self.exclude_dir_edit = QLineEdit()
+        self.exclude_dir_edit.setPlaceholderText("例如 node_modules; D:\\Temp")
+        sl.addWidget(self.exclude_dir_edit)
+        sl.addWidget(self._mini_label("最大檔案大小（0＝不限）"))
+        max_row = QHBoxLayout()
+        max_row.setSpacing(6)
+        self.max_size_spin = QSpinBox()
+        self.max_size_spin.setRange(0, 1_000_000)
+        self.max_size_spin.setValue(0)
+        self.max_unit_combo = _unit_combo("GB")
+        max_row.addWidget(self.max_size_spin, 1)
+        max_row.addWidget(self.max_unit_combo)
+        sl.addLayout(max_row)
+        self.cb_hidden = QCheckBox("包含隱藏／系統檔")
+        self.cb_hidden.setToolTip("預設略過「.」開頭與 Windows 隱藏／系統屬性的檔案和資料夾")
+        sl.addWidget(self.cb_hidden)
+        cache_row = QHBoxLayout()
+        cache_row.setSpacing(6)
+        self.cb_cache = QCheckBox("使用雜湊快取")
+        self.cb_cache.setChecked(True)
+        self.cb_cache.setToolTip("記住上次算過的 hash：檔案沒變就不必再讀一次，重掃同一顆磁碟快很多")
+        self.btn_clear_cache = QPushButton("清除快取")
+        self.btn_clear_cache.clicked.connect(self._clear_hash_cache)
+        cache_row.addWidget(self.cb_cache, 1)
+        cache_row.addWidget(self.btn_clear_cache)
+        sl.addLayout(cache_row)
+        bl.addWidget(self._sb_scan_body)
+
         # ── 區段：篩選與排序 ──────────────────────────────────────────
         self._sb_filter_hdr = QPushButton("▾  篩選與排序")
         self._sb_filter_hdr.setStyleSheet(_SECTION_HDR)
@@ -926,6 +1010,86 @@ class MainWindow(QMainWindow):
         lbl.setStyleSheet(f"font-size:11px;color:{SUBTEXT};")
         return lbl
 
+    # ── 掃描路徑與設定 ────────────────────────────────────────────────
+    def _scan_paths(self) -> list[str]:
+        """輸入框裡的掃描路徑（以 ; 分隔；整串本身就是一個存在的路徑時視為單一路徑）。"""
+        text = self.path_edit.text().strip()
+        if text and os.path.exists(text.strip('"')):
+            return [text.strip('"')]
+        paths: list[str] = []
+        for part in text.split(";"):
+            part = part.strip().strip('"')
+            if part and part not in paths:
+                paths.append(part)
+        return paths
+
+    def _add_paths(self, new_paths: list[str], append: bool = True):
+        paths = self._scan_paths() if append else []
+        for p in new_paths:
+            p = os.path.normpath(p)
+            if p not in paths:
+                paths.append(p)
+        self.path_edit.setText("; ".join(paths))
+
+    def _scan_options(self) -> dict:
+        def split(text: str, sep: str) -> list[str]:
+            return [t.strip() for t in text.split(sep) if t.strip()]
+        max_size = self.max_size_spin.value() * SIZE_UNITS[self.max_unit_combo.currentText()]
+        return {
+            "min_size": self.min_size_spin.value() * SIZE_UNITS[self.min_unit_combo.currentText()],
+            "max_size": max_size or None,
+            "include_hidden": self.cb_hidden.isChecked(),
+            "include_exts": split(self.include_ext_edit.text(), ","),
+            "exclude_exts": split(self.exclude_ext_edit.text(), ","),
+            "exclude_dirs": split(self.exclude_dir_edit.text(), ";"),
+        }
+
+    @staticmethod
+    def _describe_options(o: dict, use_cache: bool) -> str:
+        parts = [f"最小大小: {o['min_size']:,} B"]
+        if o["max_size"]:
+            parts.append(f"最大大小: {o['max_size']:,} B")
+        if o["include_exts"]:
+            parts.append(f"只掃: {', '.join(o['include_exts'])}")
+        if o["exclude_exts"]:
+            parts.append(f"排除副檔名: {', '.join(o['exclude_exts'])}")
+        if o["exclude_dirs"]:
+            parts.append(f"排除資料夾: {'; '.join(o['exclude_dirs'])}")
+        parts.append("包含隱藏檔" if o["include_hidden"] else "略過隱藏檔")
+        parts.append("使用快取" if use_cache else "不使用快取")
+        return "，".join(parts)
+
+    def _toggle_scan_panel(self):
+        self._sb_scan_open = not self._sb_scan_open
+        self._sb_scan_body.setVisible(self._sb_scan_open)
+        self._sb_scan_hdr.setText("▾  掃描設定" if self._sb_scan_open else "▸  掃描設定")
+
+    def _clear_hash_cache(self):
+        if self._threads:
+            QMessageBox.information(self, "提示", "掃描進行中，請等掃描結束再清除快取。")
+            return
+        reply = QMessageBox.question(
+            self, "清除雜湊快取",
+            "清除後，下次掃描會重新讀取所有檔案內容。\n（只是 DupeScan 自己的快取，不會動到你的檔案）\n\n確定要清除嗎？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        clear_cache()
+        logger.info("已清除雜湊快取")
+        self.status_bar.showMessage("已清除雜湊快取")
+
+    def dragEnterEvent(self, event):
+        if not self._scanning and any(u.isLocalFile() and os.path.isdir(u.toLocalFile())
+                                      for u in event.mimeData().urls()):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        dirs = [u.toLocalFile() for u in event.mimeData().urls()
+                if u.isLocalFile() and os.path.isdir(u.toLocalFile())]
+        if dirs and not self._scanning:
+            self._add_paths(dirs, append=True)
+            event.acceptProposedAction()
+
     # ── 側邊列展開/收折 ───────────────────────────────────────────────
     def _toggle_sidebar(self):
         self._sidebar_open = not self._sidebar_open
@@ -1000,21 +1164,22 @@ class MainWindow(QMainWindow):
             self.tree.populate(groups)
 
     # ── 操作動作 ──────────────────────────────────────────────────────
-    def _browse(self):
+    def _browse(self, append: bool = False):
         path = QFileDialog.getExistingDirectory(self, "選擇資料夾", "")
         if path:
-            self.path_edit.setText(path)
+            self._add_paths([path], append)
 
     def _toggle_scan(self):
         if self._scanning: self._cancel_scan()
         else: self._start_scan()
 
     def _start_scan(self):
-        path = self.path_edit.text().strip()
-        if not path:
+        paths = self._scan_paths()
+        if not paths:
             QMessageBox.warning(self, "提示", "請先選擇要掃描的路徑。"); return
-        if not Path(path).exists():
-            QMessageBox.warning(self, "路徑錯誤", f"路徑不存在：{path}"); return
+        missing = [p for p in paths if not Path(p).exists()]
+        if missing:
+            QMessageBox.warning(self, "路徑錯誤", "路徑不存在：\n" + "\n".join(missing)); return
 
         self._stop_worker()
         self._clear_results()
@@ -1027,10 +1192,11 @@ class MainWindow(QMainWindow):
         self._paused = False
 
         self._scan_id += 1
-        min_bytes = self.min_size_spin.value() * 1024
-        logger.info(f"掃描開始 — 路徑: {path}, 最小大小: {min_bytes} B")
+        options = self._scan_options()
+        use_cache = self.cb_cache.isChecked()
+        logger.info(f"掃描開始 — 路徑: {'; '.join(paths)}；{self._describe_options(options, use_cache)}")
 
-        worker = ScanWorker(self._scan_id, roots=[path], min_size=min_bytes)
+        worker = ScanWorker(self._scan_id, paths, use_cache=use_cache, **options)
         worker.progress.connect(self._on_progress)
         worker.finished.connect(self._on_done)
         worker.cancelled.connect(self._on_cancelled)
@@ -1127,6 +1293,10 @@ class MainWindow(QMainWindow):
         self.btn_scan.style().unpolish(self.btn_scan)
         self.btn_scan.style().polish(self.btn_scan)
         self.btn_scan.setEnabled(True)
+        # 掃描中不能改路徑與掃描設定
+        for w in (self.path_edit, self.btn_browse, self.btn_add_path, self.min_size_spin,
+                  self.min_unit_combo, self._sb_scan_body, self.btn_clear_cache):
+            w.setEnabled(not scanning)
 
     # ── Signal 接收者（Slots）────────────────────────────────────────
     def _on_thread_finished(self, scan_id: int):

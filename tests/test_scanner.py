@@ -301,3 +301,47 @@ def test_stop_interrupts_large_file(tree, monkeypatch, workers):
     th.join(10)
     assert time.monotonic() - t0 < 0.5
     assert result == [None]
+
+
+# ── 掃描設定：大小上限、副檔名、排除資料夾、各磁碟執行緒數 ──────────────
+def test_max_size_and_extension_filters(tree):
+    small, other, big = blob(4 * KB, 1), blob(4 * KB, 3), blob(64 * KB, 2)
+    for n in ("a.jpg", "b.jpg"):
+        tree(n, small)
+    for n in ("a.tmp", "b.tmp"):
+        tree(n, other)
+    tree("big1.jpg", big)
+    tree("big2.jpg", big)
+    paths = lambda **kw: group_paths(Scanner([str(tree.root)], min_size=1, **kw).scan(), tree.root)
+    assert paths(max_size=8 * KB) == {frozenset({"a.jpg", "b.jpg"}), frozenset({"a.tmp", "b.tmp"})}
+    assert paths(include_exts=["JPG"]) == {frozenset({"a.jpg", "b.jpg"}),
+                                           frozenset({"big1.jpg", "big2.jpg"})}
+    assert paths(exclude_exts=[".jpg"]) == {frozenset({"a.tmp", "b.tmp"})}
+
+
+def test_exclude_dirs_by_name_and_path(tree):
+    data = blob(4 * KB, 1)
+    for n in ("keep/a.bin", "web/node_modules/b.bin", "other/c.bin", "skipme/d.bin"):
+        tree(n, data)
+    s = Scanner([str(tree.root)], min_size=1,
+                exclude_dirs=["node_modules", str(tree.root / "skipme")])
+    assert group_paths(s.scan(), tree.root) == {frozenset({"keep/a.bin", "other/c.bin"})}
+    assert s.stats.skipped_excluded == 2
+
+
+def test_workers_per_device(tree, monkeypatch):
+    data = blob(4 * KB, 1)
+    tree("a.bin", data)
+    tree("b.bin", data)
+    dev = os.stat(tree.root).st_dev
+    used = []
+    orig = Scanner._hash_batch
+
+    def spy(self, files, fn, workers):
+        used.append(workers)
+        return orig(self, files, fn, workers)
+
+    monkeypatch.setattr(Scanner, "_hash_batch", spy)
+    Scanner([str(tree.root)], min_size=1, pass2_workers=1, pass3_workers=1,
+            workers_by_dev={dev: (6, 3)}).scan()
+    assert used == [6, 3]

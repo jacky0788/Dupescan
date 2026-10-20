@@ -335,3 +335,47 @@ def test_path_column_needs_ctrl_to_open_explorer(qapp, window, tree, monkeypatch
     QTest.mouseClick(window.tree.viewport(), Qt.MouseButton.LeftButton,
                      Qt.KeyboardModifier.ControlModifier, pos)
     assert len(located) == 1
+
+
+# ── 掃描設定：多路徑、拖放、側邊列選項 ─────────────────────────────────
+def test_multiple_paths_find_cross_folder_duplicates(qapp, window, tree):
+    data = blob(4 * KB, 5)
+    tree("one/a.bin", data)
+    tree("two/b.bin", data)
+    tree("three/c.bin", blob(4 * KB, 6))
+    window.path_edit.setText(f"{tree.root / 'one'}; {tree.root / 'two'}")
+    assert window._scan_paths() == [str(tree.root / "one"), str(tree.root / "two")]
+    window._start_scan()
+    assert wait_until(qapp, lambda: not window._scanning, timeout=20)
+    assert len(window._all_groups) == 1
+    assert {fi.path.name for fi in window._all_groups[0].files} == {"a.bin", "b.bin"}
+
+
+def test_sidebar_options_are_applied(qapp, window, tree):
+    data = blob(4 * KB, 5)
+    for n in ("a.jpg", "b.jpg", "a.log", "b.log", "node_modules/c.jpg"):
+        tree(n, data)
+    window.exclude_ext_edit.setText("log")
+    window.exclude_dir_edit.setText("node_modules")
+    window.min_size_spin.setValue(2)
+    window.min_unit_combo.setCurrentText("KB")
+    run_scan(qapp, window, tree.root)
+    assert len(window._all_groups) == 1
+    assert {fi.path.name for fi in window._all_groups[0].files} == {"a.jpg", "b.jpg"}
+    window.min_unit_combo.setCurrentText("MB")            # 最小 2 MB → 4 KB 的檔案都不比對
+    run_scan(qapp, window, tree.root)
+    assert window._all_groups == []
+
+
+def test_drop_folders_adds_scan_paths(qapp, window, tree):
+    from PyQt6.QtCore import QMimeData, QPointF, QUrl
+    from PyQt6.QtGui import QDropEvent
+    a = tree("x/a.bin", b"1").parent
+    b = tree("y/b.bin", b"2").parent
+    window.path_edit.setText(str(a))
+    mime = QMimeData()
+    mime.setUrls([QUrl.fromLocalFile(str(b)), QUrl.fromLocalFile(str(tree.root / "y" / "b.bin"))])
+    event = QDropEvent(QPointF(10, 10), Qt.DropAction.CopyAction, mime,
+                       Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+    window.dropEvent(event)
+    assert window._scan_paths() == [str(a), str(b)]       # 只加入資料夾，檔案略過
