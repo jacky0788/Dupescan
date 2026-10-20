@@ -51,7 +51,7 @@ dupescan/
 │   ├── scanner.py           # 掃描引擎（不依賴 Qt）
 │   ├── hash_cache.py        # SQLite 雜湊快取
 │   ├── disk_detect.py       # 磁碟類型偵測（ctypes）
-│   ├── selection.py         # 快速選取條件（不依賴 Qt）
+│   ├── selection.py         # 快速選取條件、智慧規則、參考資料夾、預設集（不依賴 Qt）
 │   ├── delete_plan.py       # 移除前檢查（不依賴 Qt）
 │   ├── file_ops.py          # 資源回收筒／隔離資料夾／還原／操作紀錄（不依賴 Qt）
 │   ├── results_io.py        # 結果 CSV、儲存與開啟（不依賴 Qt）
@@ -177,7 +177,42 @@ Scanner(roots, min_size=1, include_hidden=False, pass2_workers=1, pass3_workers=
 
 ### `src/selection.py`
 
-`CONDITIONS_DEF`（9 條：id、標籤、key 函式、reverse、互斥 id）、`condition(id)`、`rank_by_conditions(files, conditions)`（多條件穩定排序，回傳勝出索引）、`apply_selection(group, conditions, mode)`（`keep`＝勝出者不勾選；`delete`＝只勾選勝出者）。
+決定每個群組保留哪一份、勾選哪些。
+
+| 名稱 | 說明 |
+|------|------|
+| `CONDITIONS_DEF` | 12 條：9 條基本條件（id、標籤、key 函式、reverse、互斥 id）＋ 3 條智慧規則 `copy_name`／`folders`／`custom`（key 與 reverse 為 `None`）|
+| `Condition(id, keys, reverse, smart)` | `keys(files)` 依整個群組算出每個檔案的排序值 |
+| `condition(id, rules=None)` | 建立 `Condition`；智慧規則需要的設定從 `RuleSet` 取 |
+| `rank_by_conditions(files, conditions, mode="keep", candidates=None)` | 勝出（成為目標）的檔案索引；`candidates` 限定候選 |
+| `apply_selection(group, conditions, mode, reference=None)` | 更新 `selected`（`keep`＝勝出者不勾選；`delete`＝只勾選勝出者）；回傳決定勝負的條件 id，`"reference"`＝參考資料夾決定，`None`＝全部平手取列表第一 |
+| `RuleSet` | 一組規則：`mode`、`conditions`（id，依優先序）、`keep_dirs`、`remove_dirs`、`reference_dirs`、`custom`（自訂規則原文）。`build()`、`reference()`、`custom_rules()`、`to_dict()`／`from_dict()` |
+| `dump_presets(presets)`／`load_presets(text)` | `dict[str, RuleSet]` ↔ JSON 字串 `{"version": 1, "presets": [{"name": …, …}]}`；內容壞掉時略過壞掉的部分，不拋例外 |
+
+**比較方式**（`_rank`）：依優先序逐一比較，每個條件只留下最好的那幾個候選，平手才交給下一個條件；全部平手時取候選中的第一個（群組內依路徑排序，結果固定）。等同以倒序套用條件的多鍵穩定排序。
+
+- 基本條件：`reverse=True` 表示值越大越優先成為目標（保留模式＝保留它，刪除模式＝勾選它）
+- 智慧規則（`smart=True`）：排序值是「該移除的程度」，**方向固定**——保留模式取最小值，刪除模式取最大值。所以「優先移除」在兩種模式下都比較容易被勾選
+
+**智慧規則的排序值**
+
+| id | 函式 | 說明 |
+|----|------|------|
+| `copy_name` | `copy_scores(files)` | `copy_info(name)` 回傳（去掉複本標記後的檔名, 標記數），檔名先 NFC 正規化、比對時 casefold。同名（去掉標記後）的檔案中，比最少的多幾個標記就是幾分；群組裡沒有同名的其他檔案時為 0 |
+| `folders` | `folder_scores(files, keep, remove)` | 在優先移除的資料夾為正、優先保留的為負、都不在為 0，清單越前面絕對值越大。兩邊都符合時以比對到比較深的那邊為準，一樣深算優先保留 |
+| `custom` | `custom_scores(files, compiled)` | 由上往下第一條符合的規則決定：`-` 為正、`+` 為負，越上面絕對值越大；都不符合為 0 |
+
+**複本標記**：`_COPY_SUFFIX` 必須接在任何一個 `.` 之前或檔名結尾——` (1)`～` (99)`（含沒有空白、全形括號；`(0)`、`(100)`、`(2019)` 不算）、` - 複製／复制／副本／コピー／Copy`（可再接 ` (2)`）、macOS ` copy`／` copy 2`、Linux ` (copy)`、`.dup`／`.dup1`；`_COPY_PREFIX`：`Copy of `、`Copy (2) of `。檔名含 `+` 或 `%` 時先 `unquote_plus`，有變化就算 1 個標記。標記一次去掉一個、重複到沒有為止。檔名完全不含 `( （ - + %`、`copy`、`.dup` 時直接略過（`_COPY_HINT`）。
+
+**資料夾清單**（`FolderList(dirs)`，輸入用 `split_dirs(text)` 以 `;` 拆開）：不分大小寫、`\` 換成 `/`，只比對檔案所在的資料夾（`_folder_of(path)` → `d:/a/b/`，結尾有 `/`）。
+
+- 完整路徑（`x:` 開頭或 UNC `//` 開頭）：資料夾本身與其下所有子資料夾（`folder.startswith(樣式 + "/")`）
+- 其他視為名稱片段：資料夾路徑中任何位置含有就算（取最後一次出現）；`/old/` 這種前後有分隔符號的，等於要整個資料夾名稱相同
+- `match_folder(folder)` 回傳（比對結尾落在第幾層, 樣式在清單中的位置）；好幾個樣式符合時取最深的，一樣深取前面的。參考資料夾、`delete_plan` 也用同一套比對
+
+**參考資料夾**（`apply_selection` 的 `reference`）：裡面的檔案一律 `selected=False`。保留模式下群組裡有參考檔案時，候選＝參考檔案（保留的那份從中選，其他副本照常勾選）；刪除模式下候選＝非參考檔案（整組都是參考檔案時不勾選）。
+
+**自訂規則**：`parse_custom_rules(text)` → (`list[CustomRule]`, 錯誤訊息)。每行 `+ 樣式`（優先保留）或 `- 樣式`（優先移除），也接受全形 `＋`／`－`；`+`／`-` 後面的空白忽略；空行與 `#` 開頭的行略過；以 `re.IGNORECASE` 編譯，失敗的行列入錯誤訊息。比對時對原本的路徑（`D:\a\b.png`）與 `/` 分隔的路徑（`D:/a/b.png`）各試一次，任一符合就算。
 
 ---
 
@@ -187,11 +222,13 @@ Scanner(roots, min_size=1, include_hidden=False, pass2_workers=1, pass3_workers=
 
 | 名稱 | 說明 |
 |------|------|
-| `build_plan(groups, protected=None, verify_head=True)` | `groups` 為 `(顯示編號, DuplicateGroup)`；回傳 `DeletePlan` |
-| `DeletePlan.removable(allow_whole_group, allow_protected)` | 實際要移除的 `(PlanGroup, PlanEntry)` |
-| `PlanEntry.status` | `keep`／`ok`（會移除）／`skip`（自動略過）／`protected` |
+| `build_plan(groups, protected=None, verify_head=True, reference_dirs=None)` | `groups` 為 `(顯示編號, DuplicateGroup)`；`reference_dirs` 為參考資料夾（寫法同 `selection.FolderList`），裡面被勾選的檔案視同受保護；回傳 `DeletePlan` |
+| `DeletePlan.removable(allow_whole_group, allow_protected)` | 實際要移除的 `(PlanGroup, PlanEntry)`；`allow_protected` 同時放行受保護與參考資料夾 |
+| `PlanEntry.status` | `keep`／`ok`（會移除）／`skip`（自動略過）／`protected`（`note` 為 `PROTECTED_NOTE`「位於受保護資料夾」或 `REFERENCE_NOTE`「位於參考資料夾」）|
 | `DEFAULT_PROTECTED` | 受保護資料夾的 fnmatch 樣式 |
 | `is_protected(path)` | 是否位於受保護資料夾 |
+
+判斷順序：掃描後有變動（`skip`）→ 受保護資料夾 → 參考資料夾 → `ok`。
 
 ---
 
@@ -239,7 +276,13 @@ Scanner(roots, min_size=1, include_hidden=False, pass2_workers=1, pass3_workers=
 
 #### `DuplicateTree(QTreeWidget)`
 
-頂層列＝群組、子列＝檔案（展開時才建立）；勾選狀態存在 `FileInfo.selected`。字型由 `_FontDelegate` 依 `_font_size` 繪製，改字級只需重新排版。重點方法：`populate(groups, expanded=None)`、`expanded_group_ids()`、`refresh_checks()`、`select_all()`、`apply_conditions_all()`、`selected_stats()`、`set_font_size()`、`keyPressEvent()`（空白鍵切換勾選）、`_on_clicked()`（Ctrl＋點擊路徑定位）。
+頂層列＝群組、子列＝檔案（展開時才建立）；勾選狀態存在 `FileInfo.selected`。字型由 `_FontDelegate` 依 `_font_size` 繪製，改字級只需重新排版。重點方法：`populate(groups, expanded=None)`、`expanded_group_ids()`、`refresh_checks()`、`select_all(sel, reference=None)`（勾選時略過參考資料夾）、`apply_conditions_all(conditions, mode, reference=None)`（回傳各條件決定了幾組的 `Counter`）、`selected_stats()`、`set_font_size()`、`set_reference()`（參考資料夾的檔名標 📌）、`keyPressEvent()`（空白鍵切換勾選）、`_on_clicked()`（Ctrl＋點擊路徑定位）、`_context_menu(item)`（建立右鍵選單，測試直接檢查）。
+
+右鍵選單要用的目前規則與預設集由主視窗指定：`rules_provider()` → `RuleSet`、`presets_provider()` → `dict[str, RuleSet]`。手動操作（點勾選框、空白鍵、「勾選此群組全部」）不受參考資料夾限制，由移除前的檢查把關。
+
+#### `ConditionPanel(QWidget)`
+
+側邊列的條件面板：基本條件與智慧規則的勾選框（`_checkboxes`，勾選順序存在 `_checked_order`＝優先序，互斥的自動停用）、勾選「資料夾優先序」「自訂規則」才顯示的設定欄位（`keep_dirs_edit`、`remove_dirs_edit`、`custom_edit`，自訂規則一邊打一邊檢查）、參考資料夾 `reference_edit`（停手 0.3 秒發出 `referenceChanged`）、「優先序」說明。`rule_set()` 讀出 `RuleSet`（`mode` 由主視窗填），`set_rule_set(rules)` 載入預設集。
 
 #### `MainWindow(QMainWindow)`
 
@@ -251,6 +294,7 @@ Scanner(roots, min_size=1, include_hidden=False, pass2_workers=1, pass3_workers=
 | `_removal` | 背景移除中的 `(QThread, RemovalWorker, QProgressDialog)` |
 | `_all_groups` / `_groups` | 完整結果／篩選排序後顯示的結果 |
 | `_settings` | `QSettings`（INI）|
+| `_presets` | 具名預設集 `dict[str, RuleSet]` |
 
 | 方法 | 說明 |
 |------|------|
@@ -258,7 +302,11 @@ Scanner(roots, min_size=1, include_hidden=False, pass2_workers=1, pass3_workers=
 | `_stop_worker(wait_ms)` | 要求停止並等待；等不到也不釋放參照 |
 | `_on_thread_finished(scan_id)` | 該執行緒 `finished` 送達：此時才釋放 |
 | `_on_done` / `_on_cancelled` / `_on_error` | 只處理 `scan_id` 相符的訊號 |
-| `_delete_selected()` | `build_plan` → `DeletePlanDialog` → `_run_removal()` |
+| `_current_rules()` | 側邊列目前的 `RuleSet`（操作模式＋條件面板）|
+| `_apply_rules_to_all(rules)` | 套用到所有顯示中的群組，回傳狀態列訊息；沒有條件或自訂規則有誤時提示並擋下 |
+| `_apply_preset()` / `_save_preset()` / `_delete_preset()` | 預設集：載入並套用／另存（同名先確認）／刪除（先確認）；`_store_presets()` 立即寫進設定檔 |
+| `_select_all()` | 「全部勾選」，略過參考資料夾 |
+| `_delete_selected()` | `build_plan(..., reference_dirs=…)` → `DeletePlanDialog` → `_run_removal()` |
 | `_on_removal_done(results)` | `_apply_removal()`（就地更新結果，不重掃）→ `_report_removal()` |
 | `_load_settings()` / `_save_settings()` | 啟動時還原、關閉時記住 |
 | `_export_csv()` / `_save_results()` / `_open_results()` | 結果匯出與存檔 |
@@ -364,7 +412,7 @@ SCANNING ──[finished(scan_id)]──→ IDLE（顯示結果）
              ├─ 整組全選 → whole_group（預設不移除）
              ├─ 已不存在／大小或時間變了／開頭 4 KB 與基準不同 → skip
              ├─ 沒有可用的基準 → 整組 skip
-             └─ 位於受保護資料夾 → protected（預設不移除）
+             └─ 位於受保護資料夾或參考資料夾 → protected（預設不移除）
         └─ DeletePlanDialog：預覽、選方式、勾「仍要移除」、匯出 CSV
         └─ RemovalWorker（背景）：可選完整比對 → file_ops.remove_files()
              ├─ recycle：事先判斷進不了回收筒的 → 隔離資料夾；其餘 SHFileOperationW
@@ -395,6 +443,16 @@ SCANNING ──[finished(scan_id)]──→ IDLE（顯示結果）
 | `%LOCALAPPDATA%\DupeScan\reports\` | HTML 報表 | `DUPESCAN_DATA_DIR` |
 | `<磁碟根目錄>\.dupescan_quarantine\` | 隔離資料夾（掃描時一律排除）| — |
 | `logs\` | 執行日誌 | — |
+
+`DupeScan.ini` 裡的選取規則（`[select]`）：
+
+| 鍵 | 內容 | 寫入時機 |
+|----|------|---------|
+| `mode`、`conditions` | 操作模式、勾選的條件 id（依優先序）| 關閉視窗 |
+| `keep_dirs`、`remove_dirs`、`reference_dirs` | 輸入框原文（`;` 分隔）| 關閉視窗 |
+| `custom_rules` | 自訂規則原文（多行、含註解）| 關閉視窗 |
+| `presets` | 預設集 JSON（`dump_presets`）| 預設集一有變動就寫入 |
+| `preset` | 上次選的預設集名稱 | 關閉視窗 |
 
 ---
 
@@ -427,11 +485,11 @@ python -m pytest
 |------|------|
 | `test_scanner.py` | 重複判定、排序、大小與副檔名篩選、junction／硬連結、排除、隱藏與雲端屬性、取消、暫停真的停、停止不必等大檔、各磁碟執行緒數 |
 | `test_hash_cache.py` | 重掃不讀檔、檔案變了重算、改名仍認得、取消後保留進度、演算法變更、舊紀錄清理 |
-| `test_selection.py` | 9 種條件與疊加優先序 |
-| `test_delete_plan.py` | 整組全刪、掃描後變動、保留的那份不見、受保護資料夾 |
+| `test_selection.py` | 9 種條件與疊加優先序、決定勝負的條件；像副本的檔名（各種標記、不算標記的、空白 vs + 平手）、資料夾優先序（完整路徑／名稱片段、比較深的為準、清單順序）、參考資料夾（保留與刪除模式）、自訂規則（第一條符合的為準、兩種分隔符號、有錯的行）、智慧規則疊加順序、預設集序列化與壞掉的內容 |
+| `test_delete_plan.py` | 整組全刪、掃描後變動、保留的那份不見、受保護資料夾、參考資料夾視同受保護 |
 | `test_file_ops.py` | 隔離與還原、不覆蓋、回收筒障礙判斷、失敗改走隔離區、使用者取消 |
 | `test_results_io.py` | 儲存／開啟結果、CSV |
-| `test_ui_smoke.py` | 主視窗 offscreen：掃描、取消、重新開始、重置與關閉不閃退（子程序）、預覽與背景移除、就地更新、鍵盤與 Ctrl＋點擊、掃描設定、多路徑、拖放、記住設定、報表 |
+| `test_ui_smoke.py` | 主視窗 offscreen：掃描、取消、重新開始、重置與關閉不閃退（子程序）、預覽與背景移除、就地更新、鍵盤與 Ctrl＋點擊、掃描設定、多路徑、拖放、記住設定、報表；智慧規則（側邊列、右鍵快速選取、套用側邊列的條件）、參考資料夾（規則與全部勾選略過、📌、預覽視同受保護）、自訂規則有誤時擋下、預設集（另存、取代確認、套用、右鍵套用到一組、刪除、重開還在）、選取規則設定記住 |
 
 隔離：`conftest.py` 把 `DUPESCAN_DATA_DIR`、`DUPESCAN_SETTINGS` 指到暫存資料夾；隔離資料夾在測試中改到 `tmp_path`。pytest 的暫存資料夾位於 `AppData\Local\Temp`，測試期間停用「AppData 受保護」規則。真的送資源回收筒的測試需設定 `DUPESCAN_TEST_RECYCLE=1`。
 
@@ -447,6 +505,7 @@ python -m pytest
 6. **時間節流進度**：`EMIT_INTERVAL` 0.15 秒；Pass 3 以位元組估算 ETA
 7. **移除後就地更新**：不必整顆重掃
 8. **UI 虛擬化**：見上節
+9. **套用選取規則**：67,792 個群組／17.6 萬個檔案（合成資料）只用「路徑較短」約 0.16 秒，智慧規則與參考資料夾全開約 0.9 秒（不含重繪結果樹），期間顯示等待游標
 
 ---
 
@@ -489,3 +548,7 @@ python -m pytest
 ### 取消被當成「未發現重複」（v0.9 修正）
 
 舊版停止時 `scan()` 仍呼叫 `on_done([])`，畫面顯示「✅ 未發現重複檔案」。修正：停止改呼叫 `on_cancel()`。
+
+### 「空白 vs +」讓「路徑較短」平手（智慧選取規則）
+
+瀏覽器把檔名的空白換成 `+` 時，`my photo.png` 與 `my+photo.png` 路徑一樣長，「路徑較短」平手，保留哪一份只看列表順序（舊版甚至每次掃描都可能不同；log 裡有一對來回開了 8 次才刪掉其中一份）。修正：「像副本的檔名優先移除」把 `+`／`%20` 等 URL 編碼痕跡算成複本標記，保留空白那份。
