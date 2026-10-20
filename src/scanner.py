@@ -1,8 +1,13 @@
 # 掃描引擎：3-Pass 重複檔案偵測，支援暫停/繼續/停止與 ETA 估算。
 #
-# Pass 1  依檔案大小分組       — 純 stat()，無磁碟讀取
-# Pass 2  前 4 KB 快速 Hash   — 過濾約 90% 的偽候選
-# Pass 3  完整 xxHash 比對    — 只對 Pass 2 剩餘的候選執行
+# Pass 1  遍歷目錄、依檔案大小分組   — 不讀檔案內容
+#         └ 大小相同的候選再查檔案 ID，把「同一個實體檔」的多條路徑（硬連結）合併成一筆
+# Pass 2  前 4 KB 快速 Hash         — 過濾約 90% 的偽候選
+# Pass 3  完整 xxHash 比對          — 只對 Pass 2 剩餘的候選執行
+#
+# 遍歷時不跟隨符號連結與 junction（目錄連接點／磁碟區掛載點），並一律排除資源回收筒、
+# System Volume Information；預設也略過隱藏／系統檔與雲端佔位檔（OneDrive 未下載的檔案，
+# 讀取會觸發下載）。否則同一個檔案可能經由兩條路徑被列成「重複」，刪任一份就等於刪掉唯一的一份。
 #
 # Pass 2 / Pass 3 支援多執行緒（由 disk_detect.DiskProfile 提供執行緒數）：
 #   SSD/NVMe → ThreadPoolExecutor 並行 I/O，大幅縮短比對時間
@@ -13,6 +18,7 @@ import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -35,9 +41,49 @@ STEP_NAMES    = {
     3: "完整 Hash 比對",
 }
 
+# Windows 檔案屬性（stat_result.st_file_attributes）
+_ATTR_HIDDEN                = 0x2
+_ATTR_SYSTEM                = 0x4
+_ATTR_OFFLINE               = 0x1000
+_ATTR_RECALL_ON_OPEN        = 0x40000
+_ATTR_RECALL_ON_DATA_ACCESS = 0x400000
+_CLOUD_ATTRS = _ATTR_OFFLINE | _ATTR_RECALL_ON_OPEN | _ATTR_RECALL_ON_DATA_ACCESS
+_REPARSE_TAG_MOUNT_POINT = 0xA0000003   # junction 與磁碟區掛載點共用的 reparse tag
+
+# 不論設定都不掃描的資料夾名稱（比對時不分大小寫）
+EXCLUDED_DIR_NAMES = frozenset({
+    "$recycle.bin", "recycler", "system volume information", ".dupescan_quarantine",
+})
+
+MAX_ERROR_SAMPLES = 200   # 無法讀取的檔案最多保留幾筆明細供 UI 顯示
+
 # on_progress 回調簽名：(訊息, 目前進度, 總數, 步驟號, 總步驟數, 預估剩餘秒數)
 # eta_secs = -1 表示尚無法估算
 ProgressCallback = Callable[[str, int, int, int, int, int], None]
+
+
+@dataclass
+class ScanStats:
+    """掃描過程的統計，掃描完成時隨結果一起交給 on_done。"""
+    files_seen:       int = 0   # 符合大小條件、納入比對的檔案數
+    candidates:       int = 0   # 大小有重複的候選數（已合併同一實體檔）
+    same_file_merged: int = 0   # 因指向同一個實體檔（硬連結）而合併的路徑數
+    skipped_links:    int = 0   # 略過的符號連結與 junction
+    skipped_hidden:   int = 0   # 略過的隱藏／系統檔案與資料夾
+    skipped_cloud:    int = 0   # 略過的雲端佔位檔
+    skipped_excluded: int = 0   # 略過的排除資料夾（資源回收筒等）
+    unreadable:       int = 0   # 無法讀取的檔案與資料夾
+    unreadable_samples: list[str] = field(default_factory=list)
+
+    def add_unreadable(self, path, exc: OSError):
+        self.unreadable += 1
+        if len(self.unreadable_samples) < MAX_ERROR_SAMPLES:
+            reason = getattr(exc, "strerror", None) or str(exc) or type(exc).__name__
+            self.unreadable_samples.append(f"{path}（{reason}）")
+
+
+class _Stopped(Exception):
+    """使用者停止掃描時，用來從深層迴圈直接跳出。"""
 
 
 def _format_eta(seconds: int) -> str:
@@ -55,38 +101,67 @@ def _format_eta(seconds: int) -> str:
     return f"約 {h} 小時 {m2} 分"
 
 
-def _partial_hash(path: Path) -> str | None:
-    """讀取檔案前 PARTIAL_READ bytes 並計算 hash，IO 失敗回傳 None。
+def _partial_hash(path: Path) -> str:
+    """讀取檔案前 PARTIAL_READ bytes 並計算 hash；讀取失敗時拋出 OSError。
     此函式在 ThreadPoolExecutor worker thread 中執行，設計為純函式（無共用狀態）。
     """
-    try:
-        with open(path, "rb") as f:
-            data = f.read(PARTIAL_READ)
-        if _FAST_HASH:
-            return xxhash.xxh64(data).hexdigest()
-        return __import__("hashlib").blake2b(data, digest_size=8).hexdigest()
-    except (OSError, PermissionError):
-        return None
+    with open(path, "rb") as f:
+        data = f.read(PARTIAL_READ)
+    if _FAST_HASH:
+        return xxhash.xxh64(data).hexdigest()
+    return __import__("hashlib").blake2b(data, digest_size=8).hexdigest()
 
 
-def _full_hash(path: Path) -> str | None:
-    """讀取整個檔案計算完整 hash，IO 失敗回傳 None。
+def _full_hash(path: Path) -> str:
+    """讀取整個檔案計算完整 hash；讀取失敗時拋出 OSError。
     此函式在 ThreadPoolExecutor worker thread 中執行，設計為純函式（無共用狀態）。
     """
+    if _FAST_HASH:
+        h = xxhash.xxh64()
+    else:
+        h = __import__("hashlib").blake2b(digest_size=32)
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _is_junction(entry: os.DirEntry) -> bool:
+    """junction／磁碟區掛載點（Python 不把它們當成符號連結，os.walk 也會走進去）。"""
+    is_junction = getattr(entry, "is_junction", None)   # Python 3.12+
+    if is_junction is not None:
+        return is_junction()
     try:
-        if _FAST_HASH:
-            h = xxhash.xxh64()
-        else:
-            h = __import__("hashlib").blake2b(digest_size=32)
-        with open(path, "rb") as f:
-            while True:
-                chunk = f.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                h.update(chunk)
-        return h.hexdigest()
-    except (OSError, PermissionError):
-        return None
+        st = entry.stat(follow_symlinks=False)
+    except OSError:
+        return False
+    return getattr(st, "st_reparse_tag", 0) == _REPARSE_TAG_MOUNT_POINT
+
+
+def _is_hidden(name: str, attrs: int) -> bool:
+    """「.」開頭的名稱，或帶有 Windows 隱藏／系統屬性。"""
+    return name.startswith(".") or bool(attrs & (_ATTR_HIDDEN | _ATTR_SYSTEM))
+
+
+def normalize_roots(roots) -> list[Path]:
+    """轉成絕對路徑，並去掉重複或位於其他根目錄底下的路徑，避免同一批檔案被掃兩次。"""
+    items = sorted({os.path.abspath(str(r)) for r in roots},
+                   key=lambda p: len(os.path.normcase(p)))
+    kept: list[str] = []
+    for p in items:
+        norm = os.path.normcase(p)
+        if any(norm == os.path.normcase(k) or
+               norm.startswith(os.path.normcase(k).rstrip("\\/") + os.sep) for k in kept):
+            continue
+        kept.append(p)
+    return [Path(p) for p in kept]
+
+
+def _path_key(fi: FileInfo) -> str:
+    return str(fi.path).casefold()
 
 
 class Scanner:
@@ -107,10 +182,11 @@ class Scanner:
         pass2_workers: int = 1,   # Pass 2 執行緒數（由 DiskProfile 提供）
         pass3_workers: int = 1,   # Pass 3 執行緒數（由 DiskProfile 提供）
         on_progress: ProgressCallback | None = None,
-        on_done: Callable[[list[DuplicateGroup]], None] | None = None,
+        on_done: Callable[[list[DuplicateGroup], ScanStats], None] | None = None,
         on_error: Callable[[str], None] | None = None,
+        on_cancel: Callable[[], None] | None = None,
     ):
-        self.roots          = [Path(r) for r in roots]
+        self.roots          = normalize_roots(roots)
         self.min_size       = min_size
         self.include_hidden = include_hidden
         self.pass2_workers  = pass2_workers
@@ -118,6 +194,8 @@ class Scanner:
         self.on_progress    = on_progress
         self.on_done        = on_done
         self.on_error       = on_error
+        self.on_cancel      = on_cancel
+        self.stats          = ScanStats()
 
         self._stop_event  = threading.Event()
         self._pause_event = threading.Event()
@@ -141,17 +219,26 @@ class Scanner:
         return not self._pause_event.is_set()
 
     # ── 入口 ──────────────────────────────────────────────────────────
-    def scan(self) -> list[DuplicateGroup]:
-        """執行掃描，完成後呼叫 on_done；例外時呼叫 on_error。"""
+    def scan(self) -> list[DuplicateGroup] | None:
+        """執行掃描。
+
+        完成 → 呼叫 on_done(groups, stats) 並回傳 groups；
+        被停止 → 只呼叫 on_cancel() 並回傳 None（不會被當成「沒有重複」）；
+        發生例外 → 呼叫 on_error(msg) 並回傳 None。
+        """
         try:
             groups = self._run()
-            if self.on_done:
-                self.on_done(groups)
-            return groups
         except Exception as exc:
             if self.on_error:
                 self.on_error(str(exc))
-            return []
+            return None
+        if groups is None:
+            if self.on_cancel:
+                self.on_cancel()
+            return None
+        if self.on_done:
+            self.on_done(groups, self.stats)
+        return groups
 
     # ── 內部工具 ───────────────────────────────────────────────────────
     def _check(self) -> bool:
@@ -184,12 +271,109 @@ class Scanner:
         rate = done / elapsed
         return int((total - done) / rate)
 
+    # ── Pass 1：遍歷 ───────────────────────────────────────────────────
+    def _walk(self):
+        """依序產生每個符合條件的檔案（FileInfo）。停止時拋出 _Stopped。"""
+        stats = self.stats
+        last_emit = time.monotonic()
+        for root in self.roots:
+            stack = [str(root)]
+            while stack:
+                if self._check():
+                    raise _Stopped
+                current = stack.pop()
+                try:
+                    it = os.scandir(current)
+                except OSError as exc:
+                    stats.add_unreadable(current, exc)
+                    continue
+                with it:
+                    for entry in it:
+                        name = entry.name
+                        try:
+                            if entry.is_symlink():
+                                stats.skipped_links += 1
+                                continue
+                            if entry.is_dir(follow_symlinks=False):
+                                if _is_junction(entry):
+                                    stats.skipped_links += 1
+                                elif name.casefold() in EXCLUDED_DIR_NAMES:
+                                    stats.skipped_excluded += 1
+                                elif not self.include_hidden and _is_hidden(
+                                        name, getattr(entry.stat(follow_symlinks=False),
+                                                      "st_file_attributes", 0)):
+                                    stats.skipped_hidden += 1
+                                else:
+                                    stack.append(entry.path)
+                                continue
+                            if not entry.is_file(follow_symlinks=False):
+                                continue
+                            st = os.stat(entry.path)
+                        except OSError as exc:
+                            stats.add_unreadable(entry.path, exc)
+                            continue
+
+                        attrs = getattr(st, "st_file_attributes", 0)
+                        if not self.include_hidden and _is_hidden(name, attrs):
+                            stats.skipped_hidden += 1
+                            continue
+                        if attrs & _CLOUD_ATTRS:
+                            stats.skipped_cloud += 1
+                            continue
+                        if st.st_size < self.min_size:
+                            continue
+                        stats.files_seen += 1
+                        yield FileInfo(path=Path(entry.path), size=st.st_size,
+                                       mtime=st.st_mtime, mtime_ns=st.st_mtime_ns)
+
+                        if stats.files_seen % 512 == 0:
+                            if self._check():
+                                raise _Stopped
+                            now = time.monotonic()
+                            if now - last_emit >= EMIT_INTERVAL:
+                                self._emit(f"掃描中... 已找到 {stats.files_seen:,} 個檔案",
+                                           stats.files_seen, 0, 1, -1)
+                                last_emit = now
+
+    def _merge_same_files(self, candidates: dict[int, list[FileInfo]]) -> dict[int, list[FileInfo]]:
+        """以檔案 ID（st_dev + st_ino）合併指向同一個實體檔的路徑（硬連結）。
+
+        合併後的路徑記在代表檔的 aliases，不會被列為「重複」——刪掉其中一條路徑既不省空間，
+        若是經由 junction 等方式重複看到，更可能刪掉唯一的一份。
+        """
+        merged: dict[int, list[FileInfo]] = {}
+        checked = 0
+        for size, files in candidates.items():
+            files.sort(key=_path_key)          # 代表路徑固定取字母序最前者
+            seen: dict[tuple[int, int], FileInfo] = {}
+            unique: list[FileInfo] = []
+            for fi in files:
+                checked += 1
+                if checked % 256 == 0 and self._check():
+                    raise _Stopped
+                try:
+                    st = os.stat(fi.path)
+                except OSError as exc:
+                    self.stats.add_unreadable(fi.path, exc)
+                    continue
+                fi.dev, fi.ino = st.st_dev, st.st_ino
+                key = (st.st_dev, st.st_ino)
+                if st.st_ino and key in seen:      # ino 為 0 代表檔案系統不提供，不合併
+                    seen[key].aliases.append(str(fi.path))
+                    self.stats.same_file_merged += 1
+                    continue
+                seen[key] = fi
+                unique.append(fi)
+            if len(unique) > 1:
+                merged[size] = unique
+        return merged
+
     # ── Pass 2 路徑選擇 ────────────────────────────────────────────────
     def _pass2_sequential(self, candidates, total_c, t0) -> dict | None:
         """HDD 安全的循序 Pass 2：細粒度暫停/停止，維持順序讀取。
         回傳 by_partial dict；若使用者停止則回傳 None。
         """
-        by_partial: dict[str, list[FileInfo]] = defaultdict(list)
+        by_partial: dict[tuple[int, str], list[FileInfo]] = defaultdict(list)
         done = 0
         last_emit = t0
 
@@ -197,9 +381,10 @@ class Scanner:
             for fi in files:
                 if self._check():
                     return None     # 使用者已停止，中斷掃描
-                ph = _partial_hash(fi.path)
-                if ph:
-                    by_partial[ph].append(fi)
+                try:
+                    by_partial[(fi.size, _partial_hash(fi.path))].append(fi)
+                except OSError as exc:
+                    self.stats.add_unreadable(fi.path, exc)
                 done += 1
                 now = time.monotonic()
                 if now - last_emit >= EMIT_INTERVAL or done == total_c:
@@ -220,7 +405,7 @@ class Scanner:
         暫停：在消費迴圈呼叫 _pause_event.wait()，已提交的 future 繼續跑完
         停止：呼叫 f.cancel() 嘗試取消尚未開始的 future，已在跑的等完即捨棄
         """
-        by_partial: dict[str, list[FileInfo]] = defaultdict(list)
+        by_partial: dict[tuple[int, str], list[FileInfo]] = defaultdict(list)
         done = 0
         last_emit = t0
         # 展平成一維 list，方便一次性提交給 executor
@@ -235,9 +420,10 @@ class Scanner:
                         f.cancel()          # 嘗試取消尚未開始的 future
                     return None
                 fi = futs[fut]
-                ph = fut.result()
-                if ph:
-                    by_partial[ph].append(fi)
+                try:
+                    by_partial[(fi.size, fut.result())].append(fi)
+                except OSError as exc:
+                    self.stats.add_unreadable(fi.path, exc)
                 done += 1
                 now = time.monotonic()
                 if now - last_emit >= EMIT_INTERVAL or done == total_c:
@@ -250,7 +436,7 @@ class Scanner:
     # ── Pass 3 路徑選擇 ────────────────────────────────────────────────
     def _pass3_sequential(self, candidates2, total2, t0) -> dict | None:
         """HDD 安全的循序 Pass 3。"""
-        by_full: dict[str, list[FileInfo]] = defaultdict(list)
+        by_full: dict[tuple[int, str], list[FileInfo]] = defaultdict(list)
         done = 0
         last_emit = t0
 
@@ -258,10 +444,12 @@ class Scanner:
             for fi in files:
                 if self._check():
                     return None
-                fh = _full_hash(fi.path)
-                if fh:
+                try:
+                    fh = _full_hash(fi.path)
                     fi.hash_full = fh
-                    by_full[fh].append(fi)
+                    by_full[(fi.size, fh)].append(fi)
+                except OSError as exc:
+                    self.stats.add_unreadable(fi.path, exc)
                 done += 1
                 now = time.monotonic()
                 if now - last_emit >= EMIT_INTERVAL or done == total2:
@@ -274,7 +462,7 @@ class Scanner:
 
     def _pass3_parallel(self, candidates2, total2, t0, workers) -> dict | None:
         """SSD/NVMe 並行 Pass 3，執行緒安全說明同 _pass2_parallel。"""
-        by_full: dict[str, list[FileInfo]] = defaultdict(list)
+        by_full: dict[tuple[int, str], list[FileInfo]] = defaultdict(list)
         done = 0
         last_emit = t0
         flat = [fi for files in candidates2.values() for fi in files]
@@ -288,10 +476,12 @@ class Scanner:
                         f.cancel()
                     return None
                 fi = futs[fut]
-                fh = fut.result()
-                if fh:
+                try:
+                    fh = fut.result()
                     fi.hash_full = fh
-                    by_full[fh].append(fi)
+                    by_full[(fi.size, fh)].append(fi)
+                except OSError as exc:
+                    self.stats.add_unreadable(fi.path, exc)
                 done += 1
                 now = time.monotonic()
                 if now - last_emit >= EMIT_INTERVAL or done == total2:
@@ -303,49 +493,24 @@ class Scanner:
         return by_full
 
     # ── 3-Pass 主流程 ──────────────────────────────────────────────────
-    def _run(self) -> list[DuplicateGroup]:
+    def _run(self) -> list[DuplicateGroup] | None:
+        """執行 3-pass 演算法；使用者停止時回傳 None。"""
 
         # ── Pass 1：遍歷目錄，依檔案大小分組 ──────────────────────────
-        # 只呼叫 stat()，無 read()，速度極快
         self._emit("掃描檔案中...", 0, 0, 1)
         by_size: dict[int, list[FileInfo]] = defaultdict(list)
-        scanned = 0
-        t0 = time.monotonic()
-
-        for root in self.roots:
-            # followlinks=False：避免 symlink 循環導致無限遍歷
-            for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-                if self._check():
-                    return []
-                if not self.include_hidden:
-                    # 原地修改 dirnames 讓 os.walk 跳過隱藏子目錄
-                    dirnames[:] = [d for d in dirnames if not d.startswith(".")]
-
-                for fname in filenames:
-                    if self._check():
-                        return []
-                    if not self.include_hidden and fname.startswith("."):
-                        continue
-                    fpath = Path(dirpath) / fname
-                    try:
-                        stat = fpath.stat()
-                        if stat.st_size < self.min_size:
-                            continue
-                        by_size[stat.st_size].append(
-                            FileInfo(path=fpath, size=stat.st_size, mtime=stat.st_mtime)
-                        )
-                        scanned += 1
-                        if scanned % 300 == 0:
-                            self._emit(
-                                f"掃描中... 已找到 {scanned:,} 個檔案",
-                                scanned, 0, 1, -1,
-                            )
-                    except (OSError, PermissionError):
-                        continue    # 無權限或檔案已不存在，跳過
-
-        # 只保留大小有重複的群組，其他不可能是重複檔案
-        candidates = {s: f for s, f in by_size.items() if len(f) > 1}
+        try:
+            for fi in self._walk():
+                by_size[fi.size].append(fi)
+            # 只保留大小有重複的群組，其他不可能是重複檔案；再合併同一實體檔的路徑
+            candidates = self._merge_same_files(
+                {s: f for s, f in by_size.items() if len(f) > 1})
+        except _Stopped:
+            return None
+        by_size.clear()
         total_c = sum(len(v) for v in candidates.values())
+        self.stats.candidates = total_c
+        scanned = self.stats.files_seen
         self._emit(
             f"大小分組完成 — 共掃描 {scanned:,} 個檔案，{total_c:,} 個候選",
             scanned, scanned, 1, 0,
@@ -359,10 +524,11 @@ class Scanner:
             by_partial = self._pass2_sequential(candidates, total_c, t0)
 
         if by_partial is None:
-            return []   # 使用者中止
+            return None   # 使用者中止
 
-        # 前 4 KB hash 不同的一定不是重複，直接刪除
-        candidates2 = {ph: f for ph, f in by_partial.items() if len(f) > 1}
+        # 大小相同但前 4 KB 不同的一定不是重複，直接刪除
+        # （以「大小＋前段 hash」分組，避免不同大小但開頭相同的檔案被送去完整比對）
+        candidates2 = {k: f for k, f in by_partial.items() if len(f) > 1}
         total2 = sum(len(v) for v in candidates2.values())
         self._emit(
             f"快速比對完成 — {total2:,} 個檔案需完整比對",
@@ -377,13 +543,14 @@ class Scanner:
             by_full = self._pass3_sequential(candidates2, total2, t0)
 
         if by_full is None:
-            return []   # 使用者中止
+            return None   # 使用者中止
 
-        # 建立結果群組，依可釋放空間由大到小排序（最值得刪除的排最前面）
-        groups: list[DuplicateGroup] = [
-            DuplicateGroup(hash_value=h, size=files[0].size, files=files)
-            for h, files in by_full.items()
-            if len(files) > 1
-        ]
-        groups.sort(key=lambda g: g.wasted_bytes, reverse=True)
+        # 建立結果群組：群組內依路徑排序（平手規則的結果才會固定），
+        # 群組依可釋放空間由大到小排序（最值得刪除的排最前面）
+        groups: list[DuplicateGroup] = []
+        for (size, h), files in by_full.items():
+            if len(files) > 1:
+                files.sort(key=_path_key)
+                groups.append(DuplicateGroup(hash_value=h, size=size, files=files))
+        groups.sort(key=lambda g: (-g.wasted_bytes, _path_key(g.files[0])))
         return groups

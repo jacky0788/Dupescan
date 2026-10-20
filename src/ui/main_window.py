@@ -33,7 +33,7 @@ from PyQt6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QMenu, QGraphicsDropShadowEffect,
 )
 
-from ..scanner import Scanner, STEP_NAMES, TOTAL_STEPS, _format_eta
+from ..scanner import Scanner, ScanStats, STEP_NAMES, TOTAL_STEPS, _format_eta
 from ..models import DuplicateGroup, FileInfo
 from ..logger import logger
 from ..selection import (
@@ -63,15 +63,17 @@ class ScanWorker(QObject):
     """Qt worker 包裝器，透過 moveToThread 搬到 QThread 執行掃描。
 
     Signal 是跨執行緒通訊的唯一介面：
-      progress → 更新進度條與步驟標籤
-      finished → 掃描完成，帶回結果群組清單
-      error    → 掃描引擎例外，帶回錯誤訊息字串
-      detected → 磁碟偵測完成，帶回 DiskProfile.summary() 字串
+      progress  → 更新進度條與步驟標籤
+      finished  → 掃描完成，帶回結果群組清單與 ScanStats
+      cancelled → 使用者停止掃描（不是「沒有重複」）
+      error     → 掃描引擎例外，帶回錯誤訊息字串
+      detected  → 磁碟偵測完成，帶回 DiskProfile.summary() 字串
     """
-    progress = pyqtSignal(str, int, int, int, int, int)
-    finished = pyqtSignal(list)
-    error    = pyqtSignal(str)
-    detected = pyqtSignal(str)
+    progress  = pyqtSignal(str, int, int, int, int, int)
+    finished  = pyqtSignal(list, object)
+    cancelled = pyqtSignal()
+    error     = pyqtSignal(str)
+    detected  = pyqtSignal(str)
 
     def __init__(self, roots: list[str], min_size: int):
         super().__init__()
@@ -92,8 +94,9 @@ class ScanWorker(QObject):
             pass2_workers=profile.pass2_workers,
             pass3_workers=profile.pass3_workers,
             on_progress=lambda m, c, t, s, ts, eta: self.progress.emit(m, c, t, s, ts, eta),
-            on_done=lambda g: self.finished.emit(g),
+            on_done=lambda g, st: self.finished.emit(g, st),
             on_error=lambda e: self.error.emit(e),
+            on_cancel=lambda: self.cancelled.emit(),
         )
         self._scanner.scan()
 
@@ -490,6 +493,12 @@ class DuplicateTree(QTreeWidget):
         item.setFont(_COL_PATH, nf)
         item.setToolTip(_COL_NAME, f"雙擊以預設程式開啟：{fi.path}")
         item.setToolTip(_COL_PATH, f"點擊在檔案總管中定位：{fi.path}")
+        if fi.aliases:
+            # 硬連結：同一份資料的其他路徑，不列為重複（刪掉也不會省空間）
+            note = (f"\n\n另有 {len(fi.aliases)} 條硬連結路徑指向同一份資料：\n"
+                    + "\n".join(fi.aliases[:10]))
+            item.setToolTip(_COL_NAME, item.toolTip(_COL_NAME) + note)
+            item.setText(_COL_NAME, f"{fi.name}  ⛓{len(fi.aliases) + 1}")
 
     def _on_expanded(self, item: QTreeWidgetItem):
         """群組首次展開時才建立子列（lazy）。"""
@@ -886,9 +895,13 @@ class MainWindow(QMainWindow):
         self.lbl_groups   = _badge("0 個群組", ACCENT)
         self.lbl_wasted   = _badge("可省 0 B", DANGER)
         self.lbl_selected = _badge("已選 0", SURFACE_HI, TEXT)
+        # 掃描時無法讀取的檔案數（滑鼠移上去看明細）；沒有時隱藏
+        self.lbl_skipped  = _badge("", ORANGE)
+        self.lbl_skipped.setVisible(False)
         sl.addWidget(self.lbl_groups)
         sl.addWidget(self.lbl_wasted)
         sl.addWidget(self.lbl_selected)
+        sl.addWidget(self.lbl_skipped)
         sl.addStretch()
 
         self.btn_export = QPushButton("📊  匯出報表")
@@ -1119,6 +1132,7 @@ class MainWindow(QMainWindow):
         self._worker = ScanWorker(roots=[path], min_size=min_bytes)
         self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._on_done)
+        self._worker.cancelled.connect(self._on_cancelled)
         self._worker.error.connect(self._on_error)
         self._worker.detected.connect(self._on_disk_detected)
         self._thread = QThread()
@@ -1163,11 +1177,7 @@ class MainWindow(QMainWindow):
         self.summary_widget.setVisible(False)
         self._sb_filter_body.setVisible(self._sb_filter_open)
         self._sb_qs_body.setVisible(self._sb_qs_open)
-        self.progress_section.setVisible(False)
-        self.progress_label.setText("")
-        self.disk_label.setText("")
-        self.step_label.setText("")
-        self.eta_label.setText("")
+        self._hide_progress()
         self._set_scanning(False)
         self._paused = False
         self.status_bar.showMessage("已重置")
@@ -1206,12 +1216,16 @@ class MainWindow(QMainWindow):
         self._paused = False
         if self._scanning:
             self._set_scanning(False)
-            self.progress_section.setVisible(False)
-            self.progress_label.setText("")
-            self.disk_label.setText("")
-            self.step_label.setText("")
-            self.eta_label.setText("")
+            self._hide_progress()
             self.status_bar.showMessage("掃描已取消")
+
+    def _hide_progress(self):
+        """隱藏進度區並清空各標籤（掃描結束、取消、錯誤、重置共用）。"""
+        self.progress_section.setVisible(False)
+        self.progress_label.setText("")
+        self.disk_label.setText("")
+        self.step_label.setText("")
+        self.eta_label.setText("")
 
     def _on_disk_detected(self, summary: str):
         self.disk_label.setText(f"💽 {summary}")
@@ -1235,20 +1249,18 @@ class MainWindow(QMainWindow):
         else:
             self.progress_bar.setRange(0, 0)
 
-    def _on_done(self, groups: list):
+    def _on_done(self, groups: list, stats: ScanStats):
         if not self._scanning: return
         self._set_scanning(False)
         self._paused = False
-        self.progress_section.setVisible(False)
-        self.progress_label.setText("")
-        self.disk_label.setText("")
-        self.step_label.setText("")
-        self.eta_label.setText("")
+        self._hide_progress()
         self._all_groups = groups
+        self._log_scan_stats(stats)
+        skipped = f"（略過 {stats.unreadable:,} 個無法讀取的項目）" if stats.unreadable else ""
 
         if not groups:
             logger.info("掃描完成 — 未發現重複檔案")
-            self.status_bar.showMessage("掃描完成 — 未發現重複檔案！")
+            self.status_bar.showMessage(f"掃描完成 — 未發現重複檔案！{skipped}")
             self.tree.set_placeholder("✅  未發現重複檔案")
             self.tree.populate([])
             return
@@ -1258,6 +1270,13 @@ class MainWindow(QMainWindow):
 
         self.lbl_groups.setText(f"{len(groups)} 個群組")
         self.lbl_wasted.setText(f"可省 {human_size(total_wasted)}")
+        self.lbl_skipped.setVisible(stats.unreadable > 0)
+        if stats.unreadable:
+            self.lbl_skipped.setText(f"⚠ 略過 {stats.unreadable:,} 個")
+            more = stats.unreadable - len(stats.unreadable_samples[:30])
+            self.lbl_skipped.setToolTip(
+                "以下項目無法讀取，未納入比對：\n" + "\n".join(stats.unreadable_samples[:30])
+                + (f"\n… 另外 {more:,} 個（完整清單見 log）" if more > 0 else ""))
         self.summary_widget.setVisible(True)
         self.btn_export.setEnabled(True)
         self.tree.setHeaderHidden(False)
@@ -1267,15 +1286,32 @@ class MainWindow(QMainWindow):
 
         self._apply_filter_sort()
         self.status_bar.showMessage(
-            f"掃描完成 — 找到 {len(groups)} 個重複群組，可省 {human_size(total_wasted)}")
+            f"掃描完成 — 找到 {len(groups)} 個重複群組，可省 {human_size(total_wasted)}{skipped}")
+
+    def _log_scan_stats(self, stats: ScanStats):
+        logger.info(
+            f"掃描統計 — 比對 {stats.files_seen:,} 個檔案、候選 {stats.candidates:,} 個；"
+            f"略過：無法讀取 {stats.unreadable:,}、連結／junction {stats.skipped_links:,}、"
+            f"隱藏／系統 {stats.skipped_hidden:,}、雲端佔位檔 {stats.skipped_cloud:,}、"
+            f"排除資料夾 {stats.skipped_excluded:,}；合併硬連結 {stats.same_file_merged:,}")
+        for line in stats.unreadable_samples:
+            logger.info(f"  無法讀取: {line}")
+
+    def _on_cancelled(self):
+        """使用者停止掃描：回到閒置狀態，明確顯示「已取消」而不是「沒有重複」。"""
+        if not self._scanning: return
+        self._set_scanning(False)
+        self._paused = False
+        self._hide_progress()
+        self.tree.set_placeholder("掃描已取消")
+        self.tree.populate([])
+        self.status_bar.showMessage("掃描已取消")
 
     def _on_error(self, msg: str):
         if not self._scanning: return
         self._set_scanning(False)
         self._paused = False
-        self.progress_section.setVisible(False)
-        self.progress_label.setText("")
-        self.disk_label.setText("")
+        self._hide_progress()
         logger.error(f"掃描錯誤: {msg}")
         QMessageBox.critical(self, "掃描錯誤", msg)
         self.status_bar.showMessage(f"錯誤: {msg}")
@@ -1288,6 +1324,7 @@ class MainWindow(QMainWindow):
         self._all_groups = []
         self.btn_delete.setEnabled(False)
         self.btn_export.setEnabled(False)
+        self.lbl_skipped.setVisible(False)
 
     # ── 勾選統計 UI 更新 ──────────────────────────────────────────────
     def _update_selection_ui(self):

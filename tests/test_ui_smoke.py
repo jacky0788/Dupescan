@@ -46,3 +46,25 @@ def test_scan_without_duplicates(qapp, window, tree):
     run_scan(qapp, window, tree.root)
     assert window._all_groups == []
     assert window.tree.topLevelItemCount() == 0
+
+
+def test_cancel_shows_cancelled_not_no_duplicates(qapp, window, tree, monkeypatch):
+    import time
+    import src.scanner as sc
+    orig = sc._partial_hash
+
+    def slow(path):
+        time.sleep(0.05)
+        return orig(path)
+
+    monkeypatch.setattr(sc, "_partial_hash", slow)
+    data = blob(4 * KB, 1)
+    for i in range(200):
+        tree(f"f{i:03d}.bin", data)
+    window.path_edit.setText(str(tree.root))
+    window._start_scan()
+    assert wait_until(qapp, lambda: "快速比對" in window.progress_label.text(), timeout=10)
+    window._cancel_scan()
+    assert wait_until(qapp, lambda: not window._scanning, timeout=30)
+    assert "取消" in window.status_bar.currentMessage()
+    assert "未發現" not in window.tree._placeholder.text()

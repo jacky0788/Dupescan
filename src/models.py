@@ -12,6 +12,11 @@ class FileInfo:
     mtime:     float = 0.0  # 修改時間（Unix timestamp）
     selected:  bool  = False  # 是否被勾選待刪除（選取狀態存於資料層，與 UI widget 解耦，
                               # 使虛擬化樹狀檢視在群組未展開時仍能正確記住勾選結果）
+    mtime_ns:  int = 0      # 修改時間（奈秒，供刪除前複驗與快取比對）
+    dev:       int = 0      # 磁碟區序號（st_dev），與 ino 一起識別「同一個實體檔」
+    ino:       int = 0      # 檔案 ID（st_ino）；0 表示檔案系統不提供
+    aliases:   list[str] = field(default_factory=list)
+                            # 指向同一個實體檔的其他路徑（硬連結），只顯示、不另列為重複
 
     @property
     def name(self) -> str:
