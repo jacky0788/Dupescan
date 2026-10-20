@@ -225,10 +225,44 @@ def test_remove_flow_moves_files_and_reports(qapp, window, tree, tmp_path, monke
                         lambda *a, **k: reports.append(a[2]))
 
     scan_and_select(qapp, window, tree, {"dup1.bin", "dup2.bin"})
+    scan_id = window._scan_id
     window._delete_selected()
-    assert wait_until(qapp, lambda: reports and window._removal is None and not window._scanning,
-                      timeout=20)
+    assert wait_until(qapp, lambda: reports and window._removal is None, timeout=20)
     assert "隔離資料夾：2 個" in reports[0]
     assert not (tree.root / "b/dup1.bin").exists() and not (tree.root / "c/dup2.bin").exists()
     assert (tree.root / "a/keep.bin").exists()
     assert len(list(qroot.rglob("*.bin"))) == 2
+    # 不重新掃描，直接更新結果：只剩一份的群組消失
+    assert window._scan_id == scan_id and not window._scanning
+    assert window._all_groups == []
+    assert "處理完了" in window.tree._placeholder.text()
+
+
+def test_partial_removal_keeps_group_and_view(qapp, window, tree, tmp_path, monkeypatch):
+    from PyQt6.QtWidgets import QDialog
+    from src import file_ops
+    from src.ui import delete_dialog, main_window
+
+    monkeypatch.setattr(file_ops, "quarantine_root_for", lambda p: tmp_path / "Q")
+    monkeypatch.setattr(delete_dialog.DeletePlanDialog, "exec",
+                        lambda dlg: (dlg.set_method("quarantine"), QDialog.DialogCode.Accepted)[1])
+    monkeypatch.setattr(main_window.QMessageBox, "information", lambda *a, **k: None)
+
+    scan_and_select(qapp, window, tree, {"dup1.bin"}, extra=["d/dup3.bin"])
+    other = blob(6 * KB, 10)
+    tree("x/o1.bin", other)
+    tree("y/o2.bin", other)
+    run_scan(qapp, window, tree.root)                 # 兩個群組：4 份與 2 份
+    big = next(g for g in window._all_groups if len(g.files) == 4)
+    for fi in big.files:
+        fi.selected = fi.path.name == "dup1.bin"
+    window.tree.refresh_checks()
+    window.tree.topLevelItem(0).setExpanded(True)
+    expanded_before = window.tree.expanded_group_ids()
+
+    window._delete_selected()
+    assert wait_until(qapp, lambda: window._removal is None and len(big.files) == 3, timeout=20)
+    assert len(window._all_groups) == 2
+    assert window.tree.topLevelItemCount() == 2
+    assert window.tree.expanded_group_ids() == expanded_before
+    assert window.lbl_groups.text() == "2 個群組"

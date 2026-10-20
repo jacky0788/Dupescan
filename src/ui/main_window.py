@@ -259,10 +259,11 @@ class DuplicateTree(QTreeWidget):
         self._placeholder.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
     # ── 建立 / 重建 ───────────────────────────────────────────────────
-    def populate(self, groups: list[DuplicateGroup]):
+    def populate(self, groups: list[DuplicateGroup], expanded: set[int] | None = None):
         """以 groups 重建樹。只建立群組頂層列；子列待展開時才建立。
 
         勾選狀態保存在 FileInfo.selected，因此排序/篩選後重建仍會反映既有選取。
+        expanded：要維持展開的群組（id(DuplicateGroup)），移除檔案後重建時保留原本的檢視。
         """
         self._preview.reset()
         self._guard = True
@@ -293,10 +294,23 @@ class DuplicateTree(QTreeWidget):
             self._set_group_state(gi, g)
         self.setUpdatesEnabled(True)
         self._guard = False
+        if expanded:
+            for gi, g in zip(items, groups):
+                if id(g) in expanded:
+                    gi.setExpanded(True)      # 觸發 _on_expanded 建立子列
         self.setHeaderHidden(not groups)
         self._placeholder.setVisible(not groups)
         self._placeholder.raise_()
         self.checksChanged.emit()
+
+    def expanded_group_ids(self) -> set[int]:
+        """目前展開中的群組（id(DuplicateGroup)）。"""
+        ids = set()
+        for i in range(self.topLevelItemCount()):
+            gi = self.topLevelItem(i)
+            if gi.isExpanded():
+                ids.add(id(gi.data(0, _ROLE_OBJ)))
+        return ids
 
     def set_placeholder(self, text: str):
         self._placeholder.setText(text)
@@ -919,8 +933,9 @@ class MainWindow(QMainWindow):
             self.tree._font_size = size
 
     # ── 篩選 / 排序 ───────────────────────────────────────────────────
-    def _apply_filter_sort(self):
-        if not self._all_groups:
+    def _apply_filter_sort(self, keep_view: bool = False):
+        """依篩選與排序條件重建結果樹；keep_view 時保留展開狀態與捲動位置。"""
+        if not self._all_groups and not keep_view:
             return
         ext_text = self.ext_filter_edit.text().strip().lower()
         if ext_text:
@@ -941,7 +956,13 @@ class MainWindow(QMainWindow):
         key_fn, rev = sort_opts[self.sort_combo.currentIndex()]
         groups.sort(key=key_fn, reverse=rev)
         self._groups = groups
-        self.tree.populate(groups)
+        if keep_view:
+            expanded = self.tree.expanded_group_ids()
+            scroll = self.tree.verticalScrollBar().value()
+            self.tree.populate(groups, expanded)
+            self.tree.verticalScrollBar().setValue(scroll)
+        else:
+            self.tree.populate(groups)
 
     # ── 操作動作 ──────────────────────────────────────────────────────
     def _browse(self):
@@ -1137,8 +1158,7 @@ class MainWindow(QMainWindow):
         total_wasted = sum(g.wasted_bytes for g in groups)
         logger.info(f"掃描完成 — {len(groups)} 個重複群組，共浪費 {human_size(total_wasted)}")
 
-        self.lbl_groups.setText(f"{len(groups)} 個群組")
-        self.lbl_wasted.setText(f"可省 {human_size(total_wasted)}")
+        self._update_summary()
         self.lbl_skipped.setVisible(stats.unreadable > 0)
         if stats.unreadable:
             self.lbl_skipped.setText(f"⚠ 略過 {stats.unreadable:,} 個")
@@ -1147,7 +1167,6 @@ class MainWindow(QMainWindow):
                 "以下項目無法讀取，未納入比對：\n" + "\n".join(stats.unreadable_samples[:30])
                 + (f"\n… 另外 {more:,} 個（完整清單見 log）" if more > 0 else ""))
         self.summary_widget.setVisible(True)
-        self.btn_export.setEnabled(True)
         self.tree.setHeaderHidden(False)
 
         self._sb_filter_body.setVisible(self._sb_filter_open)
@@ -1265,9 +1284,29 @@ class MainWindow(QMainWindow):
 
     def _on_removal_done(self, results: list):
         self._finish_removal_ui()
+        self._apply_removal(results)
         self._report_removal(results)
-        if not self._scanning:
-            self._start_scan()
+
+    def _apply_removal(self, results: list):
+        """把已移除的檔案從結果中拿掉（不重新掃描）：剩不到 2 份的群組直接消失。"""
+        removed = {r.path for r in results if r.ok}
+        if not removed:
+            return
+        for g in self._all_groups:
+            g.files = [fi for fi in g.files if str(fi.path) not in removed]
+        self._all_groups = [g for g in self._all_groups if len(g.files) > 1]
+        self._update_summary()
+        self._apply_filter_sort(keep_view=True)
+        logger.info(f"結果已更新（未重新掃描）— 剩 {len(self._all_groups)} 個群組")
+
+    def _update_summary(self):
+        """依目前的 _all_groups 更新摘要列的群組數與可省空間。"""
+        groups = self._all_groups
+        self.lbl_groups.setText(f"{len(groups)} 個群組")
+        self.lbl_wasted.setText(f"可省 {human_size(sum(g.wasted_bytes for g in groups))}")
+        self.btn_export.setEnabled(bool(groups))
+        if not groups:
+            self.tree.set_placeholder("✅  這次找到的重複檔都處理完了")
 
     def _on_removal_error(self, msg: str):
         self._finish_removal_ui()
