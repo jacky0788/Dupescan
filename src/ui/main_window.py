@@ -49,8 +49,10 @@ from ..models import DuplicateGroup, FileInfo
 from ..logger import logger
 from ..selection import (
     COND_BY_ID as _COND_BY_ID,
+    RuleSet,
     apply_selection as _apply_selection,
     condition as _condition,
+    split_dirs,
 )
 
 # 支援懸停圖片預覽的副檔名集合
@@ -282,6 +284,8 @@ class DuplicateTree(QTreeWidget):
         self._groups: list[DuplicateGroup] = []
         self._font_size = 13
         self._guard = False   # 防止程式化 setCheckState 觸發的 itemChanged 遞迴
+        # 右鍵選單要用的目前規則（側邊列的條件與資料夾設定），由主視窗指定
+        self.rules_provider = RuleSet
 
         self.setColumnCount(4)
         self.setHeaderLabels(["名稱", "路徑（雙擊開啟・Ctrl＋點擊在檔案總管定位）", "大小", "修改時間"])
@@ -593,18 +597,24 @@ class DuplicateTree(QTreeWidget):
             menu.addSeparator()
 
         # 快速選取子選單（保留某條件勝出者，其餘標記待刪）
+        rules: RuleSet = self.rules_provider()
         quick = menu.addMenu("快速選取（保留…）")
 
-        def add_quick(text: str, conditions: list):
-            act = quick.addAction(text)
+        def add_quick(parent: QMenu, text: str, conditions: list, mode: str = "keep"):
+            act = parent.addAction(text)
             act.triggered.connect(
-                lambda _, gg=g, gi=group_item, c=conditions: self._quick_group(gi, gg, c))
+                lambda _, gg=g, gi=group_item, c=conditions, m=mode: self._quick_group(gi, gg, c, m))
             return act
 
         for cid in ("newer", "older", "sh_path", "shallow", "lo_path"):
-            add_quick(f"保留{_COND_BY_ID[cid][1]}者", [_condition(cid)])
+            add_quick(quick, f"保留{_COND_BY_ID[cid][1]}者", [_condition(cid)])
         quick.addSeparator()
-        add_quick("保留原始檔名（像副本的優先移除）", [_condition("copy_name")])
+        add_quick(quick, "保留原始檔名（像副本的優先移除）", [_condition("copy_name")])
+        has_dirs = bool(rules.keep_dirs or rules.remove_dirs)
+        add_quick(quick, "依資料夾優先序" if has_dirs else "依資料夾優先序（請先在側邊列設定資料夾）",
+                  [_condition("folders", rules)]).setEnabled(has_dirs)
+        active = rules.build()
+        add_quick(menu, "套用側邊列的條件到此群組", active, rules.mode).setEnabled(bool(active))
         menu.addSeparator()
         a_all = menu.addAction("勾選此群組全部")
         a_all.triggered.connect(lambda: self._toggle_group(group_item, g, True))
@@ -612,8 +622,9 @@ class DuplicateTree(QTreeWidget):
         a_none.triggered.connect(lambda: self._toggle_group(group_item, g, False))
         return menu
 
-    def _quick_group(self, gi: QTreeWidgetItem, g: DuplicateGroup, conditions: list):
-        _apply_selection(g, conditions, "keep")
+    def _quick_group(self, gi: QTreeWidgetItem, g: DuplicateGroup, conditions: list,
+                     mode: str = "keep"):
+        _apply_selection(g, conditions, mode)
         self._set_group_state(gi, g)
         if gi.data(0, _ROLE_POP):
             self._guard = True
@@ -722,6 +733,7 @@ class MainWindow(QMainWindow):
         cl.addWidget(self._sidebar_tab)
 
         self.tree = DuplicateTree(self._preview_popup)
+        self.tree.rules_provider = self._current_rules
         self.tree.checksChanged.connect(self._update_selection_ui)
         self.tree.setHeaderHidden(True)   # 初始無結果時隱藏表頭
         cl.addWidget(self.tree, 1)
@@ -1150,6 +1162,8 @@ class MainWindow(QMainWindow):
         self.font_size_spin.setValue(st.value("view/font_size", 13, int))
         self.sort_combo.setCurrentIndex(st.value("view/sort", 0, int))
         self._set_global_mode(st.value("select/mode", "keep", str))
+        self._global_cond.keep_dirs_edit.setText(st.value("select/keep_dirs", "", str))
+        self._global_cond.remove_dirs_edit.setText(st.value("select/remove_dirs", "", str))
         for cond_id in st.value("select/conditions", [], list) or []:
             cb = self._global_cond._checkboxes.get(cond_id)
             if cb is not None and cb.isEnabled():
@@ -1178,6 +1192,8 @@ class MainWindow(QMainWindow):
         st.setValue("view/sort", self.sort_combo.currentIndex())
         st.setValue("select/mode", self._global_qs_mode)
         st.setValue("select/conditions", list(self._global_cond._checked_order))
+        st.setValue("select/keep_dirs", self._global_cond.keep_dirs_edit.text())
+        st.setValue("select/remove_dirs", self._global_cond.remove_dirs_edit.text())
         st.setValue("ui/sidebar_open", self._sidebar_open)
         st.setValue("ui/scan_panel_open", self._sb_scan_open)
         st.setValue("ui/filter_panel_open", self._sb_filter_open)
@@ -1211,6 +1227,12 @@ class MainWindow(QMainWindow):
         keep = self._global_qs_mode == "keep"
         self._g_btn_keep.setStyleSheet(_SEG_ON if keep else _SEG_OFF)
         self._g_btn_delete.setStyleSheet(_SEG_OFF if keep else _SEG_ON)
+
+    def _current_rules(self) -> RuleSet:
+        """側邊列目前的規則：操作模式＋條件面板。"""
+        rules = self._global_cond.rule_set()
+        rules.mode = self._global_qs_mode
+        return rules
 
     def _global_apply_conditions(self):
         conditions = self._global_cond.get_active()
@@ -1912,7 +1934,9 @@ class ConditionPanel(QWidget):
             lay.addLayout(row)
         lay.addWidget(self._make_cb("list_1st"))
 
-        smart = QLabel("智慧規則（方向固定，保留／刪除模式都一樣）")
+        smart = QLabel("智慧規則（方向固定，兩種模式都一樣）")
+        smart.setToolTip("「優先移除」的檔案在兩種模式下都比較容易被勾選：\n"
+                         "保留目標模式留下最不該移除的那份；刪除目標模式只勾最該移除的那份。")
         smart.setWordWrap(True)
         smart.setStyleSheet(f"font-size:11px;color:{SUBTEXT};padding-top:4px;")
         lay.addWidget(smart)
@@ -1923,11 +1947,38 @@ class ConditionPanel(QWidget):
             "像副本的優先移除。檔名之間沒有這種關係時算平手，交給下一個條件。")
         lay.addWidget(copy_cb)
 
+        folders_cb = self._make_cb("folders")
+        folders_cb.setToolTip(
+            "檔案在「優先保留」的資料夾就留下，在「優先移除」的就勾選；清單越前面越優先。\n"
+            "可填完整路徑（D:\\Models，含子資料夾）或名稱片段（_trash、備份、Downloads：\n"
+            "資料夾路徑中含有這段文字就算）。同一個檔案兩邊都符合時，以比較深的那層為準。")
+        lay.addWidget(folders_cb)
+        self._folders_box = QWidget()
+        fl = QVBoxLayout(self._folders_box)
+        fl.setContentsMargins(20, 0, 0, 2)
+        fl.setSpacing(3)
+        fl.addWidget(self._hint("優先保留（; 分隔，越前面越優先）"))
+        self.keep_dirs_edit = QLineEdit()
+        self.keep_dirs_edit.setPlaceholderText("例如 D:\\Models; 收藏")
+        fl.addWidget(self.keep_dirs_edit)
+        fl.addWidget(self._hint("優先移除（; 分隔，越前面越優先移除）"))
+        self.remove_dirs_edit = QLineEdit()
+        self.remove_dirs_edit.setPlaceholderText("例如 _trash; _bak; 備份; Downloads")
+        fl.addWidget(self.remove_dirs_edit)
+        lay.addWidget(self._folders_box)
+
         self._order_label = QLabel()
         self._order_label.setWordWrap(True)
         self._order_label.setStyleSheet(f"font-size:11px;color:{SUBTEXT};padding-top:2px;")
         lay.addWidget(self._order_label)
         self._update_order_label()
+
+    @staticmethod
+    def _hint(text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setWordWrap(True)
+        lbl.setStyleSheet(f"font-size:11px;color:{SUBTEXT};")
+        return lbl
 
     def _make_cb(self, cond_id: str) -> QCheckBox:
         cb = QCheckBox(_COND_BY_ID[cond_id][1])
@@ -1937,11 +1988,13 @@ class ConditionPanel(QWidget):
         return cb
 
     def _update_order_label(self):
+        """更新「優先序」說明，並只在勾選時顯示智慧規則的設定欄位。"""
         if self._checked_order:
             steps = [f"{i}. {_COND_BY_ID[cid][1]}" for i, cid in enumerate(self._checked_order, 1)]
             self._order_label.setText("優先序：" + " → ".join(steps))
         else:
             self._order_label.setText("優先序：（尚未勾選條件）")
+        self._folders_box.setVisible("folders" in self._checked_order)
 
     def _on_toggle(self, cond_id: str, state: int):
         checked = (state == Qt.CheckState.Checked.value)
@@ -1964,5 +2017,11 @@ class ConditionPanel(QWidget):
                 self._checkboxes[conflict].setEnabled(True)
         self._update_order_label()
 
+    def rule_set(self) -> RuleSet:
+        """面板上目前的規則（操作模式由主視窗另外填）。"""
+        return RuleSet(conditions=list(self._checked_order),
+                       keep_dirs=split_dirs(self.keep_dirs_edit.text()),
+                       remove_dirs=split_dirs(self.remove_dirs_edit.text()))
+
     def get_active(self) -> list:
-        return [_condition(cid) for cid in self._checked_order]
+        return self.rule_set().build()

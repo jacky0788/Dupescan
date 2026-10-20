@@ -10,7 +10,7 @@
 
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 from urllib.parse import unquote_plus
 
@@ -29,9 +29,10 @@ CONDITIONS_DEF = [
     ("al_last",  "字母較後", lambda fi: str(fi.path).lower(), True,  "al_first"),
     ("list_1st", "列表第一", None,                             False, None),
     ("copy_name", "像副本的檔名優先移除", None,               None,  None),
+    ("folders",   "資料夾優先序",         None,               None,  None),
 ]
 COND_BY_ID = {c[0]: c for c in CONDITIONS_DEF}
-SMART_IDS = ("copy_name",)
+SMART_IDS = ("copy_name", "folders")
 
 
 @dataclass(frozen=True)
@@ -98,11 +99,107 @@ def copy_scores(files: list[FileInfo]) -> list[int]:
     return [count - least[canon] for canon, count in infos]
 
 
+# ── 資料夾清單 ───────────────────────────────────────────────────────────
+_ABSOLUTE = re.compile(r"^(?:[a-z]:(?:/|$)|//)")      # 「d:/…」「d:」或 UNC「//server/…」
+
+
+def split_dirs(text: str) -> list[str]:
+    """把「_trash; D:\\Models」這類以 ; 分隔的輸入拆成清單（去掉空白與引號）。"""
+    return [p for p in (part.strip().strip('"').strip() for part in text.split(";")) if p]
+
+
+def _folder_of(path) -> str:
+    """「D:\\Models\\a.bin」→「d:/models/」：檔案所在資料夾，比對用（不分大小寫、/ 分隔、結尾有 /）。"""
+    s = str(path).replace("\\", "/").casefold()
+    return s[:s.rfind("/") + 1]
+
+
+class FolderList:
+    """使用者列出的資料夾，不分大小寫，/ 與 \\ 視為相同。
+
+    完整路徑（D:\\Models、\\\\NAS\\share）：資料夾本身與其下所有子資料夾。
+    其他視為名稱片段（_trash、備份、Downloads、models\\blobs）：資料夾路徑中任何位置含有就算；
+    要整個資料夾名稱相同，前後加上分隔符號，例如 \\old\\。
+    """
+
+    def __init__(self, dirs: list[str]):
+        self.patterns: list[tuple[str, bool]] = []      # (樣式, 是否為完整路徑)
+        for d in dirs:
+            p = d.strip().strip('"').replace("\\", "/").casefold()
+            absolute = bool(_ABSOLUTE.match(p))
+            if absolute:
+                p = p.rstrip("/")
+            if p.strip("/"):
+                self.patterns.append((p, absolute))
+
+    def __bool__(self) -> bool:
+        return bool(self.patterns)
+
+    def match_folder(self, folder: str) -> tuple[int, int] | None:
+        """folder 為 _folder_of() 的結果。回傳 (比對到的最深一層, 樣式在清單中的位置)：
+        好幾個樣式都符合時取最深（最具體）的，一樣深取清單前面的；都不符合回傳 None。"""
+        best = None
+        for index, (pat, absolute) in enumerate(self.patterns):
+            if absolute:
+                end = len(pat) if folder.startswith(pat + "/") else -1
+            else:
+                i = folder.rfind(pat)
+                end = i + len(pat) if i >= 0 else -1
+            if end < 0:
+                continue
+            depth = folder.count("/", 0, end - 1) + 1      # 比對結尾落在第幾層資料夾
+            if best is None or depth > best[0]:
+                best = (depth, index)
+        return best
+
+    def contains(self, path) -> bool:
+        """檔案是否位於清單裡的資料夾。"""
+        return self.match_folder(_folder_of(path)) is not None
+
+
+def folder_scores(files: list[FileInfo], keep: FolderList, remove: FolderList) -> list[int]:
+    """每個檔案「該移除」的程度：在優先移除的資料夾為正、優先保留的為負、都不在為 0。
+
+    清單越前面的資料夾，分數的絕對值越大。同一個檔案兩邊都符合時，以比對到比較深（比較具體）
+    的那邊為準——「D:\\Models」優先保留、「_trash」優先移除，D:\\Models\\_trash 裡的檔案算優先
+    移除；一樣深時算優先保留。
+    """
+    scores = []
+    for fi in files:
+        folder = _folder_of(fi.path)
+        k, r = keep.match_folder(folder), remove.match_folder(folder)
+        if r is not None and (k is None or r[0] > k[0]):
+            scores.append(len(remove.patterns) - r[1])
+        elif k is not None:
+            scores.append(-(len(keep.patterns) - k[1]))
+        else:
+            scores.append(0)
+    return scores
+
+
+# ── 規則組合 ─────────────────────────────────────────────────────────────
+@dataclass
+class RuleSet:
+    """一組選取規則：操作模式、條件 id（依優先序）與智慧規則需要的設定。"""
+    mode: str = "keep"                                         # keep＝保留目標；delete＝刪除目標
+    conditions: list[str] = field(default_factory=list)
+    keep_dirs: list[str] = field(default_factory=list)         # 優先保留的資料夾（越前面越優先）
+    remove_dirs: list[str] = field(default_factory=list)       # 優先移除的資料夾（越前面越優先移除）
+
+    def build(self) -> list[Condition]:
+        """依優先序建立排序條件（不認得的 id 略過）。"""
+        return [condition(cid, self) for cid in self.conditions if cid in COND_BY_ID]
+
+
 # ── 套用條件 ─────────────────────────────────────────────────────────────
-def condition(cond_id: str) -> Condition:
-    """依 id 建立排序條件。"""
+def condition(cond_id: str, rules: RuleSet | None = None) -> Condition:
+    """依 id 建立排序條件；智慧規則需要的設定（資料夾清單等）從 rules 取。"""
     if cond_id == "copy_name":
         return Condition(cond_id, copy_scores, smart=True)
+    if cond_id == "folders":
+        rules = rules or RuleSet()
+        keep, remove = FolderList(rules.keep_dirs), FolderList(rules.remove_dirs)
+        return Condition(cond_id, lambda files: folder_scores(files, keep, remove), smart=True)
     _, _, key_fn, rev, _ = COND_BY_ID[cond_id]
     if key_fn is None:                          # 列表第一：維持群組內原本的順序
         return Condition(cond_id, lambda files: list(range(len(files))))

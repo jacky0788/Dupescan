@@ -478,3 +478,51 @@ def test_copy_name_rule_from_sidebar_and_context_menu(qapp, window, tree):
     quick_action(window, 0, "原始檔名").trigger()
     assert selected_names(g) == {"photo (1).png", "photo - 複製.png"}
     assert window.lbl_selected.text().startswith("已選 2")
+
+
+def test_folder_priority_from_sidebar_and_context_menu(qapp, window, tree):
+    data = blob(4 * KB, 22)
+    for n in ("main/m.bin", "main/_bak/m.bin", "_trash/m.bin"):
+        tree(n, data)
+    run_scan(qapp, window, tree.root)
+    g = window._all_groups[0]
+    panel = window._global_cond
+
+    assert not quick_action(window, 0, "資料夾優先序").isEnabled()     # 還沒設定資料夾
+    assert not panel._folders_box.isVisibleTo(panel)
+    panel._checkboxes["folders"].setChecked(True)
+    assert panel._folders_box.isVisibleTo(panel)                       # 勾選後才顯示設定欄位
+    panel.keep_dirs_edit.setText(str(tree.root / "main"))
+    panel.remove_dirs_edit.setText("_trash; _bak")
+    window._global_apply_conditions()
+    assert [fi.path for fi in g.files if not fi.selected] == [tree.root / "main" / "m.bin"]
+
+    window.tree.select_all(False)
+    quick_action(window, 0, "資料夾優先序").trigger()
+    assert [fi.path for fi in g.files if not fi.selected] == [tree.root / "main" / "m.bin"]
+
+    # 「套用側邊列的條件到此群組」：用側邊列的模式（刪除目標 → 只勾最該移除的那份）
+    window._set_global_mode("delete")
+    menu = window.tree._context_menu(window.tree.topLevelItem(0))
+    next(a for a in menu.actions() if "套用側邊列" in a.text()).trigger()
+    assert [fi.path for fi in g.files if fi.selected] == [tree.root / "_trash" / "m.bin"]
+
+
+def test_rule_settings_are_remembered(qapp, tmp_path):
+    from PyQt6.QtCore import QSettings
+    from src.ui.main_window import MainWindow
+    ini = str(tmp_path / "rules.ini")
+    first = MainWindow(QSettings(ini, QSettings.Format.IniFormat))
+    first._global_cond._checkboxes["copy_name"].setChecked(True)
+    first._global_cond._checkboxes["folders"].setChecked(True)
+    first._global_cond.keep_dirs_edit.setText("D:\\Models; 收藏")
+    first._global_cond.remove_dirs_edit.setText("_trash; 備份")
+    first.close()
+
+    second = MainWindow(QSettings(ini, QSettings.Format.IniFormat))
+    rules = second._current_rules()
+    assert rules.conditions == ["copy_name", "folders"]
+    assert rules.keep_dirs == ["D:\\Models", "收藏"]
+    assert rules.remove_dirs == ["_trash", "備份"]
+    assert second._global_cond._folders_box.isVisibleTo(second._global_cond)
+    second.close()

@@ -4,7 +4,10 @@ from pathlib import Path
 import pytest
 
 from src.models import DuplicateGroup, FileInfo
-from src.selection import apply_selection, condition, copy_info, copy_scores, rank_by_conditions
+from src.selection import (
+    FolderList, RuleSet, apply_selection, condition, copy_info, copy_scores, folder_scores,
+    rank_by_conditions, split_dirs,
+)
 
 
 def make_group():
@@ -150,3 +153,79 @@ def test_copy_name_direction_is_fixed_in_delete_mode():
     g = group_of("D:/dl/photo (1) (1).png", "D:/dl/photo (1).png", "D:/dl/photo.png")
     apply_selection(g, [condition("copy_name")], "delete")
     assert names_selected(g) == ["photo (1) (1).png"]
+
+
+# ── 資料夾優先序 ───────────────────────────────────────────────────────────
+def paths_selected(g):
+    return [fi.path.as_posix() for fi in g.files if fi.selected]
+
+
+def test_split_dirs():
+    assert split_dirs(' _trash ; "D:\\My Models" ;; Downloads ') == ["_trash", "D:\\My Models", "Downloads"]
+    assert split_dirs("  ") == []
+
+
+@pytest.mark.parametrize("pattern, path, hit", [
+    ("D:\\Models",       "D:/Models/a.bin",            True),
+    ("d:/models/",       "D:/Models/sub/a.bin",        True),    # 含子資料夾、不分大小寫
+    ("D:\\Models",       "D:/Models2/a.bin",           False),   # 不同資料夾
+    ("D:\\Models",       "E:/Models/a.bin",            False),
+    ("D:\\Models",       "D:/Models.bin",              False),   # 只比對資料夾
+    ("D:",               "D:/x/a.bin",                 True),
+    ("\\\\NAS\\share",   "//NAS/share/x/a.bin",        True),
+    ("_trash",           "G:/a/_trash/b/c.bin",        True),
+    ("_trash",           "G:/a/old_trash_2023/c.bin",  True),    # 名稱片段：含有就算
+    ("_trash",           "G:/a/_trash.bin",            False),   # 檔名不算
+    ("\\old\\",          "G:/old/a.bin",               True),    # 前後加分隔符號＝整個名稱相同
+    ("\\old\\",          "G:/older/a.bin",             False),
+    ("models\\blobs",    "H:/Ollama/models/blobs/x",   True),
+    ("下載",             "D:/我的下載/a.png",          True),
+    ("\\",               "D:/a/b.png",                 False),   # 只有分隔符號的樣式略過
+])
+def test_folder_list_matching(pattern, path, hit):
+    assert FolderList([pattern]).contains(Path(path)) is hit
+
+
+def test_folder_scores_follow_list_order_and_deepest_match():
+    keep = FolderList(["D:\\Models", "收藏"])
+    remove = FolderList(["_trash", "Downloads"])
+    g = group_of("D:/Models/a.bin", "E:/收藏/a.bin", "F:/other/a.bin",
+                 "G:/Downloads/a.bin", "H:/_trash/a.bin", "D:/Models/_trash/a.bin")
+    # 越前面分數絕對值越大；D:\Models\_trash 兩邊都符合 → 比較深的 _trash 為準
+    assert folder_scores(g.files, keep, remove) == [-2, -1, 0, 1, 2, 2]
+    # 一樣深時算優先保留
+    assert folder_scores(group_of("D:/models/a.bin").files,
+                         FolderList(["models"]), FolderList(["mod"])) == [-1]
+
+
+def test_folder_priority_keep_and_delete_mode():
+    rules = RuleSet(conditions=["folders"], keep_dirs=["D:\\SD\\models"], remove_dirs=["_trash", "_bak"])
+    g = group_of("D:/SD/models/_bak/m.safetensors", "D:/SD/models/m.safetensors",
+                 "G:/_trash/m.safetensors")
+    assert apply_selection(g, rules.build(), "keep") == "folders"
+    assert paths_selected(g) == ["D:/SD/models/_bak/m.safetensors", "G:/_trash/m.safetensors"]
+    # 刪除模式：只勾最該移除的（_trash 排在 _bak 前面）
+    apply_selection(g, rules.build(), "delete")
+    assert paths_selected(g) == ["G:/_trash/m.safetensors"]
+
+
+def test_folder_priority_without_folders_is_a_tie():
+    g = group_of("D:/a/x.bin", "D:/b/x.bin")
+    assert apply_selection(g, [condition("folders")], "keep") is None
+    assert paths_selected(g) == ["D:/b/x.bin"]
+
+
+def test_smart_rules_stack_in_priority_order():
+    g = group_of("D:/Pictures/photo (1).png", "G:/Downloads/photo.png")
+    rules = RuleSet(keep_dirs=["D:\\Pictures"], remove_dirs=["Downloads"])
+    rules.conditions = ["copy_name", "folders"]          # 先看檔名
+    apply_selection(g, rules.build(), "keep")
+    assert paths_selected(g) == ["D:/Pictures/photo (1).png"]
+    rules.conditions = ["folders", "copy_name"]          # 先看資料夾
+    apply_selection(g, rules.build(), "keep")
+    assert paths_selected(g) == ["G:/Downloads/photo.png"]
+
+
+def test_rule_set_build_skips_unknown_ids():
+    rules = RuleSet(conditions=["copy_name", "no_such_rule", "sh_path"])
+    assert [c.id for c in rules.build()] == ["copy_name", "sh_path"]
