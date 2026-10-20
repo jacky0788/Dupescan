@@ -1181,7 +1181,8 @@ class MainWindow(QMainWindow):
             f"掃描統計 — 比對 {stats.files_seen:,} 個檔案、候選 {stats.candidates:,} 個；"
             f"略過：無法讀取 {stats.unreadable:,}、連結／junction {stats.skipped_links:,}、"
             f"隱藏／系統 {stats.skipped_hidden:,}、雲端佔位檔 {stats.skipped_cloud:,}、"
-            f"排除資料夾 {stats.skipped_excluded:,}；合併硬連結 {stats.same_file_merged:,}")
+            f"排除資料夾 {stats.skipped_excluded:,}、正在寫入 {stats.skipped_changing:,}；"
+            f"合併硬連結 {stats.same_file_merged:,}")
         for line in stats.unreadable_samples:
             logger.info(f"  無法讀取: {line}")
 
