@@ -41,6 +41,7 @@ from .theme import (
     BG, PANEL, SURFACE, SURFACE_HI, BORDER, BORDER_HI, TEXT, SUBTEXT, FAINT,
     ACCENT, ACCENT_HI, GREEN, DANGER, DANGER_HI, ORANGE, STYLE,
 )
+from ..hash_cache import HashCache
 from ..scanner import Scanner, ScanStats, STEP_NAMES, TOTAL_STEPS, _format_eta
 from ..models import DuplicateGroup, FileInfo
 from ..logger import logger
@@ -85,7 +86,7 @@ class ScanWorker(QObject):
     detected  = pyqtSignal(int, str)
     ended     = pyqtSignal()
 
-    def __init__(self, scan_id: int, roots: list[str], min_size: int):
+    def __init__(self, scan_id: int, roots: list[str], min_size: int, use_cache: bool = True):
         super().__init__()
         self.scan_id = scan_id
         self._roots  = roots
@@ -93,6 +94,7 @@ class ScanWorker(QObject):
         self._scanner = Scanner(
             roots=roots,
             min_size=min_size,
+            cache=HashCache() if use_cache else None,
             on_progress=lambda m, c, t, s, ts, eta: self.progress.emit(scan_id, m, c, t, s, ts, eta),
             on_done=lambda g, st: self.finished.emit(scan_id, g, st),
             on_error=lambda e: self.error.emit(scan_id, e),
@@ -1147,6 +1149,8 @@ class MainWindow(QMainWindow):
         self._all_groups = groups
         self._log_scan_stats(stats)
         skipped = f"（略過 {stats.unreadable:,} 個無法讀取的項目）" if stats.unreadable else ""
+        if stats.cache_hits_full:
+            skipped += f"（{stats.cache_hits_full:,} 個檔案沿用上次的比對結果）"
 
         if not groups:
             logger.info("掃描完成 — 未發現重複檔案")
@@ -1182,7 +1186,8 @@ class MainWindow(QMainWindow):
             f"略過：無法讀取 {stats.unreadable:,}、連結／junction {stats.skipped_links:,}、"
             f"隱藏／系統 {stats.skipped_hidden:,}、雲端佔位檔 {stats.skipped_cloud:,}、"
             f"排除資料夾 {stats.skipped_excluded:,}、正在寫入 {stats.skipped_changing:,}；"
-            f"合併硬連結 {stats.same_file_merged:,}")
+            f"合併硬連結 {stats.same_file_merged:,}；快取沿用：前段 {stats.cache_hits_partial:,}、"
+            f"完整 {stats.cache_hits_full:,}")
         for line in stats.unreadable_samples:
             logger.info(f"  無法讀取: {line}")
 

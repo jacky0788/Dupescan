@@ -32,8 +32,10 @@ except ImportError:
     # 未安裝 xxhash 時退回 hashlib.blake2b（Python 內建，較慢但不需額外安裝）
     _FAST_HASH = False
 
+from .hash_cache import HashCache
 from .models import DuplicateGroup, FileInfo
 
+HASH_ALGO     = "xxh64" if _FAST_HASH else "blake2b"   # 寫進快取，換演算法時舊紀錄自動作廢
 PARTIAL_READ  = 4096    # Pass 2 每個檔案讀取的前綴長度（bytes）
 CHUNK_SIZE    = 131072  # Pass 3 每次 read() 的 chunk 大小（128 KB，減少系統呼叫次數）
 EMIT_INTERVAL = 0.15    # 進度 signal 最小發送間隔（秒），避免 Qt 事件佇列積壓
@@ -79,6 +81,8 @@ class ScanStats:
     skipped_cloud:    int = 0   # 略過的雲端佔位檔
     skipped_excluded: int = 0   # 略過的排除資料夾（資源回收筒等）
     skipped_changing: int = 0   # 掃描過程中大小改變（正在寫入）的檔案
+    cache_hits_partial: int = 0  # 前段 hash 直接沿用快取的檔案數
+    cache_hits_full:    int = 0  # 完整 hash 直接沿用快取的檔案數（省下整檔讀取）
     unreadable:       int = 0   # 無法讀取的檔案與資料夾
     unreadable_samples: list[str] = field(default_factory=list)
 
@@ -209,6 +213,7 @@ class Scanner:
         on_done: Callable[[list[DuplicateGroup], ScanStats], None] | None = None,
         on_error: Callable[[str], None] | None = None,
         on_cancel: Callable[[], None] | None = None,
+        cache: HashCache | None = None,   # 雜湊快取；None 表示每次都重新讀檔
     ):
         self.roots          = normalize_roots(roots)
         self.min_size       = min_size
@@ -219,6 +224,7 @@ class Scanner:
         self.on_done        = on_done
         self.on_error       = on_error
         self.on_cancel      = on_cancel
+        self.cache          = cache
         self.stats          = ScanStats()
 
         self._stop_event  = threading.Event()
@@ -502,12 +508,16 @@ class Scanner:
     # ── 3-Pass 主流程 ──────────────────────────────────────────────────
     def _run(self) -> list[DuplicateGroup] | None:
         """執行 3-pass 演算法；使用者停止時回傳 None。"""
+        if self.cache is not None:
+            self.cache.open()
         try:
             return self._run_passes()
         except _Stopped:
             return None
         finally:
             self._stage = None
+            if self.cache is not None:
+                self.cache.close()          # 取消時也會把已算好的 hash 存起來，下次接著用
 
     def _run_passes(self) -> list[DuplicateGroup]:
         # ── Pass 1：遍歷目錄，依檔案大小分組 ──────────────────────────
@@ -525,24 +535,46 @@ class Scanner:
             f"大小分組完成 — 共掃描 {scanned:,} 個檔案，{len(flat):,} 個候選",
             scanned, scanned, 1, 0,
         )
+        cached = self.cache.lookup(flat, HASH_ALGO, PARTIAL_READ) if self.cache else {}
 
         # ── Pass 2：前 4 KB 快速 Hash ────────────────────────────────
         # 以「大小＋前段 hash」分組：大小相同但前 4 KB 不同的一定不是重複，
         # 大小不同但開頭相同的檔案也不會被送去完整比對
         by_partial: dict[tuple[int, str], list[FileInfo]] = defaultdict(list)
-        for fi, digest in self._hash_stage(flat, _partial_hash, self.pass2_workers,
+        todo = []
+        for fi in flat:
+            hit = cached.get(id(fi), (None, None))[0]
+            if hit:
+                by_partial[(fi.size, hit)].append(fi)
+                self.stats.cache_hits_partial += 1
+            else:
+                todo.append(fi)
+        for fi, digest in self._hash_stage(todo, _partial_hash, self.pass2_workers,
                                            2, "快速比對中"):
             by_partial[(fi.size, digest)].append(fi)
+            if self.cache:
+                self.cache.store(fi, HASH_ALGO, partial=digest, partial_len=PARTIAL_READ)
         flat2 = [fi for files in by_partial.values() if len(files) > 1 for fi in files]
         self._emit(f"快速比對完成 — {len(flat2):,} 個檔案需完整比對",
                    len(flat), len(flat), 2, 0)
 
         # ── Pass 3：完整 Hash ────────────────────────────────────────
         by_full: dict[tuple[int, str], list[FileInfo]] = defaultdict(list)
-        for fi, digest in self._hash_stage(flat2, _full_hash, self.pass3_workers,
+        todo = []
+        for fi in flat2:
+            hit = cached.get(id(fi), (None, None))[1]
+            if hit:
+                fi.hash_full = hit
+                by_full[(fi.size, hit)].append(fi)
+                self.stats.cache_hits_full += 1
+            else:
+                todo.append(fi)
+        for fi, digest in self._hash_stage(todo, _full_hash, self.pass3_workers,
                                            3, "完整比對中"):
             fi.hash_full = digest
             by_full[(fi.size, digest)].append(fi)
+            if self.cache:
+                self.cache.store(fi, HASH_ALGO, full=digest)
 
         # 建立結果群組：群組內依路徑排序（平手規則的結果才會固定），
         # 群組依可釋放空間由大到小排序（最值得刪除的排最前面）
