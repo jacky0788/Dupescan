@@ -91,8 +91,8 @@ def test_protected_folders(tree):
 
 def test_is_protected_patterns():
     assert is_protected(Path("C:/Windows/System32/a.dll"))
-    assert is_protected(Path("H:/Ollama/models/blobs/sha256-abc"))
+    assert is_protected(Path("D:/Ollama/models/blobs/sha256-abc"))
     assert is_protected(Path("C:/Users/me/.ollama/models/blobs/sha256-abc"))
     assert is_protected(Path("D:/Games/SteamLibrary/steamapps/common/x.pak"))
     assert not is_protected(Path("D:/Photos/windows/a.jpg"))     # 不是磁碟根目錄的 Windows
-    assert not is_protected(Path("G:/Downloads/model.safetensors"))
+    assert not is_protected(Path("E:/Downloads/model.safetensors"))
