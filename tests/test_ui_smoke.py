@@ -181,3 +181,54 @@ def test_reset_and_close_during_long_hash_do_not_crash(tree, tmp_path):
     assert "FATAL" not in proc.stdout, proc.stdout + proc.stderr
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "OK" in proc.stdout
+
+
+# ── 移除前預覽視窗與背景移除 ──────────────────────────────────────────────
+def scan_and_select(qapp, window, tree, names_to_select, extra=()):
+    data = blob(4 * KB, 9)
+    for n in ["a/keep.bin", "b/dup1.bin", "c/dup2.bin", *extra]:
+        tree(n, data)
+    run_scan(qapp, window, tree.root)
+    for fi in window._all_groups[0].files:
+        fi.selected = fi.path.name in names_to_select
+    window.tree.refresh_checks()
+
+
+def test_dialog_blocks_whole_group_until_confirmed(qapp, window, tree):
+    from src.delete_plan import build_plan
+    from src.ui.delete_dialog import DeletePlanDialog
+    scan_and_select(qapp, window, tree, {"keep.bin", "dup1.bin", "dup2.bin"})
+    dlg = DeletePlanDialog(build_plan([(1, window._all_groups[0])]), window)
+    assert dlg.selected() == []
+    assert not dlg.btn_ok.isEnabled()
+    dlg.cb_whole.setChecked(True)
+    assert len(dlg.selected()) == 3
+    assert dlg.btn_ok.isEnabled() and "3" in dlg.btn_ok.text()
+    dlg.close()
+
+
+def test_remove_flow_moves_files_and_reports(qapp, window, tree, tmp_path, monkeypatch):
+    from PyQt6.QtWidgets import QDialog
+    from src import file_ops
+    from src.ui import delete_dialog, main_window
+
+    qroot = tmp_path / "Q"
+    monkeypatch.setattr(file_ops, "quarantine_root_for", lambda p: qroot)
+
+    def accept_with_quarantine(dlg):
+        dlg.set_method("quarantine")
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(delete_dialog.DeletePlanDialog, "exec", accept_with_quarantine)
+    reports = []
+    monkeypatch.setattr(main_window.QMessageBox, "information",
+                        lambda *a, **k: reports.append(a[2]))
+
+    scan_and_select(qapp, window, tree, {"dup1.bin", "dup2.bin"})
+    window._delete_selected()
+    assert wait_until(qapp, lambda: reports and window._removal is None and not window._scanning,
+                      timeout=20)
+    assert "隔離資料夾：2 個" in reports[0]
+    assert not (tree.root / "b/dup1.bin").exists() and not (tree.root / "c/dup2.bin").exists()
+    assert (tree.root / "a/keep.bin").exists()
+    assert len(list(qroot.rglob("*.bin"))) == 2

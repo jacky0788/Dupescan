@@ -27,7 +27,7 @@ except ImportError:
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QObject, QEvent, QPoint
 from PyQt6.QtGui import QColor, QFont, QPixmap, QAction
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFileDialog, QFrame,
+    QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QProgressDialog,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QPushButton, QProgressBar, QScrollArea,
     QSizePolicy, QSpinBox, QStatusBar, QVBoxLayout, QWidget,
@@ -35,6 +35,12 @@ from PyQt6.QtWidgets import (
 )
 
 from .. import file_ops
+from ..delete_plan import SKIP, build_plan
+from . import delete_dialog
+from .theme import (
+    BG, PANEL, SURFACE, SURFACE_HI, BORDER, BORDER_HI, TEXT, SUBTEXT, FAINT,
+    ACCENT, ACCENT_HI, GREEN, DANGER, DANGER_HI, ORANGE, STYLE,
+)
 from ..scanner import Scanner, ScanStats, STEP_NAMES, TOTAL_STEPS, _format_eta
 from ..models import DuplicateGroup, FileInfo
 from ..logger import logger
@@ -118,182 +124,6 @@ class ScanWorker(QObject):
 # 關閉視窗時仍未結束的掃描執行緒：保留參照到程式結束，避免 QThread 在執行中被回收而閃退
 _UNFINISHED_THREADS: list = []
 
-
-# ── 現代化深色主題配色 ────────────────────────────────────────────────────────
-BG        = "#0f1117"   # 視窗最底層背景
-PANEL     = "#161922"   # 面板 / 輸入框背景
-SURFACE   = "#1e222e"   # 卡片表面、按鈕一般狀態
-SURFACE_HI= "#272c3a"   # 表面 hover / 次要強調
-BORDER    = "#2a2f3c"   # 邊框
-BORDER_HI = "#3a4150"   # 強調邊框
-TEXT      = "#e4e7ee"   # 主文字
-SUBTEXT   = "#9aa3b2"   # 次要文字
-FAINT     = "#6b7280"   # 更淡的提示文字
-ACCENT    = "#6c8cff"   # 主強調（靛藍）
-ACCENT_HI = "#88a2ff"   # 主強調 hover
-GREEN     = "#4ade80"   # 成功 / SSD
-DANGER    = "#f87171"   # 危險 / 刪除
-DANGER_HI = "#fb8a8a"
-ORANGE    = "#fbbf24"   # 路徑 / 警示
-
-# 全域 Qt StyleSheet
-STYLE = f"""
-QMainWindow, QWidget {{
-    background-color: {BG};
-    color: {TEXT};
-    font-family: "Segoe UI Variable", "Segoe UI", "Inter", sans-serif;
-    font-size: 13px;
-}}
-QToolTip {{
-    background-color: {SURFACE_HI};
-    color: {TEXT};
-    border: 1px solid {BORDER_HI};
-    border-radius: 6px;
-    padding: 4px 8px;
-}}
-QLabel {{ background: transparent; }}
-
-QPushButton {{
-    background-color: {SURFACE};
-    color: {TEXT};
-    border: 1px solid {BORDER};
-    border-radius: 8px;
-    padding: 6px 14px;
-    min-height: 18px;
-}}
-QPushButton:hover {{ background-color: {SURFACE_HI}; border-color: {BORDER_HI}; }}
-QPushButton:pressed {{ background-color: {ACCENT}; color: {BG}; border-color: {ACCENT}; }}
-QPushButton:disabled {{ color: {FAINT}; background-color: {PANEL}; }}
-
-QPushButton#primary {{
-    background-color: {ACCENT};
-    color: #0b0d14;
-    font-weight: 600;
-    border: none;
-}}
-QPushButton#primary:hover {{ background-color: {ACCENT_HI}; }}
-QPushButton#primary:pressed {{ background-color: #5a78e0; }}
-
-QPushButton#danger {{
-    background-color: {DANGER};
-    color: #1a0d0d;
-    font-weight: 600;
-    border: none;
-}}
-QPushButton#danger:hover {{ background-color: {DANGER_HI}; }}
-QPushButton#danger:disabled {{ background-color: {PANEL}; color: {FAINT}; }}
-
-QLineEdit, QSpinBox, QComboBox {{
-    background-color: {PANEL};
-    border: 1px solid {BORDER};
-    border-radius: 8px;
-    padding: 6px 10px;
-    color: {TEXT};
-    selection-background-color: {ACCENT};
-    selection-color: #0b0d14;
-}}
-QLineEdit:focus, QSpinBox:focus, QComboBox:focus {{ border-color: {ACCENT}; }}
-QLineEdit:hover, QSpinBox:hover, QComboBox:hover {{ border-color: {BORDER_HI}; }}
-QComboBox::drop-down {{ border: none; width: 22px; }}
-QComboBox::down-arrow {{ image: none; border-left: 4px solid transparent;
-    border-right: 4px solid transparent; border-top: 5px solid {SUBTEXT}; margin-right: 8px; }}
-QComboBox QAbstractItemView {{
-    background-color: {PANEL};
-    border: 1px solid {BORDER_HI};
-    border-radius: 8px;
-    color: {TEXT};
-    padding: 4px;
-    selection-background-color: {SURFACE_HI};
-    outline: none;
-}}
-QSpinBox::up-button, QSpinBox::down-button {{ width: 16px; border: none;
-    background: {SURFACE}; }}
-QSpinBox::up-button {{ border-top-right-radius: 7px; }}
-QSpinBox::down-button {{ border-bottom-right-radius: 7px; }}
-QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background: {SURFACE_HI}; }}
-
-QProgressBar {{
-    background-color: {PANEL};
-    border: none;
-    border-radius: 6px;
-    text-align: center;
-    color: {TEXT};
-    height: 10px;
-    font-size: 11px;
-}}
-QProgressBar::chunk {{
-    background-color: {ACCENT};
-    border-radius: 6px;
-}}
-
-QTreeWidget {{
-    background-color: {PANEL};
-    alternate-background-color: #13161e;
-    border: 1px solid {BORDER};
-    border-radius: 12px;
-    outline: none;
-    padding: 4px;
-}}
-QTreeWidget::item {{
-    padding: 5px 4px;
-    border-radius: 6px;
-    color: {TEXT};
-}}
-QTreeWidget::item:hover {{ background-color: {SURFACE}; }}
-QTreeWidget::item:selected {{ background-color: {SURFACE_HI}; color: {TEXT}; }}
-QHeaderView::section {{
-    background-color: {PANEL};
-    color: {SUBTEXT};
-    border: none;
-    border-bottom: 1px solid {BORDER};
-    padding: 8px 10px;
-    font-weight: 600;
-    font-size: 12px;
-}}
-QTreeWidget::indicator, QCheckBox::indicator {{
-    width: 16px; height: 16px;
-    border: 1.5px solid {BORDER_HI};
-    border-radius: 5px;
-    background: {PANEL};
-}}
-QTreeWidget::indicator:checked, QCheckBox::indicator:checked {{
-    background: {ACCENT}; border-color: {ACCENT};
-    image: url(none);
-}}
-QTreeWidget::indicator:indeterminate {{ background: {SURFACE_HI}; border-color: {ACCENT}; }}
-QTreeWidget::branch {{ background: transparent; }}
-
-QScrollBar:vertical {{ background: transparent; width: 12px; margin: 2px; }}
-QScrollBar::handle:vertical {{ background: {BORDER_HI}; border-radius: 5px; min-height: 28px; }}
-QScrollBar::handle:vertical:hover {{ background: {ACCENT}; }}
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; }}
-QScrollBar:horizontal {{ background: transparent; height: 12px; margin: 2px; }}
-QScrollBar::handle:horizontal {{ background: {BORDER_HI}; border-radius: 5px; min-width: 28px; }}
-QScrollBar::handle:horizontal:hover {{ background: {ACCENT}; }}
-QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0px; }}
-
-QStatusBar {{
-    background-color: {PANEL};
-    border-top: 1px solid {BORDER};
-    color: {SUBTEXT};
-}}
-QStatusBar::item {{ border: none; }}
-
-QCheckBox {{ spacing: 6px; color: {TEXT}; }}
-QCheckBox:disabled {{ color: {FAINT}; }}
-QCheckBox::indicator:disabled {{ background: {SURFACE}; border-color: {BORDER}; }}
-
-QMenu {{
-    background-color: {PANEL};
-    border: 1px solid {BORDER_HI};
-    border-radius: 10px;
-    padding: 6px;
-}}
-QMenu::item {{ padding: 6px 24px 6px 14px; border-radius: 6px; color: {TEXT}; }}
-QMenu::item:selected {{ background-color: {ACCENT}; color: #0b0d14; }}
-QMenu::separator {{ height: 1px; background: {BORDER}; margin: 5px 8px; }}
-QMenu::item:disabled {{ color: {FAINT}; }}
-"""
 
 # 區段標題（側邊列可收折區段）共用樣式
 _SECTION_HDR = (
@@ -401,6 +231,7 @@ class DuplicateTree(QTreeWidget):
         self.setAnimated(False)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setSelectionMode(QTreeWidget.SelectionMode.NoSelection)
+        self.setTextElideMode(Qt.TextElideMode.ElideMiddle)   # 長路徑從中間省略，保留結尾的資料夾名稱
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
         hdr = self.header()
@@ -488,14 +319,10 @@ class DuplicateTree(QTreeWidget):
             Qt.CheckState.Checked if fi.selected else Qt.CheckState.Unchecked)
 
         item.setText(_COL_NAME, fi.name)
-        item.setForeground(_COL_NAME, QColor(ACCENT))
         item.setText(_COL_PATH, fi.folder)
-        item.setForeground(_COL_PATH, QColor(ORANGE))
         item.setText(_COL_SIZE, human_size(fi.size))
-        item.setForeground(_COL_SIZE, QColor(SUBTEXT))
         mt = datetime.datetime.fromtimestamp(fi.mtime).strftime("%Y-%m-%d %H:%M")
         item.setText(_COL_TIME, mt)
-        item.setForeground(_COL_TIME, QColor(SUBTEXT))
 
         nf = QFont(); nf.setPixelSize(self._font_size)
         item.setFont(_COL_NAME, nf)
@@ -742,6 +569,7 @@ class MainWindow(QMainWindow):
         # 每次掃描的 (thread, worker)，以 scan_id 為鍵；一律等 finished 訊號送達才釋放：
         # 執行中的 QThread 被回收，或 finished 送達前就刪掉它，Qt 都會直接終止程式
         self._threads: dict[int, tuple[QThread, ScanWorker]] = {}
+        self._removal: tuple | None = None   # 背景移除中的 (thread, worker, 進度視窗)
 
         self._global_qs_mode: str  = "keep"
         self._sidebar_open:   bool = True
@@ -1221,6 +1049,8 @@ class MainWindow(QMainWindow):
         for thread, worker in list(self._threads.values()):
             worker.stop()
             thread.wait(3000)
+        if self._removal:
+            self._removal[0].wait(10000)
         _UNFINISHED_THREADS.extend(p for p in self._threads.values() if p[0].isRunning())
         self._preview_popup.close()
         super().closeEvent(event)
@@ -1373,37 +1203,85 @@ class MainWindow(QMainWindow):
         self.btn_delete.setEnabled(n > 0)
 
     def _delete_selected(self):
-        """把勾選的檔案移到資源回收筒（放不進去的改移到隔離資料夾），不會永久刪除。"""
-        targets: list[FileInfo] = [
-            fi for g in self.tree._groups for fi in g.files if fi.selected]
-
-        if not targets:
+        """先建立移除計畫並顯示預覽，確認後在背景移到資源回收筒或隔離資料夾（不會永久刪除）。"""
+        groups = [(i + 1, g) for i, g in enumerate(self.tree._groups)
+                  if any(fi.selected for fi in g.files)]
+        if not groups:
             QMessageBox.information(self, "提示", "請先勾選要移除的檔案。"); return
 
-        msg = (f"確定要把以下 {len(targets)} 個檔案移到資源回收筒？\n"
-               f"（可從資源回收筒還原；放不進回收筒的檔案會改移到隔離資料夾）\n\n")
-        msg += "\n".join(str(fi.path) for fi in targets[:20])
-        if len(targets) > 20:
-            msg += f"\n… 另外 {len(targets) - 20} 個檔案"
-
-        reply = QMessageBox.question(
-            self, "確認移除", msg,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply != QMessageBox.StandardButton.Yes: return
-
-        logger.info(f"開始移除 {len(targets)} 個檔案（資源回收筒）")
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            results = file_ops.remove_files(
-                [(fi.path, fi.size) for fi in targets], "recycle", hwnd=int(self.winId()))
+            plan = build_plan(groups)       # 會重新檢查每個檔案是否在掃描後變動
         finally:
             QApplication.restoreOverrideCursor()
+
+        dlg = delete_dialog.DeletePlanDialog(plan, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        for e in plan.entries_with(SKIP):
+            logger.info(f"  略過: {e.file.path}（{e.note}）")
+        self._run_removal(dlg.selected(), dlg.method(), dlg.full_verify())
+
+    def _run_removal(self, items: list, method: str, full_verify: bool):
+        if not items:
+            return
+        where = "資源回收筒" if method == "recycle" else "隔離資料夾"
+        logger.info(f"開始移除 {len(items)} 個檔案（{where}"
+                    + ("，先完整比對內容）" if full_verify else "）"))
+        progress = QProgressDialog(f"正在移到{where}…", None, 0, len(items), self)
+        progress.setWindowTitle("移除中")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+
+        worker = delete_dialog.RemovalWorker(items, method, int(self.winId()), full_verify)
+        thread = QThread()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.ended.connect(thread.quit)
+        worker.progress.connect(self._on_removal_progress)
+        worker.finished.connect(self._on_removal_done)
+        worker.error.connect(self._on_removal_error)
+        thread.finished.connect(self._on_removal_thread_finished)
+        self._removal = (thread, worker, progress)
+        self.btn_delete.setEnabled(False)
+        self.btn_scan.setEnabled(False)
+        thread.start()
+        progress.show()
+
+    def _on_removal_progress(self, phase: str, done: int, total: int):
+        if self._removal:
+            progress = self._removal[2]
+            progress.setMaximum(max(total, 1))
+            progress.setValue(done)
+            progress.setLabelText(f"{phase}… {done:,} / {total:,}")
+
+    def _finish_removal_ui(self):
+        if self._removal:
+            self._removal[2].close()
+        self.btn_scan.setEnabled(True)
+        self._update_selection_ui()
+
+    def _on_removal_done(self, results: list):
+        self._finish_removal_ui()
         self._report_removal(results)
         if not self._scanning:
             self._start_scan()
 
+    def _on_removal_error(self, msg: str):
+        self._finish_removal_ui()
+        logger.error(f"移除時發生錯誤: {msg}")
+        QMessageBox.critical(self, "移除時發生錯誤",
+                             f"{msg}\n\n已處理的檔案請到「操作紀錄」或 log 查看。")
+
+    def _on_removal_thread_finished(self):
+        if self._removal:
+            self._removal[0].wait()
+            self._removal = None
+
     def _report_removal(self, results: list):
-        """記錄並顯示移除結果：回收筒／隔離區／失敗各幾個，以及改走隔離區與失敗的原因。"""
+        """記錄並顯示移除結果：回收筒／隔離區／未移除各幾個，以及原因。"""
         recycled = [r for r in results if r.ok and r.method == "recycle"]
         moved    = [r for r in results if r.ok and r.method == "quarantine"]
         failed   = [r for r in results if not r.ok]
@@ -1412,9 +1290,9 @@ class MainWindow(QMainWindow):
         for r in moved:
             logger.info(f"  移到隔離資料夾: {r.path} → {r.dest}" + (f"（{r.note}）" if r.note else ""))
         for r in failed:
-            logger.warning(f"  移除失敗: {r.path}  原因: {r.note}")
+            logger.warning(f"  沒有移除: {r.path}  原因: {r.note}")
         logger.info(f"移除完成 — 資源回收筒 {len(recycled)} 個、隔離資料夾 {len(moved)} 個、"
-                    f"失敗 {len(failed)} 個")
+                    f"沒有移除 {len(failed)} 個")
 
         lines = [f"已移到資源回收筒：{len(recycled)} 個"]
         if moved:
@@ -1429,7 +1307,7 @@ class MainWindow(QMainWindow):
                 lines.append(f"  … 另外 {len(failed) - 10} 個（完整清單見 log）")
         QMessageBox.information(self, "移除完成", "\n".join(lines))
         self.status_bar.showMessage(
-            f"已移除 {len(recycled) + len(moved)} 個檔案" + (f"，{len(failed)} 個失敗" if failed else ""))
+            f"已移除 {len(recycled) + len(moved)} 個檔案" + (f"，{len(failed)} 個沒有移除" if failed else ""))
 
     def _show_history(self):
         from .history_dialog import HistoryDialog

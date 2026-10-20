@@ -18,6 +18,14 @@ def isolated_data_dir(tmp_path_factory):
     return path
 
 
+@pytest.fixture(autouse=True)
+def no_appdata_protection(monkeypatch):
+    """pytest 的暫存資料夾在 AppData/Local/Temp 底下，測試期間不套用「AppData 受保護」規則。"""
+    from src import delete_plan
+    monkeypatch.setattr(delete_plan, "DEFAULT_PROTECTED",
+                        [p for p in delete_plan.DEFAULT_PROTECTED if p != "*/appdata/*"])
+
+
 @pytest.fixture
 def tree(tmp_path):
     """建檔小幫手：tree("a/b.bin", data, mtime=...) 在 tmp_path 底下建立檔案並回傳路徑。"""
