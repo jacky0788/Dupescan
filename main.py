@@ -2,10 +2,12 @@
 import sys
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QIcon
+from src.logger import setup_logging
 from src.ui.main_window import MainWindow
 
 
 def main():
+    setup_logging()
     app = QApplication(sys.argv)
     app.setApplicationName("DupeScan")
     app.setOrganizationName("DupeScan")
