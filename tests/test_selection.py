@@ -173,12 +173,12 @@ def test_split_dirs():
     ("D:\\Models",       "D:/Models.bin",              False),   # 只比對資料夾
     ("D:",               "D:/x/a.bin",                 True),
     ("\\\\NAS\\share",   "//NAS/share/x/a.bin",        True),
-    ("_trash",           "G:/a/_trash/b/c.bin",        True),
-    ("_trash",           "G:/a/old_trash_2023/c.bin",  True),    # 名稱片段：含有就算
-    ("_trash",           "G:/a/_trash.bin",            False),   # 檔名不算
-    ("\\old\\",          "G:/old/a.bin",               True),    # 前後加分隔符號＝整個名稱相同
-    ("\\old\\",          "G:/older/a.bin",             False),
-    ("models\\blobs",    "H:/Ollama/models/blobs/x",   True),
+    ("_trash",           "E:/a/_trash/b/c.bin",        True),
+    ("_trash",           "E:/a/old_trash_2023/c.bin",  True),    # 名稱片段：含有就算
+    ("_trash",           "E:/a/_trash.bin",            False),   # 檔名不算
+    ("\\old\\",          "E:/old/a.bin",               True),    # 前後加分隔符號＝整個名稱相同
+    ("\\old\\",          "E:/older/a.bin",             False),
+    ("models\\blobs",    "D:/Ollama/models/blobs/x",   True),
     ("下載",             "D:/我的下載/a.png",          True),
     ("\\",               "D:/a/b.png",                 False),   # 只有分隔符號的樣式略過
 ])
@@ -190,7 +190,7 @@ def test_folder_scores_follow_list_order_and_deepest_match():
     keep = FolderList(["D:\\Models", "收藏"])
     remove = FolderList(["_trash", "Downloads"])
     g = group_of("D:/Models/a.bin", "E:/收藏/a.bin", "F:/other/a.bin",
-                 "G:/Downloads/a.bin", "H:/_trash/a.bin", "D:/Models/_trash/a.bin")
+                 "E:/Downloads/a.bin", "F:/_trash/a.bin", "D:/Models/_trash/a.bin")
     # 越前面分數絕對值越大；D:\Models\_trash 兩邊都符合 → 比較深的 _trash 為準
     assert folder_scores(g.files, keep, remove) == [-2, -1, 0, 1, 2, 2]
     # 一樣深時算優先保留
@@ -201,12 +201,12 @@ def test_folder_scores_follow_list_order_and_deepest_match():
 def test_folder_priority_keep_and_delete_mode():
     rules = RuleSet(conditions=["folders"], keep_dirs=["D:\\SD\\models"], remove_dirs=["_trash", "_bak"])
     g = group_of("D:/SD/models/_bak/m.safetensors", "D:/SD/models/m.safetensors",
-                 "G:/_trash/m.safetensors")
+                 "E:/_trash/m.safetensors")
     assert apply_selection(g, rules.build(), "keep") == "folders"
-    assert paths_selected(g) == ["D:/SD/models/_bak/m.safetensors", "G:/_trash/m.safetensors"]
+    assert paths_selected(g) == ["D:/SD/models/_bak/m.safetensors", "E:/_trash/m.safetensors"]
     # 刪除模式：只勾最該移除的（_trash 排在 _bak 前面）
     apply_selection(g, rules.build(), "delete")
-    assert paths_selected(g) == ["G:/_trash/m.safetensors"]
+    assert paths_selected(g) == ["E:/_trash/m.safetensors"]
 
 
 def test_folder_priority_without_folders_is_a_tie():
@@ -216,14 +216,14 @@ def test_folder_priority_without_folders_is_a_tie():
 
 
 def test_smart_rules_stack_in_priority_order():
-    g = group_of("D:/Pictures/photo (1).png", "G:/Downloads/photo.png")
+    g = group_of("D:/Pictures/photo (1).png", "E:/Downloads/photo.png")
     rules = RuleSet(keep_dirs=["D:\\Pictures"], remove_dirs=["Downloads"])
     rules.conditions = ["copy_name", "folders"]          # 先看檔名
     apply_selection(g, rules.build(), "keep")
     assert paths_selected(g) == ["D:/Pictures/photo (1).png"]
     rules.conditions = ["folders", "copy_name"]          # 先看資料夾
     apply_selection(g, rules.build(), "keep")
-    assert paths_selected(g) == ["G:/Downloads/photo.png"]
+    assert paths_selected(g) == ["E:/Downloads/photo.png"]
 
 
 def test_rule_set_build_skips_unknown_ids():
@@ -280,12 +280,12 @@ def test_custom_rules_first_match_wins_and_both_separators_work():
     # 第 1 條用 / 寫、第 3 條用 \\ 寫，兩種都要能比對；不分大小寫
     rules = RuleSet(conditions=["custom"], custom="+ ^d:/models/\n- \\.dup\\d+$\n- \\\\old\\\\")
     g = group_of("D:/Models/m.safetensors.dup1", "E:/old/m.safetensors",
-                 "F:/x/m.safetensors.dup1", "G:/y/m.safetensors")
+                 "F:/x/m.safetensors.dup1", "E:/y/m.safetensors")
     # 由上往下第一條符合的為準：D:/Models 那份同時符合第 1、2 條 → 算優先保留
     assert condition("custom", rules).keys(g.files) == [-3, 1, 2, 0]
     assert apply_selection(g, rules.build(), "keep") == "custom"
     assert paths_selected(g) == ["E:/old/m.safetensors", "F:/x/m.safetensors.dup1",
-                                 "G:/y/m.safetensors"]
+                                 "E:/y/m.safetensors"]
     apply_selection(g, rules.build(), "delete")
     assert paths_selected(g) == ["F:/x/m.safetensors.dup1"]
 
