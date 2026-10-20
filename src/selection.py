@@ -4,6 +4,7 @@
 #   基本條件 — 依單一檔案的屬性比較（修改時間、路徑長短、目錄深淺、字母序、列表順序）
 #   智慧規則 — 要看整個群組才能判斷（例如「像副本的檔名」要看群組裡有沒有原名那份）；
 #              方向固定：值越大越該移除，保留模式與刪除模式都一樣
+#   參考資料夾 — 裡面的檔案永遠不會被勾選（見 apply_selection）
 #
 # 條件可疊加：依優先序逐一比較，前面的條件平手才看下一個；全部平手時取列表第一
 # （群組內檔案已依路徑排序，結果每次一致）。
@@ -185,10 +186,14 @@ class RuleSet:
     conditions: list[str] = field(default_factory=list)
     keep_dirs: list[str] = field(default_factory=list)         # 優先保留的資料夾（越前面越優先）
     remove_dirs: list[str] = field(default_factory=list)       # 優先移除的資料夾（越前面越優先移除）
+    reference_dirs: list[str] = field(default_factory=list)    # 參考資料夾：裡面的檔案不會被勾選
 
     def build(self) -> list[Condition]:
         """依優先序建立排序條件（不認得的 id 略過）。"""
         return [condition(cid, self) for cid in self.conditions if cid in COND_BY_ID]
+
+    def reference(self) -> FolderList:
+        return FolderList(self.reference_dirs)
 
 
 # ── 套用條件 ─────────────────────────────────────────────────────────────
@@ -235,14 +240,27 @@ def rank_by_conditions(files: list, conditions: list, mode: str = "keep",
     return _rank(files, conditions, mode, candidates)[0]
 
 
-def apply_selection(group: DuplicateGroup, conditions: list, mode: str) -> str | None:
+def apply_selection(group: DuplicateGroup, conditions: list, mode: str,
+                    reference: FolderList | None = None) -> str | None:
     """依條件找出勝出檔案，更新群組內各檔案的 selected 旗標。
 
     mode='keep'   → 保留勝出者（勝出者不勾選，其餘勾選待刪）
     mode='delete' → 刪除勝出者（只勾選勝出者）
-    回傳決定勝負的條件 id；None 表示條件都平手、取列表第一。
+    reference：參考資料夾，裡面的檔案永遠不會被勾選。保留模式下，群組裡有參考資料夾的檔案時，
+      保留的那份從它們之中選（其他副本照常勾選）；刪除模式下只從參考資料夾以外的檔案挑目標。
+    回傳決定勝負的條件 id；"reference"＝由參考資料夾決定；None＝條件都平手、取列表第一。
     """
-    winner, decided = _rank(group.files, conditions, mode, None)
-    for i, fi in enumerate(group.files):
-        fi.selected = (i != winner) if mode == "keep" else (i == winner)
+    files = group.files
+    is_ref = [bool(reference) and reference.contains(fi.path) for fi in files]
+    if not any(is_ref):
+        candidates = None
+    elif mode == "keep":
+        candidates = [i for i, r in enumerate(is_ref) if r]
+    else:
+        candidates = [i for i, r in enumerate(is_ref) if not r]
+    winner, decided = _rank(files, conditions, mode, candidates)
+    if candidates is not None and len(candidates) <= 1:
+        decided = "reference"
+    for i, fi in enumerate(files):
+        fi.selected = (i != winner and not is_ref[i]) if mode == "keep" else (i == winner)
     return decided

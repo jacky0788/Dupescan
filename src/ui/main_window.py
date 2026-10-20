@@ -49,6 +49,7 @@ from ..models import DuplicateGroup, FileInfo
 from ..logger import logger
 from ..selection import (
     COND_BY_ID as _COND_BY_ID,
+    FolderList,
     RuleSet,
     apply_selection as _apply_selection,
     condition as _condition,
@@ -81,7 +82,8 @@ def _unit_combo(default: str) -> QComboBox:
 
 def _describe_decisions(decided: Counter, conditions: list) -> str:
     """「已套用到 10 個群組：像副本的檔名優先移除 3、路徑較短 5、平手取列表第一 2」"""
-    parts = [f"{_COND_BY_ID[c.id][1]} {decided[c.id]:,}" for c in conditions if decided[c.id]]
+    parts = [f"參考資料夾 {decided['reference']:,}"] if decided["reference"] else []
+    parts += [f"{_COND_BY_ID[c.id][1]} {decided[c.id]:,}" for c in conditions if decided[c.id]]
     if decided[None]:
         parts.append(f"平手取列表第一 {decided[None]:,}")
     total = sum(decided.values())
@@ -286,6 +288,7 @@ class DuplicateTree(QTreeWidget):
         self._guard = False   # 防止程式化 setCheckState 觸發的 itemChanged 遞迴
         # 右鍵選單要用的目前規則（側邊列的條件與資料夾設定），由主視窗指定
         self.rules_provider = RuleSet
+        self._reference = FolderList([])   # 參考資料夾：檔名後面標 📌
 
         self.setColumnCount(4)
         self.setHeaderLabels(["名稱", "路徑（雙擊開啟・Ctrl＋點擊在檔案總管定位）", "大小", "修改時間"])
@@ -410,6 +413,22 @@ class DuplicateTree(QTreeWidget):
                     + "\n".join(fi.aliases[:10]))
             item.setToolTip(_COL_NAME, item.toolTip(_COL_NAME) + note)
             item.setText(_COL_NAME, f"{fi.name}  ⛓{len(fi.aliases) + 1}")
+        if self._reference and self._reference.contains(fi.path):
+            item.setText(_COL_NAME, item.text(_COL_NAME) + "  📌")
+            item.setToolTip(_COL_NAME, item.toolTip(_COL_NAME)
+                            + "\n\n📌 位於參考資料夾：規則與「全部勾選」不會勾選它")
+
+    def set_reference(self, reference: FolderList):
+        """參考資料夾變更：重新標示已建立的檔案列。"""
+        self._reference = reference
+        self._guard = True
+        for i in range(self.topLevelItemCount()):
+            gi = self.topLevelItem(i)
+            if gi.data(0, _ROLE_POP):
+                for j in range(gi.childCount()):
+                    ch = gi.child(j)
+                    self._fill_file_item(ch, ch.data(0, _ROLE_OBJ))
+        self._guard = False
 
     def _on_expanded(self, item: QTreeWidgetItem):
         """群組首次展開時才建立子列（lazy）。"""
@@ -488,15 +507,17 @@ class DuplicateTree(QTreeWidget):
         self.checksChanged.emit()
 
     # ── 批次選取操作（作用於資料層，再刷新檢視）──────────────────────
-    def select_all(self, sel: bool):
+    def select_all(self, sel: bool, reference: FolderList | None = None):
+        """全部勾選／取消；勾選時略過參考資料夾裡的檔案。"""
         for g in self._groups:
             for fi in g.files:
-                fi.selected = sel
+                fi.selected = sel and not (reference and reference.contains(fi.path))
         self.refresh_checks()
 
-    def apply_conditions_all(self, conditions: list, mode: str) -> Counter:
+    def apply_conditions_all(self, conditions: list, mode: str,
+                             reference: FolderList | None = None) -> Counter:
         """對所有顯示中的群組套用條件；回傳各條件決定了幾組（None＝平手取列表第一）。"""
-        decided = Counter(_apply_selection(g, conditions, mode) for g in self._groups)
+        decided = Counter(_apply_selection(g, conditions, mode, reference) for g in self._groups)
         self.refresh_checks()
         return decided
 
@@ -596,14 +617,16 @@ class DuplicateTree(QTreeWidget):
             act_loc.triggered.connect(lambda: self._locate(fi))
             menu.addSeparator()
 
-        # 快速選取子選單（保留某條件勝出者，其餘標記待刪）
+        # 快速選取子選單（保留某條件勝出者，其餘標記待刪；參考資料夾裡的檔案不會被勾選）
         rules: RuleSet = self.rules_provider()
+        reference = rules.reference()
         quick = menu.addMenu("快速選取（保留…）")
 
         def add_quick(parent: QMenu, text: str, conditions: list, mode: str = "keep"):
             act = parent.addAction(text)
             act.triggered.connect(
-                lambda _, gg=g, gi=group_item, c=conditions, m=mode: self._quick_group(gi, gg, c, m))
+                lambda _, gg=g, gi=group_item, c=conditions, m=mode:
+                    self._quick_group(gi, gg, c, m, reference))
             return act
 
         for cid in ("newer", "older", "sh_path", "shallow", "lo_path"):
@@ -623,8 +646,8 @@ class DuplicateTree(QTreeWidget):
         return menu
 
     def _quick_group(self, gi: QTreeWidgetItem, g: DuplicateGroup, conditions: list,
-                     mode: str = "keep"):
-        _apply_selection(g, conditions, mode)
+                     mode: str = "keep", reference: FolderList | None = None):
+        _apply_selection(g, conditions, mode, reference)
         self._set_group_state(gi, g)
         if gi.data(0, _ROLE_POP):
             self._guard = True
@@ -1035,6 +1058,7 @@ class MainWindow(QMainWindow):
 
         qb.addWidget(self._mini_label("依條件套用（可疊加，依勾選順序）"))
         self._global_cond = ConditionPanel()
+        self._global_cond.referenceChanged.connect(self._sync_reference)
         qb.addWidget(self._global_cond)
 
         btn_apply_all = QPushButton("套用到所有群組")
@@ -1044,7 +1068,8 @@ class MainWindow(QMainWindow):
 
         row2 = QHBoxLayout(); row2.setSpacing(6)
         btn_all = QPushButton("全部勾選")
-        btn_all.clicked.connect(lambda: self.tree.select_all(True))
+        btn_all.setToolTip("勾選所有群組的每一份（參考資料夾裡的檔案除外）")
+        btn_all.clicked.connect(self._select_all)
         btn_none = QPushButton("全部取消")
         btn_none.clicked.connect(lambda: self.tree.select_all(False))
         row2.addWidget(btn_all)
@@ -1164,6 +1189,8 @@ class MainWindow(QMainWindow):
         self._set_global_mode(st.value("select/mode", "keep", str))
         self._global_cond.keep_dirs_edit.setText(st.value("select/keep_dirs", "", str))
         self._global_cond.remove_dirs_edit.setText(st.value("select/remove_dirs", "", str))
+        self._global_cond.reference_edit.setText(st.value("select/reference_dirs", "", str))
+        self._sync_reference()
         for cond_id in st.value("select/conditions", [], list) or []:
             cb = self._global_cond._checkboxes.get(cond_id)
             if cb is not None and cb.isEnabled():
@@ -1194,6 +1221,7 @@ class MainWindow(QMainWindow):
         st.setValue("select/conditions", list(self._global_cond._checked_order))
         st.setValue("select/keep_dirs", self._global_cond.keep_dirs_edit.text())
         st.setValue("select/remove_dirs", self._global_cond.remove_dirs_edit.text())
+        st.setValue("select/reference_dirs", self._global_cond.reference_edit.text())
         st.setValue("ui/sidebar_open", self._sidebar_open)
         st.setValue("ui/scan_panel_open", self._sb_scan_open)
         st.setValue("ui/filter_panel_open", self._sb_filter_open)
@@ -1235,12 +1263,20 @@ class MainWindow(QMainWindow):
         return rules
 
     def _global_apply_conditions(self):
-        conditions = self._global_cond.get_active()
+        rules = self._current_rules()
+        conditions = rules.build()
         if not conditions:
             QMessageBox.information(self, "提示", "請先勾選至少一個條件。")
             return
-        decided = self.tree.apply_conditions_all(conditions, self._global_qs_mode)
+        decided = self.tree.apply_conditions_all(conditions, rules.mode, rules.reference())
         self.status_bar.showMessage(_describe_decisions(decided, conditions))
+
+    def _select_all(self):
+        """「全部勾選」：參考資料夾裡的檔案不會被勾選。"""
+        self.tree.select_all(True, self._current_rules().reference())
+
+    def _sync_reference(self):
+        self.tree.set_reference(self._current_rules().reference())
 
     # ── 文字大小調整 ──────────────────────────────────────────────────
     def _apply_font_size(self, size: int):
@@ -1559,7 +1595,8 @@ class MainWindow(QMainWindow):
 
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            plan = build_plan(groups)       # 會重新檢查每個檔案是否在掃描後變動
+            # 會重新檢查每個檔案是否在掃描後變動；參考資料夾裡的檔案視同受保護
+            plan = build_plan(groups, reference_dirs=self._current_rules().reference_dirs)
         finally:
             QApplication.restoreOverrideCursor()
 
@@ -1912,7 +1949,9 @@ class ConditionPanel(QWidget):
     互斥機制：勾選某條件時，衝突條件的 QCheckBox 會被 disable，
     取消時再恢復可用，避免矛盾條件同時生效（例如「較新」和「較舊」）。
     智慧規則和基本條件共用同一個優先序，最下面一行顯示目前的順序。
+    參考資料夾不是排序條件，有填就一律生效；內容改變（停手 0.3 秒）時發出 referenceChanged。
     """
+    referenceChanged = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1966,6 +2005,20 @@ class ConditionPanel(QWidget):
         self.remove_dirs_edit.setPlaceholderText("例如 _trash; _bak; 備份; Downloads")
         fl.addWidget(self.remove_dirs_edit)
         lay.addWidget(self._folders_box)
+
+        ref_hint = self._hint("參考資料夾（裡面的檔案不會被勾選，; 分隔）")
+        ref_hint.setStyleSheet(ref_hint.styleSheet() + "padding-top:4px;")
+        lay.addWidget(ref_hint)
+        self.reference_edit = QLineEdit()
+        self.reference_edit.setPlaceholderText("例如 D:\\Master; 正本")
+        self.reference_edit.setToolTip(
+            "放正本的資料夾：套用規則、右鍵快速選取、「全部勾選」都不會勾選裡面的檔案；\n"
+            "群組裡有參考資料夾的檔案時，其他地方的副本照常勾選。手動勾了也會在移除前預覽\n"
+            "被當成受保護、預設不移除。寫法和資料夾優先序相同（完整路徑或名稱片段）。")
+        self._ref_timer = QTimer(self, singleShot=True, interval=300)
+        self._ref_timer.timeout.connect(self.referenceChanged.emit)
+        self.reference_edit.textChanged.connect(lambda _: self._ref_timer.start())
+        lay.addWidget(self.reference_edit)
 
         self._order_label = QLabel()
         self._order_label.setWordWrap(True)
@@ -2021,7 +2074,8 @@ class ConditionPanel(QWidget):
         """面板上目前的規則（操作模式由主視窗另外填）。"""
         return RuleSet(conditions=list(self._checked_order),
                        keep_dirs=split_dirs(self.keep_dirs_edit.text()),
-                       remove_dirs=split_dirs(self.remove_dirs_edit.text()))
+                       remove_dirs=split_dirs(self.remove_dirs_edit.text()),
+                       reference_dirs=split_dirs(self.reference_edit.text()))
 
     def get_active(self) -> list:
         return self.rule_set().build()

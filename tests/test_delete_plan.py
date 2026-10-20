@@ -3,7 +3,9 @@ import os
 from pathlib import Path
 
 from helpers import blob
-from src.delete_plan import KEEP, OK, PROTECTED, SKIP, build_plan, is_protected
+from src.delete_plan import (
+    KEEP, OK, PROTECTED, PROTECTED_NOTE, REFERENCE_NOTE, SKIP, build_plan, is_protected,
+)
 from src.scanner import Scanner
 
 KB = 1024
@@ -96,3 +98,17 @@ def test_is_protected_patterns():
     assert is_protected(Path("D:/Games/SteamLibrary/steamapps/common/x.pak"))
     assert not is_protected(Path("D:/Photos/windows/a.jpg"))     # 不是磁碟根目錄的 Windows
     assert not is_protected(Path("E:/Downloads/model.safetensors"))
+
+
+def test_reference_folders_are_treated_as_protected(tree):
+    g = scan_one_group(tree, ["keep.bin", "正本/m.bin", "other/o.bin", "web/node_modules/n.bin"])
+    select(g, "m.bin", "o.bin", "n.bin")
+    for dirs in ([str(tree.root / "正本")], ["正本"]):          # 完整路徑或名稱片段都可以
+        entries = by_name(build_plan([(1, g)], reference_dirs=dirs))
+        assert (entries["m.bin"].status, entries["m.bin"].note) == (PROTECTED, REFERENCE_NOTE)
+        assert (entries["n.bin"].status, entries["n.bin"].note) == (PROTECTED, PROTECTED_NOTE)
+        assert entries["o.bin"].status == OK
+    plan = build_plan([(1, g)], reference_dirs=["正本"])
+    assert [e.file.path.name for _, e in plan.removable()] == ["o.bin"]
+    assert len(plan.removable(allow_protected=True)) == 3
+    assert by_name(build_plan([(1, g)]))["m.bin"].status == OK     # 沒設定參考資料夾

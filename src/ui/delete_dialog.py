@@ -1,8 +1,8 @@
 # 移除前預覽視窗與背景移除 worker。
 #
 # DeletePlanDialog：依群組列出「保留／移除／略過／受保護」、總釋放容量與需要注意的項目，
-#   可選處理方式（資源回收筒／隔離資料夾）、搜尋、匯出 CSV；整組全刪與受保護資料夾預設不移除，
-#   要另外勾選確認。
+#   可選處理方式（資源回收筒／隔離資料夾）、搜尋、匯出 CSV；整組全刪與受保護資料夾（含參考
+#   資料夾）預設不移除，要另外勾選確認。
 # RemovalWorker：在背景執行緒（可選擇先完整比對內容）再呼叫 file_ops.remove_files，不卡畫面。
 import csv
 from pathlib import Path
@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .. import file_ops
-from ..delete_plan import KEEP, OK, PROTECTED, SKIP, DeletePlan
+from ..delete_plan import KEEP, OK, PROTECTED, REFERENCE_NOTE, SKIP, DeletePlan
 from ..file_ops import OpResult
 from ..scanner import _full_hash
 from .theme import DANGER, FAINT, GREEN, ORANGE, SUBTEXT, TEXT
@@ -70,17 +70,24 @@ class DeletePlanDialog(QDialog):
         wl.setSpacing(6)
         n_whole = len(plan.whole_groups)
         n_protected = len(plan.entries_with(PROTECTED))
+        n_reference = sum(1 for e in plan.entries_with(PROTECTED) if e.note == REFERENCE_NOTE)
         n_skipped = len(plan.entries_with(SKIP))
         self.cb_whole = QCheckBox("仍要移除這些群組的所有副本")
-        self.cb_protected = QCheckBox("仍要移除受保護資料夾內的檔案")
+        self.cb_protected = QCheckBox("仍要移除受保護資料夾內的檔案" if not n_reference
+                                      else "仍要移除受保護／參考資料夾內的檔案")
         if n_whole:
             wl.addLayout(self._warn_row(
                 f"⛔  {n_whole} 個群組的每一份都被勾選，移除後一份都不剩 → 預設不移除",
                 self.cb_whole))
         if n_protected:
+            where = []
+            if n_protected > n_reference:
+                where.append("受保護資料夾（Windows、Program Files、AppData、.git、Ollama 模型等"
+                             "程式管理的位置）")
+            if n_reference:
+                where.append("你設定的參考資料夾")
             wl.addLayout(self._warn_row(
-                f"🔒  {n_protected} 個檔案位於受保護資料夾（Windows、Program Files、AppData、"
-                f".git、Ollama 模型等程式管理的位置）→ 預設不移除", self.cb_protected))
+                f"🔒  {n_protected} 個檔案位於{'或'.join(where)} → 預設不移除", self.cb_protected))
         if n_skipped:
             wl.addLayout(self._warn_row(
                 f"⚠  {n_skipped} 個檔案在掃描後有變動、已不存在，或找不到可比對的保留副本 → "

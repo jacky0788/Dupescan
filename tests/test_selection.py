@@ -229,3 +229,38 @@ def test_smart_rules_stack_in_priority_order():
 def test_rule_set_build_skips_unknown_ids():
     rules = RuleSet(conditions=["copy_name", "no_such_rule", "sh_path"])
     assert [c.id for c in rules.build()] == ["copy_name", "sh_path"]
+
+
+# ── 參考資料夾 ─────────────────────────────────────────────────────────────
+def test_reference_file_is_kept_and_other_copies_selected():
+    ref = RuleSet(reference_dirs=["D:\\Master"]).reference()
+    g = group_of("D:/Master/a.png", "E:/copy/a.png", "F:/b/a.png")
+    # 只看「路徑較短」本來會留 F:/b/a.png；有參考資料夾時保留參考資料夾那份
+    assert apply_selection(g, [condition("sh_path")], "keep", ref) == "reference"
+    assert paths_selected(g) == ["E:/copy/a.png", "F:/b/a.png"]
+
+
+def test_several_reference_files_are_all_kept():
+    ref = FolderList(["Master"])
+    g = group_of("D:/Master/a.png", "D:/Master/x/a.png", "E:/copy/a.png")
+    assert apply_selection(g, [condition("deep")], "keep", ref) == "deep"
+    assert paths_selected(g) == ["E:/copy/a.png"]
+
+
+def test_reference_file_is_never_the_delete_target():
+    ref = FolderList(["D:\\Master"])
+    g = group_of("D:/Master/a.png", "E:/old/a.png", "F:/new/a.png",
+                 mtimes={"D:/Master/a.png": 1.0, "E:/old/a.png": 2.0})
+    assert apply_selection(g, [condition("older")], "delete", ref) == "older"
+    assert paths_selected(g) == ["E:/old/a.png"]
+    g = group_of("D:/Master/a.png", "D:/Master/b/a.png")              # 整組都在參考資料夾
+    assert apply_selection(g, [condition("older")], "delete", ref) == "reference"
+    assert paths_selected(g) == []
+    apply_selection(g, [condition("older")], "keep", ref)
+    assert paths_selected(g) == []
+
+
+def test_empty_reference_changes_nothing():
+    g = group_of("D:/a/x.png", "D:/b/x.png")
+    assert apply_selection(g, [condition("sh_path")], "keep", FolderList([])) is None
+    assert paths_selected(g) == ["D:/b/x.png"]

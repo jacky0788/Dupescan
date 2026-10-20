@@ -3,6 +3,8 @@
 #   整組全選      — 群組裡每一份都被勾選，移除後一份都不剩 → 預設不移除，需另外確認
 #   受保護資料夾  — Windows、Program Files、AppData、.git、Ollama 模型 blobs 等由程式
 #                   管理的位置，刪了可能讓程式壞掉 → 預設不移除，需另外確認
+#   參考資料夾    — 使用者指定的正本所在（規則不會勾選裡面的檔案）；手動勾了也視同受保護
+#                   → 預設不移除，需另外確認
 #   掃描後有變動  — 檔案已不存在、大小或修改時間變了、開頭內容和保留的那份不同 → 一律略過
 #   保留的那份不見了 — 該群組沒有任何一份「確定還在且沒變」的副本 → 該群組一律略過
 #
@@ -14,8 +16,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .models import DuplicateGroup, FileInfo
+from .selection import FolderList
 
 HEAD_BYTES = 4096   # 快速複驗時比對的開頭長度
+PROTECTED_NOTE = "位於受保護資料夾"
+REFERENCE_NOTE = "位於參考資料夾"
 
 # 受保護資料夾（fnmatch 樣式，比對完整路徑，不分大小寫，/ 與 \ 視為相同）
 DEFAULT_PROTECTED = [
@@ -104,8 +109,12 @@ def _head(path: Path) -> bytes | None:
 
 
 def build_plan(groups: list[tuple[int, DuplicateGroup]], protected=None,
-               verify_head: bool = True) -> DeletePlan:
-    """依勾選狀態建立移除計畫。groups 為 (顯示編號, 群組)，只會處理有勾選檔案的群組。"""
+               verify_head: bool = True, reference_dirs: list[str] | None = None) -> DeletePlan:
+    """依勾選狀態建立移除計畫。groups 為 (顯示編號, 群組)，只會處理有勾選檔案的群組。
+
+    reference_dirs：參考資料夾（寫法同選取規則，完整路徑或名稱片段），裡面的檔案視同受保護。
+    """
+    ref_dirs = FolderList(reference_dirs or [])
     plan = DeletePlan(groups=[])
     for number, g in groups:
         selected = [fi for fi in g.files if fi.selected]
@@ -138,7 +147,9 @@ def build_plan(groups: list[tuple[int, DuplicateGroup]], protected=None,
             if reason:
                 pg.entries.append(PlanEntry(fi, SKIP, reason))
             elif is_protected(fi.path, protected):
-                pg.entries.append(PlanEntry(fi, PROTECTED, "位於受保護資料夾"))
+                pg.entries.append(PlanEntry(fi, PROTECTED, PROTECTED_NOTE))
+            elif ref_dirs and ref_dirs.contains(fi.path):
+                pg.entries.append(PlanEntry(fi, PROTECTED, REFERENCE_NOTE))
             else:
                 pg.entries.append(PlanEntry(fi, OK))
         plan.groups.append(pg)

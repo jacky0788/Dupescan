@@ -517,6 +517,7 @@ def test_rule_settings_are_remembered(qapp, tmp_path):
     first._global_cond._checkboxes["folders"].setChecked(True)
     first._global_cond.keep_dirs_edit.setText("D:\\Models; 收藏")
     first._global_cond.remove_dirs_edit.setText("_trash; 備份")
+    first._global_cond.reference_edit.setText("E:\\正本")
     first.close()
 
     second = MainWindow(QSettings(ini, QSettings.Format.IniFormat))
@@ -524,5 +525,53 @@ def test_rule_settings_are_remembered(qapp, tmp_path):
     assert rules.conditions == ["copy_name", "folders"]
     assert rules.keep_dirs == ["D:\\Models", "收藏"]
     assert rules.remove_dirs == ["_trash", "備份"]
+    assert rules.reference_dirs == ["E:\\正本"]
+    assert second.tree._reference                           # 啟動時就套用到結果樹的標示
     assert second._global_cond._folders_box.isVisibleTo(second._global_cond)
     second.close()
+
+
+def test_reference_folder_is_never_auto_selected(qapp, window, tree, monkeypatch):
+    from PyQt6.QtWidgets import QDialog
+    from src.delete_plan import PROTECTED, REFERENCE_NOTE
+    from src.ui import delete_dialog
+    data = blob(4 * KB, 23)
+    for n in ("正本/a.bin", "copy1/a.bin", "copy2/a.bin"):
+        tree(n, data)
+    run_scan(qapp, window, tree.root)
+    g = window._all_groups[0]
+    folders = lambda: {fi.path.parent.name for fi in g.files if fi.selected}
+
+    window._global_cond.reference_edit.setText("正本")
+    assert wait_until(qapp, lambda: window.tree._reference, timeout=3)    # 停手 0.3 秒後生效
+    gi = window.tree.topLevelItem(0)
+    gi.setExpanded(True)
+    assert sum("📌" in gi.child(i).text(0) for i in range(gi.childCount())) == 1
+
+    window._global_cond._checkboxes["lo_path"].setChecked(True)      # 本來會留 copy1／copy2
+    window._global_apply_conditions()
+    assert folders() == {"copy1", "copy2"}
+    assert "參考資料夾 1" in window.status_bar.currentMessage()
+    window.tree.select_all(False)
+    window._select_all()                                             # 「全部勾選」也略過
+    assert folders() == {"copy1", "copy2"}
+    window.tree.select_all(False)
+    quick_action(window, 0, "路徑較長").trigger()
+    assert folders() == {"copy1", "copy2"}
+
+    # 手動勾了參考資料夾的檔案：移除前預覽視同受保護
+    for fi in g.files:
+        fi.selected = fi.path.parent.name in ("正本", "copy1")
+    window.tree.refresh_checks()
+    seen = {}
+
+    def capture(dlg):
+        seen["plan"], seen["text"] = dlg.plan, dlg.cb_protected.text()
+        return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(delete_dialog.DeletePlanDialog, "exec", capture)
+    window._delete_selected()
+    entries = {e.file.path.parent.name: e for pg in seen["plan"].groups for e in pg.entries}
+    assert (entries["正本"].status, entries["正本"].note) == (PROTECTED, REFERENCE_NOTE)
+    assert "參考" in seen["text"]
+    assert [e.file.path.parent.name for _, e in seen["plan"].removable()] == ["copy1"]
