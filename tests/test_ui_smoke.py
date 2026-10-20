@@ -8,9 +8,10 @@ KB = 1024
 
 
 @pytest.fixture
-def window(qapp):
+def window(qapp, tmp_path):
+    from PyQt6.QtCore import QSettings
     from src.ui.main_window import MainWindow
-    win = MainWindow()
+    win = MainWindow(QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat))
     yield win
     win.close()             # closeEvent 會停止掃描並等背景執行緒結束
 
@@ -379,3 +380,32 @@ def test_drop_folders_adds_scan_paths(qapp, window, tree):
                        Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
     window.dropEvent(event)
     assert window._scan_paths() == [str(a), str(b)]       # 只加入資料夾，檔案略過
+
+
+def test_settings_are_remembered(qapp, tmp_path):
+    from PyQt6.QtCore import QSettings
+    from src.ui.main_window import MainWindow
+    ini = str(tmp_path / "remember.ini")
+    first = MainWindow(QSettings(ini, QSettings.Format.IniFormat))
+    first.path_edit.setText("D:/Photos; E:/Backup")
+    first.min_size_spin.setValue(5)
+    first.min_unit_combo.setCurrentText("MB")
+    first.exclude_dir_edit.setText("node_modules")
+    first.cb_cache.setChecked(False)
+    first.font_size_spin.setValue(16)
+    first.sort_combo.setCurrentIndex(4)
+    first._global_cond._checkboxes["older"].setChecked(True)
+    first._global_cond._checkboxes["sh_path"].setChecked(True)
+    first._toggle_scan_panel()                       # 收起「掃描設定」
+    first.close()
+
+    second = MainWindow(QSettings(ini, QSettings.Format.IniFormat))
+    assert second.path_edit.text() == "D:/Photos; E:/Backup"
+    assert second.min_size_spin.value() == 5 and second.min_unit_combo.currentText() == "MB"
+    assert second.exclude_dir_edit.text() == "node_modules"
+    assert not second.cb_cache.isChecked()
+    assert second.font_size_spin.value() == 16 and second.tree._font_size == 16
+    assert second.sort_combo.currentIndex() == 4
+    assert second._global_cond._checked_order == ["older", "sh_path"]
+    assert not second._sb_scan_open and not second._sb_scan_body.isVisibleTo(second)
+    second.close()

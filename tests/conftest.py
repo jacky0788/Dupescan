@@ -15,6 +15,7 @@ def isolated_data_dir(tmp_path_factory):
     """操作紀錄、快取等一律寫到暫存資料夾，不碰使用者的 %LOCALAPPDATA%\\DupeScan。"""
     path = tmp_path_factory.mktemp("dupescan-data")
     os.environ["DUPESCAN_DATA_DIR"] = str(path)
+    os.environ["DUPESCAN_SETTINGS"] = str(path / "settings.ini")   # 也不碰使用者真正的設定檔
     return path
 
 

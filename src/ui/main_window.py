@@ -24,7 +24,7 @@ try:
 except ImportError:
     _HZ = False  # 未安裝時退回自製格式化函式
 
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QObject, QEvent, QPoint
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QObject, QEvent, QPoint, QSettings
 from PyQt6.QtGui import QColor, QFont, QPixmap, QAction
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QProgressDialog,
@@ -53,6 +53,14 @@ from ..selection import (
 
 # 支援懸停圖片預覽的副檔名集合
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif', '.ico'}
+
+
+def default_settings() -> QSettings:
+    """設定檔：%APPDATA%\\DupeScan\\DupeScan.ini（測試可用環境變數 DUPESCAN_SETTINGS 指到別處）。"""
+    path = os.environ.get("DUPESCAN_SETTINGS")
+    if path:
+        return QSettings(path, QSettings.Format.IniFormat)
+    return QSettings(QSettings.Format.IniFormat, QSettings.Scope.UserScope, "DupeScan", "DupeScan")
 
 
 SIZE_UNITS = {"KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3}
@@ -625,8 +633,9 @@ class MainWindow(QMainWindow):
     直到該執行緒的 finished 送達 _on_thread_finished 才釋放，絕不讓執行中的 QThread 被回收。
     """
 
-    def __init__(self):
+    def __init__(self, settings: QSettings | None = None):
         super().__init__()
+        self._settings = settings if settings is not None else default_settings()
         self.setWindowTitle("DupeScan — 重複檔案掃描工具")
         self.resize(1320, 840)
         self.setMinimumSize(960, 600)
@@ -655,6 +664,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self.setStyleSheet(STYLE)
         self.setAcceptDrops(True)        # 可以把資料夾拖進視窗加入掃描路徑
+        self._load_settings()
 
     # ── UI 建構 ───────────────────────────────────────────────────────
     def _build_ui(self):
@@ -1090,6 +1100,60 @@ class MainWindow(QMainWindow):
             self._add_paths(dirs, append=True)
             event.acceptProposedAction()
 
+    # ── 記住設定 ──────────────────────────────────────────────────────
+    def _load_settings(self):
+        """還原上次關閉時的視窗大小、路徑、掃描設定、檢視與快速選取條件。"""
+        st = self._settings
+        geometry = st.value("window/geometry")
+        if geometry:
+            self.restoreGeometry(geometry)
+        self.path_edit.setText(st.value("scan/paths", "", str))
+        self.min_size_spin.setValue(st.value("scan/min_size", 1, int))
+        self.min_unit_combo.setCurrentText(st.value("scan/min_unit", "KB", str))
+        self.max_size_spin.setValue(st.value("scan/max_size", 0, int))
+        self.max_unit_combo.setCurrentText(st.value("scan/max_unit", "GB", str))
+        self.include_ext_edit.setText(st.value("scan/include_exts", "", str))
+        self.exclude_ext_edit.setText(st.value("scan/exclude_exts", "", str))
+        self.exclude_dir_edit.setText(st.value("scan/exclude_dirs", "", str))
+        self.cb_hidden.setChecked(st.value("scan/include_hidden", False, bool))
+        self.cb_cache.setChecked(st.value("scan/use_cache", True, bool))
+        self.font_size_spin.setValue(st.value("view/font_size", 13, int))
+        self.sort_combo.setCurrentIndex(st.value("view/sort", 0, int))
+        self._set_global_mode(st.value("select/mode", "keep", str))
+        for cond_id in st.value("select/conditions", [], list) or []:
+            cb = self._global_cond._checkboxes.get(cond_id)
+            if cb is not None and cb.isEnabled():
+                cb.setChecked(True)
+        for key, opened, toggle in (("ui/sidebar_open", self._sidebar_open, self._toggle_sidebar),
+                                    ("ui/scan_panel_open", self._sb_scan_open, self._toggle_scan_panel),
+                                    ("ui/filter_panel_open", self._sb_filter_open, self._toggle_filter_panel),
+                                    ("ui/qs_panel_open", self._sb_qs_open, self._toggle_qs_panel)):
+            if st.value(key, True, bool) != opened:
+                toggle()
+
+    def _save_settings(self):
+        st = self._settings
+        st.setValue("window/geometry", self.saveGeometry())
+        st.setValue("scan/paths", self.path_edit.text())
+        st.setValue("scan/min_size", self.min_size_spin.value())
+        st.setValue("scan/min_unit", self.min_unit_combo.currentText())
+        st.setValue("scan/max_size", self.max_size_spin.value())
+        st.setValue("scan/max_unit", self.max_unit_combo.currentText())
+        st.setValue("scan/include_exts", self.include_ext_edit.text())
+        st.setValue("scan/exclude_exts", self.exclude_ext_edit.text())
+        st.setValue("scan/exclude_dirs", self.exclude_dir_edit.text())
+        st.setValue("scan/include_hidden", self.cb_hidden.isChecked())
+        st.setValue("scan/use_cache", self.cb_cache.isChecked())
+        st.setValue("view/font_size", self.font_size_spin.value())
+        st.setValue("view/sort", self.sort_combo.currentIndex())
+        st.setValue("select/mode", self._global_qs_mode)
+        st.setValue("select/conditions", list(self._global_cond._checked_order))
+        st.setValue("ui/sidebar_open", self._sidebar_open)
+        st.setValue("ui/scan_panel_open", self._sb_scan_open)
+        st.setValue("ui/filter_panel_open", self._sb_filter_open)
+        st.setValue("ui/qs_panel_open", self._sb_qs_open)
+        st.sync()
+
     # ── 側邊列展開/收折 ───────────────────────────────────────────────
     def _toggle_sidebar(self):
         self._sidebar_open = not self._sidebar_open
@@ -1266,7 +1330,8 @@ class MainWindow(QMainWindow):
             logger.warning("背景掃描執行緒未在時限內結束，改在背景等待它結束")
 
     def closeEvent(self, event):
-        """關閉視窗前先停止掃描；仍未結束的執行緒保留參照到程式結束，避免閃退。"""
+        """關閉視窗前記住設定並停止掃描；仍未結束的執行緒保留參照到程式結束，避免閃退。"""
+        self._save_settings()
         self._stop_worker(wait_ms=5000)
         for thread, worker in list(self._threads.values()):
             worker.stop()
