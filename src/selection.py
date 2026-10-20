@@ -35,7 +35,6 @@ CONDITIONS_DEF = [
     ("custom",    "自訂規則（正規表示式）", None,             None,  None),
 ]
 COND_BY_ID = {c[0]: c for c in CONDITIONS_DEF}
-SMART_IDS = ("copy_name", "folders", "custom")
 
 
 @dataclass(frozen=True)
@@ -66,6 +65,7 @@ _COPY_SUFFIX = re.compile(
     r")(?=\.|$)",
     re.IGNORECASE)
 _COPY_PREFIX = re.compile(rf"^copy(?:\s*{_OPEN}{_N}{_CLOSE})?\s+of\s+", re.IGNORECASE)  # 「Copy of 」
+_COPY_HINT = re.compile(r"[(（\-+%]|copy|\.dup", re.IGNORECASE)   # 完全不含這些就不可能有標記（快速略過）
 
 
 def copy_info(name: str) -> tuple[str, int]:
@@ -75,6 +75,8 @@ def copy_info(name: str) -> tuple[str, int]:
     標記可以疊好幾層：「photo (1) (1).png」→（「photo.png」, 2）。
     """
     s = unicodedata.normalize("NFC", name)
+    if not _COPY_HINT.search(s):
+        return s.casefold(), 0
     count = 0
     if "+" in s or "%" in s:
         decoded = unquote_plus(s)
@@ -302,7 +304,7 @@ def load_presets(text: str) -> dict[str, RuleSet]:
     """dump_presets 的反向；內容壞掉時回傳空的（或略過壞掉的那幾筆），不拋例外。"""
     try:
         data = json.loads(text) if text else {}
-    except ValueError:
+    except (TypeError, ValueError):
         return {}
     items = data.get("presets") if isinstance(data, dict) else None
     presets: dict[str, RuleSet] = {}

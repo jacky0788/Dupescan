@@ -55,6 +55,7 @@ from ..selection import (
     condition as _condition,
     dump_presets,
     load_presets,
+    parse_custom_rules,
     split_dirs,
 )
 
@@ -1323,7 +1324,12 @@ class MainWindow(QMainWindow):
             # 有錯的行會被略過，套用到所有群組前先擋下，免得留下錯的那份
             QMessageBox.warning(self, "自訂規則有誤", "請先修正自訂規則：\n\n" + "\n".join(errors[:10]))
             return None
-        decided = self.tree.apply_conditions_all(conditions, rules.mode, rules.reference())
+        # 6 萬多個群組、智慧規則全開時約 1 秒
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            decided = self.tree.apply_conditions_all(conditions, rules.mode, rules.reference())
+        finally:
+            QApplication.restoreOverrideCursor()
         return _describe_decisions(decided, conditions)
 
     # ── 預設集 ────────────────────────────────────────────────────────
@@ -2202,12 +2208,9 @@ class ConditionPanel(QWidget):
         self._folders_box.setVisible("folders" in self._checked_order)
         self._custom_box.setVisible("custom" in self._checked_order)
 
-    def custom_errors(self) -> list[str]:
-        return self.rule_set().custom_rules()[1]
-
     def _check_custom(self):
         """自訂規則一邊打一邊檢查，有錯的行列在輸入框下方。"""
-        errors = self.custom_errors()
+        errors = parse_custom_rules(self.custom_edit.toPlainText())[1]
         shown = errors[:5] + ([f"…另外 {len(errors) - 5} 行有誤"] if len(errors) > 5 else [])
         self._custom_error.setText("\n".join(shown))
         self._custom_error.setVisible(bool(errors))
@@ -2253,6 +2256,3 @@ class ConditionPanel(QWidget):
             cb = self._checkboxes.get(cid)
             if cb is not None and cb.isEnabled():      # 互斥的條件以前面的為準
                 cb.setChecked(True)
-
-    def get_active(self) -> list:
-        return self.rule_set().build()
