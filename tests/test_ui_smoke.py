@@ -409,3 +409,24 @@ def test_settings_are_remembered(qapp, tmp_path):
     assert second._global_cond._checked_order == ["older", "sh_path"]
     assert not second._sb_scan_open and not second._sb_scan_body.isVisibleTo(second)
     second.close()
+
+
+def test_save_and_reopen_results_keeps_selection(qapp, window, tree, tmp_path):
+    from PyQt6.QtCore import QSettings
+    from src.ui.main_window import MainWindow
+    three_groups(tree)
+    run_scan(qapp, window, tree.root)
+    window._all_groups[0].files[0].selected = True
+    path = str(tmp_path / "saved.dupescan")
+    window._save_results(path)
+    window._export_csv(str(tmp_path / "all.csv"))
+    assert (tmp_path / "all.csv").exists()
+
+    other = MainWindow(QSettings(str(tmp_path / "other.ini"), QSettings.Format.IniFormat))
+    other._open_results(path)
+    assert len(other._all_groups) == 3
+    assert other.tree.topLevelItemCount() == 3
+    assert other.tree.selected_stats()[0] == 1
+    assert "掃描於" in other.status_bar.currentMessage()
+    assert other.path_edit.text() == str(tree.root)
+    other.close()

@@ -42,6 +42,7 @@ from .theme import (
     ACCENT, ACCENT_HI, GREEN, DANGER, DANGER_HI, ORANGE, STYLE,
 )
 from ..hash_cache import HashCache, clear_cache
+from ..results_io import RESULT_SUFFIX, export_csv, load_results, save_results
 from ..scanner import Scanner, ScanStats, STEP_NAMES, TOTAL_STEPS, _format_eta
 from ..models import DuplicateGroup, FileInfo
 from ..logger import logger
@@ -641,6 +642,8 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(960, 600)
 
         self._all_groups: list[DuplicateGroup] = []   # 完整未篩選結果
+        self._last_roots: list[str] = []               # 最近一次掃描的路徑（儲存結果用）
+        self._scanned_at: str = ""
         self._groups:     list[DuplicateGroup] = []   # 目前顯示（篩選/排序後）
 
         self._thread:  QThread | None    = None
@@ -723,6 +726,10 @@ class MainWindow(QMainWindow):
         lay.addSpacing(10)
         lay.addWidget(sub)
         lay.addStretch()
+        open_btn = QPushButton("📂  開啟結果")
+        open_btn.setToolTip("開啟之前儲存的掃描結果（含勾選狀態），接著處理")
+        open_btn.clicked.connect(lambda: self._open_results())
+        lay.addWidget(open_btn)
         history = QPushButton("↩  操作紀錄")
         history.setToolTip("查看移除過的檔案；移到隔離資料夾的可以一鍵還原")
         history.clicked.connect(self._show_history)
@@ -843,10 +850,14 @@ class MainWindow(QMainWindow):
         sl.addWidget(self.lbl_skipped)
         sl.addStretch()
 
-        self.btn_export = QPushButton("📊  匯出報表")
+        self.btn_export = QPushButton("📊  匯出／儲存")
         self.btn_export.setEnabled(False)
-        self.btn_export.setToolTip("分析重複檔案分布並匯出 HTML 報表（含圓餅圖）")
-        self.btn_export.clicked.connect(self._export_report)
+        export_menu = QMenu(self.btn_export)
+        export_menu.addAction("HTML 分析報表（圓餅圖）", self._export_report)
+        export_menu.addAction("完整結果 CSV（Excel 可開）…", lambda: self._export_csv())
+        export_menu.addSeparator()
+        export_menu.addAction("儲存結果（含勾選，之後可再開啟）…", lambda: self._save_results())
+        self.btn_export.setMenu(export_menu)
         self.btn_delete = QPushButton("🗑  移除已勾選")
         self.btn_delete.setObjectName("danger")
         self.btn_delete.setEnabled(False)
@@ -1260,6 +1271,7 @@ class MainWindow(QMainWindow):
         use_cache = self.cb_cache.isChecked()
         logger.info(f"掃描開始 — 路徑: {'; '.join(paths)}；{self._describe_options(options, use_cache)}")
 
+        self._last_roots = paths
         worker = ScanWorker(self._scan_id, paths, use_cache=use_cache, **options)
         worker.progress.connect(self._on_progress)
         worker.finished.connect(self._on_done)
@@ -1415,6 +1427,7 @@ class MainWindow(QMainWindow):
         self._paused = False
         self._hide_progress()
         self._all_groups = groups
+        self._scanned_at = datetime.datetime.now().isoformat(timespec="seconds")
         self._log_scan_stats(stats)
         skipped = f"（略過 {stats.unreadable:,} 個無法讀取的項目）" if stats.unreadable else ""
         if stats.cache_hits_full:
@@ -1625,6 +1638,65 @@ class MainWindow(QMainWindow):
     def _show_history(self):
         from .history_dialog import HistoryDialog
         HistoryDialog(self).exec()
+
+    # ── 結果匯出與存檔 ────────────────────────────────────────────────
+    def _export_csv(self, path: str | None = None):
+        if not self._all_groups:
+            return
+        if path is None:
+            path, _ = QFileDialog.getSaveFileName(
+                self, "匯出完整結果", "dupescan_結果.csv", "CSV (*.csv)")
+            if not path:
+                return
+        export_csv(path, self._groups)
+        logger.info(f"匯出結果 CSV: {path}")
+        self.status_bar.showMessage(f"已匯出 {len(self._groups):,} 個群組到 {path}")
+
+    def _save_results(self, path: str | None = None):
+        if not self._all_groups:
+            return
+        if path is None:
+            path, _ = QFileDialog.getSaveFileName(
+                self, "儲存結果", "dupescan_結果" + RESULT_SUFFIX,
+                f"DupeScan 結果 (*{RESULT_SUFFIX})")
+            if not path:
+                return
+        save_results(path, self._all_groups, self._last_roots, self._scanned_at)
+        logger.info(f"儲存結果: {path}（{len(self._all_groups):,} 個群組）")
+        self.status_bar.showMessage(f"已儲存結果到 {path}，之後可用「開啟結果」接著處理")
+
+    def _open_results(self, path: str | None = None):
+        if self._scanning:
+            QMessageBox.information(self, "提示", "請先停止掃描再開啟結果檔。")
+            return
+        if path is None:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "開啟結果", "", f"DupeScan 結果 (*{RESULT_SUFFIX})")
+            if not path:
+                return
+        try:
+            groups, meta = load_results(path)
+        except ValueError as exc:
+            QMessageBox.warning(self, "無法開啟", str(exc))
+            return
+        self._stop_worker()
+        self._clear_results()
+        self._last_roots = meta.get("roots") or []
+        self._scanned_at = meta.get("scanned_at") or ""
+        if self._last_roots:
+            self.path_edit.setText("; ".join(self._last_roots))
+        self._all_groups = groups
+        self._update_summary()
+        self.summary_widget.setVisible(True)
+        self.tree.setHeaderHidden(not groups)
+        self._sb_filter_body.setVisible(self._sb_filter_open)
+        self._sb_qs_body.setVisible(self._sb_qs_open)
+        self._apply_filter_sort()
+        when = self._scanned_at.replace("T", " ") or "不明"
+        logger.info(f"開啟結果檔: {path}（掃描於 {when}，{len(groups):,} 個群組）")
+        self.status_bar.showMessage(
+            f"已開啟結果檔（掃描於 {when}）：{len(groups):,} 個群組。"
+            f"檔案可能已變動，移除前會重新檢查。")
 
     # ── 報表匯出 ──────────────────────────────────────────────────────
     def _make_pie_svg(self, slices: list, title: str = "") -> str:
