@@ -15,7 +15,7 @@ import functools
 from html import escape
 import math
 import webbrowser
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 try:
@@ -50,6 +50,7 @@ from ..logger import logger
 from ..selection import (
     COND_BY_ID as _COND_BY_ID,
     apply_selection as _apply_selection,
+    condition as _condition,
 )
 
 # 支援懸停圖片預覽的副檔名集合
@@ -74,6 +75,15 @@ def _unit_combo(default: str) -> QComboBox:
     combo.setCurrentText(default)
     combo.setFixedWidth(70)
     return combo
+
+
+def _describe_decisions(decided: Counter, conditions: list) -> str:
+    """「已套用到 10 個群組：像副本的檔名優先移除 3、路徑較短 5、平手取列表第一 2」"""
+    parts = [f"{_COND_BY_ID[c.id][1]} {decided[c.id]:,}" for c in conditions if decided[c.id]]
+    if decided[None]:
+        parts.append(f"平手取列表第一 {decided[None]:,}")
+    total = sum(decided.values())
+    return f"已套用到 {total:,} 個群組" + (f"：{'、'.join(parts)}" if parts else "")
 
 
 def human_size(n: int) -> str:
@@ -480,10 +490,11 @@ class DuplicateTree(QTreeWidget):
                 fi.selected = sel
         self.refresh_checks()
 
-    def apply_conditions_all(self, conditions: list, mode: str):
-        for g in self._groups:
-            _apply_selection(g, conditions, mode)
+    def apply_conditions_all(self, conditions: list, mode: str) -> Counter:
+        """對所有顯示中的群組套用條件；回傳各條件決定了幾組（None＝平手取列表第一）。"""
+        decided = Counter(_apply_selection(g, conditions, mode) for g in self._groups)
         self.refresh_checks()
+        return decided
 
     def selected_stats(self) -> tuple[int, int]:
         """回傳 (已勾選檔案數, 可釋放 bytes)。"""
@@ -561,12 +572,15 @@ class DuplicateTree(QTreeWidget):
     # ── 右鍵選單（快速選取 / 開啟 / 定位）─────────────────────────────
     def _show_menu(self, pos: QPoint):
         item = self.itemAt(pos)
-        if item is None:
-            return
+        menu = self._context_menu(item) if item is not None else None
+        if menu is not None:
+            menu.exec(self.viewport().mapToGlobal(pos))
+
+    def _context_menu(self, item: QTreeWidgetItem) -> QMenu | None:
         kind = item.data(0, _ROLE_KIND)
         group_item = item if kind == "group" else item.parent()
         if group_item is None:
-            return
+            return None
         g: DuplicateGroup = group_item.data(0, _ROLE_OBJ)
 
         menu = QMenu(self)
@@ -580,17 +594,23 @@ class DuplicateTree(QTreeWidget):
 
         # 快速選取子選單（保留某條件勝出者，其餘標記待刪）
         quick = menu.addMenu("快速選取（保留…）")
-        for cid in ("newer", "older", "sh_path", "shallow", "lo_path"):
-            act = quick.addAction(f"保留{_COND_BY_ID[cid][1]}者")
-            cond = [(cid, _COND_BY_ID[cid][2], _COND_BY_ID[cid][3])]
+
+        def add_quick(text: str, conditions: list):
+            act = quick.addAction(text)
             act.triggered.connect(
-                lambda _, gg=g, gi=group_item, c=cond: self._quick_group(gi, gg, c))
+                lambda _, gg=g, gi=group_item, c=conditions: self._quick_group(gi, gg, c))
+            return act
+
+        for cid in ("newer", "older", "sh_path", "shallow", "lo_path"):
+            add_quick(f"保留{_COND_BY_ID[cid][1]}者", [_condition(cid)])
+        quick.addSeparator()
+        add_quick("保留原始檔名（像副本的優先移除）", [_condition("copy_name")])
         menu.addSeparator()
         a_all = menu.addAction("勾選此群組全部")
         a_all.triggered.connect(lambda: self._toggle_group(group_item, g, True))
         a_none = menu.addAction("取消此群組全部")
         a_none.triggered.connect(lambda: self._toggle_group(group_item, g, False))
-        menu.exec(self.viewport().mapToGlobal(pos))
+        return menu
 
     def _quick_group(self, gi: QTreeWidgetItem, g: DuplicateGroup, conditions: list):
         _apply_selection(g, conditions, "keep")
@@ -1197,7 +1217,8 @@ class MainWindow(QMainWindow):
         if not conditions:
             QMessageBox.information(self, "提示", "請先勾選至少一個條件。")
             return
-        self.tree.apply_conditions_all(conditions, self._global_qs_mode)
+        decided = self.tree.apply_conditions_all(conditions, self._global_qs_mode)
+        self.status_bar.showMessage(_describe_decisions(decided, conditions))
 
     # ── 文字大小調整 ──────────────────────────────────────────────────
     def _apply_font_size(self, size: int):
@@ -1868,6 +1889,7 @@ class ConditionPanel(QWidget):
 
     互斥機制：勾選某條件時，衝突條件的 QCheckBox 會被 disable，
     取消時再恢復可用，避免矛盾條件同時生效（例如「較新」和「較舊」）。
+    智慧規則和基本條件共用同一個優先序，最下面一行顯示目前的順序。
     """
 
     def __init__(self, parent=None):
@@ -1890,12 +1912,36 @@ class ConditionPanel(QWidget):
             lay.addLayout(row)
         lay.addWidget(self._make_cb("list_1st"))
 
+        smart = QLabel("智慧規則（方向固定，保留／刪除模式都一樣）")
+        smart.setWordWrap(True)
+        smart.setStyleSheet(f"font-size:11px;color:{SUBTEXT};padding-top:4px;")
+        lay.addWidget(smart)
+        copy_cb = self._make_cb("copy_name")
+        copy_cb.setToolTip(
+            "同一組裡有「photo.png」和「photo (1).png」「photo - 複製.png」「Copy of photo.png」\n"
+            "「photo.png.dup1」「my+photo.png」「my%20photo.png」這類檔名時，保留原名那份，\n"
+            "像副本的優先移除。檔名之間沒有這種關係時算平手，交給下一個條件。")
+        lay.addWidget(copy_cb)
+
+        self._order_label = QLabel()
+        self._order_label.setWordWrap(True)
+        self._order_label.setStyleSheet(f"font-size:11px;color:{SUBTEXT};padding-top:2px;")
+        lay.addWidget(self._order_label)
+        self._update_order_label()
+
     def _make_cb(self, cond_id: str) -> QCheckBox:
         cb = QCheckBox(_COND_BY_ID[cond_id][1])
         cb.setStyleSheet(f"font-size:12px;color:{TEXT};min-width:78px;")
         cb.stateChanged.connect(lambda s, cid=cond_id: self._on_toggle(cid, s))
         self._checkboxes[cond_id] = cb
         return cb
+
+    def _update_order_label(self):
+        if self._checked_order:
+            steps = [f"{i}. {_COND_BY_ID[cid][1]}" for i, cid in enumerate(self._checked_order, 1)]
+            self._order_label.setText("優先序：" + " → ".join(steps))
+        else:
+            self._order_label.setText("優先序：（尚未勾選條件）")
 
     def _on_toggle(self, cond_id: str, state: int):
         checked = (state == Qt.CheckState.Checked.value)
@@ -1916,7 +1962,7 @@ class ConditionPanel(QWidget):
                 self._checked_order.remove(cond_id)
             if conflict and conflict in self._checkboxes:
                 self._checkboxes[conflict].setEnabled(True)
+        self._update_order_label()
 
     def get_active(self) -> list:
-        return [(cid, _COND_BY_ID[cid][2], _COND_BY_ID[cid][3])
-                for cid in self._checked_order]
+        return [_condition(cid) for cid in self._checked_order]

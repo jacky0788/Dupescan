@@ -446,3 +446,35 @@ def test_export_report_is_saved_and_escaped(qapp, window, tree, monkeypatch, iso
     assert "<strong>.dat</strong>" in page
     assert "R&amp;D" in page and "R&D<" not in page          # 路徑中的 & 有跳脫
     assert opened and opened[0].startswith("file:")
+
+
+# ── 智慧選取規則 ───────────────────────────────────────────────────────
+def selected_names(group):
+    return {fi.path.name for fi in group.files if fi.selected}
+
+
+def quick_action(window, group_row: int, text: str):
+    """右鍵選單「快速選取」子選單裡含 text 的動作（不實際彈出選單）。"""
+    menu = window.tree._context_menu(window.tree.topLevelItem(group_row))
+    quick = next(a.menu() for a in menu.actions() if a.menu() and "快速選取" in a.text())
+    return next(a for a in quick.actions() if text in a.text())
+
+
+def test_copy_name_rule_from_sidebar_and_context_menu(qapp, window, tree):
+    data = blob(4 * KB, 21)
+    for n in ("dl/photo.png", "dl/photo (1).png", "dl/photo - 複製.png"):
+        tree(n, data)
+    run_scan(qapp, window, tree.root)
+    g = window._all_groups[0]
+
+    window._global_cond._checkboxes["copy_name"].setChecked(True)
+    window._global_cond._checkboxes["sh_path"].setChecked(True)
+    assert "1. 像副本的檔名" in window._global_cond._order_label.text()
+    window._global_apply_conditions()
+    assert selected_names(g) == {"photo (1).png", "photo - 複製.png"}
+    assert "像副本的檔名優先移除 1" in window.status_bar.currentMessage()
+
+    window.tree.select_all(False)
+    quick_action(window, 0, "原始檔名").trigger()
+    assert selected_names(g) == {"photo (1).png", "photo - 複製.png"}
+    assert window.lbl_selected.text().startswith("已選 2")
