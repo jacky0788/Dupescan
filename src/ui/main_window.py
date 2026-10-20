@@ -34,6 +34,7 @@ from PyQt6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QMenu, QGraphicsDropShadowEffect,
 )
 
+from .. import file_ops
 from ..scanner import Scanner, ScanStats, STEP_NAMES, TOTAL_STEPS, _format_eta
 from ..models import DuplicateGroup, FileInfo
 from ..logger import logger
@@ -809,6 +810,10 @@ class MainWindow(QMainWindow):
         lay.addSpacing(10)
         lay.addWidget(sub)
         lay.addStretch()
+        history = QPushButton("↩  操作紀錄")
+        history.setToolTip("查看移除過的檔案；移到隔離資料夾的可以一鍵還原")
+        history.clicked.connect(self._show_history)
+        lay.addWidget(history)
         return w
 
     def _build_toolbar(self) -> QWidget:
@@ -921,7 +926,7 @@ class MainWindow(QMainWindow):
         self.btn_export.setEnabled(False)
         self.btn_export.setToolTip("分析重複檔案分布並匯出 HTML 報表（含圓餅圖）")
         self.btn_export.clicked.connect(self._export_report)
-        self.btn_delete = QPushButton("🗑  刪除已勾選")
+        self.btn_delete = QPushButton("🗑  移除已勾選")
         self.btn_delete.setObjectName("danger")
         self.btn_delete.setEnabled(False)
         self.btn_delete.clicked.connect(self._delete_selected)
@@ -1364,44 +1369,71 @@ class MainWindow(QMainWindow):
     def _update_selection_ui(self):
         n, b = self.tree.selected_stats()
         self.lbl_selected.setText(f"已選 {n}")
-        self.btn_delete.setText(f"🗑  刪除已勾選（{n}）" if n else "🗑  刪除已勾選")
+        self.btn_delete.setText(f"🗑  移除已勾選（{n}）" if n else "🗑  移除已勾選")
         self.btn_delete.setEnabled(n > 0)
 
     def _delete_selected(self):
-        to_delete: list[Path] = [
-            fi.path for g in self.tree._groups for fi in g.files if fi.selected]
+        """把勾選的檔案移到資源回收筒（放不進去的改移到隔離資料夾），不會永久刪除。"""
+        targets: list[FileInfo] = [
+            fi for g in self.tree._groups for fi in g.files if fi.selected]
 
-        if not to_delete:
-            QMessageBox.information(self, "提示", "請先勾選要刪除的檔案。"); return
+        if not targets:
+            QMessageBox.information(self, "提示", "請先勾選要移除的檔案。"); return
 
-        msg = f"確定要刪除以下 {len(to_delete)} 個檔案？\n\n"
-        msg += "\n".join(str(p) for p in to_delete[:20])
-        if len(to_delete) > 20:
-            msg += f"\n… 另外 {len(to_delete) - 20} 個檔案"
+        msg = (f"確定要把以下 {len(targets)} 個檔案移到資源回收筒？\n"
+               f"（可從資源回收筒還原；放不進回收筒的檔案會改移到隔離資料夾）\n\n")
+        msg += "\n".join(str(fi.path) for fi in targets[:20])
+        if len(targets) > 20:
+            msg += f"\n… 另外 {len(targets) - 20} 個檔案"
 
         reply = QMessageBox.question(
-            self, "確認刪除", msg,
+            self, "確認移除", msg,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply != QMessageBox.StandardButton.Yes: return
 
-        logger.info(f"開始刪除 {len(to_delete)} 個檔案")
-        success, fail = 0, 0
-        for p in to_delete:
-            try:
-                p.unlink()
-                logger.info(f"  刪除: {p}")
-                success += 1
-            except OSError as e:
-                logger.warning(f"  刪除失敗: {p}  原因: {e}")
-                fail += 1
-
-        logger.info(f"刪除完成 — 成功 {success} 個，失敗 {fail} 個")
-        QMessageBox.information(
-            self, "刪除完成",
-            f"成功刪除 {success} 個檔案" + (f"，失敗 {fail} 個" if fail else ""))
-        self.status_bar.showMessage(f"已刪除 {success} 個檔案")
+        logger.info(f"開始移除 {len(targets)} 個檔案（資源回收筒）")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            results = file_ops.remove_files(
+                [(fi.path, fi.size) for fi in targets], "recycle", hwnd=int(self.winId()))
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._report_removal(results)
         if not self._scanning:
             self._start_scan()
+
+    def _report_removal(self, results: list):
+        """記錄並顯示移除結果：回收筒／隔離區／失敗各幾個，以及改走隔離區與失敗的原因。"""
+        recycled = [r for r in results if r.ok and r.method == "recycle"]
+        moved    = [r for r in results if r.ok and r.method == "quarantine"]
+        failed   = [r for r in results if not r.ok]
+        for r in recycled:
+            logger.info(f"  移到資源回收筒: {r.path}")
+        for r in moved:
+            logger.info(f"  移到隔離資料夾: {r.path} → {r.dest}" + (f"（{r.note}）" if r.note else ""))
+        for r in failed:
+            logger.warning(f"  移除失敗: {r.path}  原因: {r.note}")
+        logger.info(f"移除完成 — 資源回收筒 {len(recycled)} 個、隔離資料夾 {len(moved)} 個、"
+                    f"失敗 {len(failed)} 個")
+
+        lines = [f"已移到資源回收筒：{len(recycled)} 個"]
+        if moved:
+            reasons = sorted({r.note for r in moved if r.note})
+            lines.append(f"已移到隔離資料夾：{len(moved)} 個"
+                         + (f"（{'、'.join(reasons)}）" if reasons else ""))
+            lines.append("隔離資料夾的檔案可從「操作紀錄」一鍵還原。")
+        if failed:
+            lines.append(f"\n沒有移除：{len(failed)} 個")
+            lines += [f"  {r.path}（{r.note}）" for r in failed[:10]]
+            if len(failed) > 10:
+                lines.append(f"  … 另外 {len(failed) - 10} 個（完整清單見 log）")
+        QMessageBox.information(self, "移除完成", "\n".join(lines))
+        self.status_bar.showMessage(
+            f"已移除 {len(recycled) + len(moved)} 個檔案" + (f"，{len(failed)} 個失敗" if failed else ""))
+
+    def _show_history(self):
+        from .history_dialog import HistoryDialog
+        HistoryDialog(self).exec()
 
     # ── 報表匯出 ──────────────────────────────────────────────────────
     def _make_pie_svg(self, slices: list, title: str = "") -> str:

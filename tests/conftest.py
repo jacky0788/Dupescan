@@ -10,6 +10,14 @@ sys.path.insert(0, str(ROOT))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
+@pytest.fixture(autouse=True, scope="session")
+def isolated_data_dir(tmp_path_factory):
+    """操作紀錄、快取等一律寫到暫存資料夾，不碰使用者的 %LOCALAPPDATA%\\DupeScan。"""
+    path = tmp_path_factory.mktemp("dupescan-data")
+    os.environ["DUPESCAN_DATA_DIR"] = str(path)
+    return path
+
+
 @pytest.fixture
 def tree(tmp_path):
     """建檔小幫手：tree("a/b.bin", data, mtime=...) 在 tmp_path 底下建立檔案並回傳路徑。"""
