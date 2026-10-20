@@ -1,5 +1,6 @@
 # 主視窗冒煙測試（offscreen）：實際跑一次掃描、檢查結果樹與勾選統計
 import pytest
+from PyQt6.QtCore import Qt
 
 from helpers import blob, wait_until
 
@@ -266,3 +267,71 @@ def test_partial_removal_keeps_group_and_view(qapp, window, tree, tmp_path, monk
     assert window.tree.topLevelItemCount() == 2
     assert window.tree.expanded_group_ids() == expanded_before
     assert window.lbl_groups.text() == "2 個群組"
+
+
+# ── 操作小改善 ─────────────────────────────────────────────────────────
+def three_groups(tree):
+    """可省空間：big 2×8 KB → 8 KB；many 4×3 KB → 9 KB；small 2×2 KB → 2 KB。"""
+    for i in range(2):
+        tree(f"big/b{i}.bin", blob(8 * KB, 1))
+    for i in range(4):
+        tree(f"many/m{i}.bin", blob(3 * KB, 2))
+    for i in range(2):
+        tree(f"small/s{i}.bin", blob(2 * KB, 3))
+
+
+def test_default_sort_is_by_wasted_space(qapp, window, tree):
+    three_groups(tree)
+    run_scan(qapp, window, tree.root)
+    order = [window.tree.topLevelItem(i).data(0, Qt.ItemDataRole.UserRole + 1).wasted_bytes
+             for i in range(window.tree.topLevelItemCount())]
+    assert order == [9 * KB, 8 * KB, 2 * KB]
+
+
+def test_font_size_change_does_not_rebuild(qapp, window, tree):
+    three_groups(tree)
+    run_scan(qapp, window, tree.root)
+    first = window.tree.topLevelItem(0)
+    window.font_size_spin.setValue(9)
+    qapp.processEvents()
+    small = window.tree.visualItemRect(first).height()
+    window.font_size_spin.setValue(18)
+    qapp.processEvents()
+    assert window.tree.topLevelItem(0) is first          # 沒有重建
+    assert window.tree.visualItemRect(first).height() > small
+
+
+def test_space_toggles_and_selected_label_shows_size(qapp, window, tree):
+    from PyQt6.QtTest import QTest
+    three_groups(tree)
+    run_scan(qapp, window, tree.root)
+    group_item = window.tree.topLevelItem(0)              # many：4 × 3 KB
+    group_item.setExpanded(True)
+    file_item = group_item.child(1)
+    window.tree.setCurrentItem(file_item)
+    QTest.keyClick(window.tree, Qt.Key.Key_Space)
+    assert file_item.data(0, Qt.ItemDataRole.UserRole + 1).selected
+    assert window.lbl_selected.text() == "已選 1・3.0 KiB"
+    window.tree.setCurrentItem(group_item)
+    QTest.keyClick(window.tree, Qt.Key.Key_Space)         # 群組列：整組切換
+    assert all(fi.selected for fi in group_item.data(0, Qt.ItemDataRole.UserRole + 1).files)
+
+
+def test_path_column_needs_ctrl_to_open_explorer(qapp, window, tree, monkeypatch):
+    from PyQt6.QtTest import QTest
+    three_groups(tree)
+    run_scan(qapp, window, tree.root)
+    located = []
+    monkeypatch.setattr(type(window.tree), "_locate", lambda self, fi: located.append(fi))
+    group_item = window.tree.topLevelItem(0)
+    group_item.setExpanded(True)
+    qapp.processEvents()
+    rect = window.tree.visualItemRect(group_item.child(0))
+    x = window.tree.header().sectionViewportPosition(1) + 20
+    pos = rect.center()
+    pos.setX(x)
+    QTest.mouseClick(window.tree.viewport(), Qt.MouseButton.LeftButton, pos=pos)
+    assert located == []                                  # 單擊不再開檔案總管
+    QTest.mouseClick(window.tree.viewport(), Qt.MouseButton.LeftButton,
+                     Qt.KeyboardModifier.ControlModifier, pos)
+    assert len(located) == 1

@@ -30,7 +30,7 @@ from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QProgressDialog,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QPushButton, QProgressBar, QScrollArea,
-    QSizePolicy, QSpinBox, QStatusBar, QVBoxLayout, QWidget,
+    QSizePolicy, QSpinBox, QStatusBar, QStyledItemDelegate, QVBoxLayout, QWidget,
     QTreeWidget, QTreeWidgetItem, QMenu, QGraphicsDropShadowEffect,
 )
 
@@ -206,6 +206,20 @@ _ROLE_POP  = Qt.ItemDataRole.UserRole + 2   # 群組是否已建立子列（lazy
 _COL_NAME, _COL_PATH, _COL_SIZE, _COL_TIME = 0, 1, 2, 3
 
 
+class _FontDelegate(QStyledItemDelegate):
+    """依樹的目前字級繪製每一列（群組列加粗、大 1px）：改字級只要重繪，不必重建所有列。"""
+
+    def __init__(self, tree: "DuplicateTree"):
+        super().__init__(tree)
+        self._tree = tree
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        is_group = not index.parent().isValid()
+        option.font.setPixelSize(self._tree._font_size + (1 if is_group else 0))
+        option.font.setBold(is_group)
+
+
 class DuplicateTree(QTreeWidget):
     """單一虛擬化樹狀結果檢視。
 
@@ -224,7 +238,7 @@ class DuplicateTree(QTreeWidget):
         self._guard = False   # 防止程式化 setCheckState 觸發的 itemChanged 遞迴
 
         self.setColumnCount(4)
-        self.setHeaderLabels(["名稱", "路徑（雙擊開啟・點擊定位）", "大小", "修改時間"])
+        self.setHeaderLabels(["名稱", "路徑（雙擊開啟・Ctrl＋點擊在檔案總管定位）", "大小", "修改時間"])
         self.setUniformRowHeights(True)
         self.setAlternatingRowColors(True)
         self.setRootIsDecorated(True)
@@ -232,7 +246,8 @@ class DuplicateTree(QTreeWidget):
         self.setIndentation(18)
         self.setAnimated(False)
         self.setFrameShape(QFrame.Shape.NoFrame)
-        self.setSelectionMode(QTreeWidget.SelectionMode.NoSelection)
+        self.setSelectionMode(QTreeWidget.SelectionMode.SingleSelection)   # 有目前列，鍵盤才能操作
+        self.setItemDelegate(_FontDelegate(self))
         self.setTextElideMode(Qt.TextElideMode.ElideMiddle)   # 長路徑從中間省略，保留結尾的資料夾名稱
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
@@ -272,8 +287,6 @@ class DuplicateTree(QTreeWidget):
         self.clear()
         self._groups = groups
         self.setUpdatesEnabled(False)
-        # 群組標題共用同一個 QFont（避免每列各配置一個，加速大量群組的建立）
-        gfont = QFont(); gfont.setPixelSize(self._font_size + 1); gfont.setBold(True)
         flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable
         show_indicator = QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator
 
@@ -286,7 +299,6 @@ class DuplicateTree(QTreeWidget):
             gi.setData(0, _ROLE_OBJ, g)
             gi.setText(_COL_NAME, self._group_caption(idx, g))
             gi.setFlags(flags)
-            gi.setFont(_COL_NAME, gfont)
             gi.setChildIndicatorPolicy(show_indicator)
             items.append(gi)
         self.addTopLevelItems(items)
@@ -340,11 +352,8 @@ class DuplicateTree(QTreeWidget):
         mt = datetime.datetime.fromtimestamp(fi.mtime).strftime("%Y-%m-%d %H:%M")
         item.setText(_COL_TIME, mt)
 
-        nf = QFont(); nf.setPixelSize(self._font_size)
-        item.setFont(_COL_NAME, nf)
-        item.setFont(_COL_PATH, nf)
         item.setToolTip(_COL_NAME, f"雙擊以預設程式開啟：{fi.path}")
-        item.setToolTip(_COL_PATH, f"點擊在檔案總管中定位：{fi.path}")
+        item.setToolTip(_COL_PATH, f"Ctrl＋點擊在檔案總管中定位：{fi.path}")
         if fi.aliases:
             # 硬連結：同一份資料的其他路徑，不列為重複（刪掉也不會省空間）
             note = (f"\n\n另有 {len(fi.aliases)} 條硬連結路徑指向同一份資料：\n"
@@ -451,8 +460,24 @@ class DuplicateTree(QTreeWidget):
 
     # ── 滑鼠互動 ──────────────────────────────────────────────────────
     def _on_clicked(self, item: QTreeWidgetItem, col: int):
-        if item.data(0, _ROLE_KIND) == "file" and col == _COL_PATH:
+        # 單擊路徑欄不再直接開檔案總管（容易誤觸）；按住 Ctrl 點擊才定位
+        ctrl = QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier
+        if item.data(0, _ROLE_KIND) == "file" and col == _COL_PATH and ctrl:
             self._locate(item.data(0, _ROLE_OBJ))
+
+    def keyPressEvent(self, event):
+        """空白鍵：切換目前這一列的勾選（檔案列切換自己，群組列切換整組）。"""
+        item = self.currentItem()
+        if event.key() == Qt.Key.Key_Space and item is not None:
+            if item.data(0, _ROLE_KIND) == "file":
+                fi = item.data(0, _ROLE_OBJ)
+                item.setCheckState(_COL_NAME, Qt.CheckState.Unchecked if fi.selected
+                                   else Qt.CheckState.Checked)
+            else:
+                g = item.data(0, _ROLE_OBJ)
+                self._toggle_group(item, g, not all(fi.selected for fi in g.files))
+            return
+        super().keyPressEvent(event)
 
     def _on_double_clicked(self, item: QTreeWidgetItem, col: int):
         if item.data(0, _ROLE_KIND) == "file":
@@ -468,7 +493,8 @@ class DuplicateTree(QTreeWidget):
 
     def _locate(self, fi: FileInfo):
         try:
-            subprocess.Popen(f'explorer /select,"{fi.path}"', shell=True)
+            # 不經過 shell：路徑中的 % 或 & 不會被 cmd 解讀
+            subprocess.Popen(f'explorer /select,"{fi.path}"')
             logger.info(f"在檔案總管定位: {fi.path}")
         except Exception as e:
             logger.warning(f"無法定位 {fi.path}: {e}")
@@ -554,8 +580,12 @@ class DuplicateTree(QTreeWidget):
 
     # ── 字體大小 ──────────────────────────────────────────────────────
     def set_font_size(self, size: int):
+        """改字級：由 _FontDelegate 套用，只需重新排版與重繪，不重建列。"""
         self._font_size = size
-        self.populate(self._groups)   # 重建以套用新字級（collapsed，成本低）
+        self.setUniformRowHeights(False)     # 讓 view 依新字級重新計算列高
+        self.setUniformRowHeights(True)
+        self.doItemsLayout()
+        self.viewport().update()
 
 
 # ── MainWindow（主視窗）──────────────────────────────────────────────────────
@@ -819,13 +849,17 @@ class MainWindow(QMainWindow):
         fb.addWidget(self._mini_label("副檔名篩選"))
         self.ext_filter_edit = QLineEdit()
         self.ext_filter_edit.setPlaceholderText("jpg, png…（留空＝全部）")
-        self.ext_filter_edit.textChanged.connect(self._apply_filter_sort)
+        # 打字時不要每個字都重建整棵樹（6 萬多個群組時每次要 1 秒以上）：停手 0.3 秒才套用
+        self._filter_timer = QTimer(self, singleShot=True, interval=300)
+        self._filter_timer.timeout.connect(self._apply_filter_sort)
+        self.ext_filter_edit.textChanged.connect(lambda _: self._filter_timer.start())
         fb.addWidget(self.ext_filter_edit)
 
         fb.addWidget(self._mini_label("排序方式"))
         self.sort_combo = QComboBox()
         self.sort_combo.addItems([
-            "群組大小（大→小）", "群組大小（小→大）",
+            "可省空間（大→小）", "可省空間（小→大）",
+            "單檔大小（大→小）", "單檔大小（小→大）",
             "檔案數量（多→少）", "檔案數量（少→多）",
             "副檔名 A→Z",        "副檔名 Z→A",
         ])
@@ -929,10 +963,7 @@ class MainWindow(QMainWindow):
 
     # ── 文字大小調整 ──────────────────────────────────────────────────
     def _apply_font_size(self, size: int):
-        if self._groups:
-            self.tree.set_font_size(size)
-        else:
-            self.tree._font_size = size
+        self.tree.set_font_size(size)
 
     # ── 篩選 / 排序 ───────────────────────────────────────────────────
     def _apply_filter_sort(self, keep_view: bool = False):
@@ -948,6 +979,8 @@ class MainWindow(QMainWindow):
             groups = list(self._all_groups)
 
         sort_opts = [
+            (lambda g: g.wasted_bytes, True),
+            (lambda g: g.wasted_bytes, False),
             (lambda g: g.size, True),
             (lambda g: g.size, False),
             (lambda g: len(g.files), True),
@@ -1223,7 +1256,7 @@ class MainWindow(QMainWindow):
     # ── 勾選統計 UI 更新 ──────────────────────────────────────────────
     def _update_selection_ui(self):
         n, b = self.tree.selected_stats()
-        self.lbl_selected.setText(f"已選 {n}")
+        self.lbl_selected.setText(f"已選 {n:,}・{human_size(b)}" if n else "已選 0")
         self.btn_delete.setText(f"🗑  移除已勾選（{n}）" if n else "🗑  移除已勾選")
         self.btn_delete.setEnabled(n > 0)
 
