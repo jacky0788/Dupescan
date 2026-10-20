@@ -607,3 +607,66 @@ def test_custom_rules_from_sidebar(qapp, window, tree, monkeypatch):
     window.tree.select_all(False)
     quick_action(window, 0, "依自訂規則").trigger()
     assert kept() == {"main"}
+
+
+def test_presets_save_apply_delete_and_persist(qapp, tmp_path, tree, monkeypatch):
+    from PyQt6.QtCore import QSettings
+    from PyQt6.QtWidgets import QMessageBox
+    from src.selection import RuleSet, load_presets
+    from src.ui import main_window
+    from src.ui.main_window import MainWindow
+    data = blob(4 * KB, 25)
+    for n in ("dl/photo.png", "dl/photo (1).png", "_trash/photo.png"):
+        tree(n, data)
+    kept = lambda w: {fi.path.relative_to(tree.root).as_posix()
+                      for fi in w._all_groups[0].files if not fi.selected}
+    names = iter(["整理下載", "整理下載", "只看資料夾"])
+    monkeypatch.setattr(main_window.QInputDialog, "getText", lambda *a, **k: (next(names), True))
+    answers = []
+    monkeypatch.setattr(main_window.QMessageBox, "question", lambda *a, **k: answers.pop(0))
+    ini = str(tmp_path / "presets.ini")
+    win = MainWindow(QSettings(ini, QSettings.Format.IniFormat))
+    panel = win._global_cond
+    assert not win.btn_preset_apply.isEnabled()              # 還沒有預設集
+
+    panel._checkboxes["copy_name"].setChecked(True)
+    panel._checkboxes["folders"].setChecked(True)
+    panel.remove_dirs_edit.setText("_trash")
+    win._save_preset()
+    assert list(win._presets) == ["整理下載"] and win.btn_preset_apply.isEnabled()
+    panel._checkboxes["sh_path"].setChecked(True)
+    answers.append(QMessageBox.StandardButton.No)            # 同名：問要不要取代，答「否」
+    win._save_preset()
+    assert win._presets["整理下載"].conditions == ["copy_name", "folders"]
+    win._load_rules(RuleSet(mode="delete", conditions=["folders"], remove_dirs=["_trash"]))
+    win._save_preset()
+    assert list(win._presets) == ["整理下載", "只看資料夾"]
+    assert win.preset_combo.currentText() == "只看資料夾"
+
+    # 打亂側邊列後一鍵套用：規則載回來並套用到所有群組
+    run_scan(qapp, win, tree.root)
+    win._load_rules(RuleSet())
+    win.preset_combo.setCurrentText("整理下載")
+    win._apply_preset()
+    assert panel._checked_order == ["copy_name", "folders"] and win._global_qs_mode == "keep"
+    assert panel.remove_dirs_edit.text() == "_trash"
+    assert kept(win) == {"dl/photo.png"}
+    assert "預設集「整理下載」" in win.status_bar.currentMessage()
+    win.close()
+
+    # 存在設定檔裡，重開還在；右鍵可以只套用到一個群組（用預設集自己的模式）
+    second = MainWindow(QSettings(ini, QSettings.Format.IniFormat))
+    assert list(second._presets) == ["整理下載", "只看資料夾"]
+    assert second.preset_combo.currentText() == "整理下載"
+    run_scan(qapp, second, tree.root)
+    menu = second.tree._context_menu(second.tree.topLevelItem(0))
+    sub = next(a.menu() for a in menu.actions() if a.menu() and "預設集" in a.text())
+    next(a for a in sub.actions() if a.text() == "只看資料夾").trigger()
+    assert kept(second) == {"dl/photo.png", "dl/photo (1).png"}     # 刪除模式：只勾 _trash 那份
+    second.preset_combo.setCurrentText("只看資料夾")
+    answers.append(QMessageBox.StandardButton.Yes)
+    second._delete_preset()
+    assert list(second._presets) == ["整理下載"]
+    second.close()
+    stored = QSettings(ini, QSettings.Format.IniFormat).value("select/presets", "", str)
+    assert list(load_presets(stored)) == ["整理下載"]

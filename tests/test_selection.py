@@ -6,7 +6,7 @@ import pytest
 from src.models import DuplicateGroup, FileInfo
 from src.selection import (
     CustomRule, FolderList, RuleSet, apply_selection, condition, copy_info, copy_scores,
-    folder_scores, parse_custom_rules, rank_by_conditions, split_dirs,
+    dump_presets, folder_scores, load_presets, parse_custom_rules, rank_by_conditions, split_dirs,
 )
 
 
@@ -297,3 +297,26 @@ def test_custom_rules_skip_lines_with_errors():
     apply_selection(g, rules.build(), "keep")
     assert paths_selected(g) == ["D:/_bak/a.bin"]
     assert condition("custom").keys(g.files) == [0, 0]          # 沒有規則 → 平手
+
+
+# ── 預設集 ─────────────────────────────────────────────────────────────────
+def test_rule_set_round_trip_and_tolerates_junk():
+    rules = RuleSet(mode="delete", conditions=["copy_name", "folders", "older"],
+                    keep_dirs=["D:\\Models"], remove_dirs=["_trash", "備份"],
+                    reference_dirs=["E:\\正本"], custom="# 註解\n- \\.dup\\d+$")
+    assert RuleSet.from_dict(rules.to_dict()) == rules
+    junk = {"mode": "wipe", "conditions": ["older", 3, "nope", "older"], "keep_dirs": "D:\\x",
+            "custom": None}
+    assert RuleSet.from_dict(junk) == RuleSet(conditions=["older"])
+    assert RuleSet.from_dict("not a dict") == RuleSet()
+
+
+def test_presets_round_trip_keep_order():
+    presets = {"模型整理": RuleSet(conditions=["folders"], remove_dirs=["_trash", "D:\\舊, 版本"]),
+               "下載資料夾": RuleSet(mode="delete", conditions=["copy_name", "sh_path"])}
+    loaded = load_presets(dump_presets(presets))
+    assert list(loaded) == ["模型整理", "下載資料夾"]
+    assert loaded == presets
+    assert load_presets("") == {} and load_presets("{oops") == {} and load_presets("[1]") == {}
+    text = '{"presets": [{"name": " "}, 5, {"name": " ok ", "conditions": ["newer"]}]}'
+    assert load_presets(text) == {"ok": RuleSet(conditions=["newer"])}

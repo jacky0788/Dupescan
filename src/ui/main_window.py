@@ -28,7 +28,7 @@ from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QObject, QEvent, QPoin
 from PyQt6.QtGui import QColor, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QProgressDialog,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
+    QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QPlainTextEdit, QPushButton, QProgressBar, QScrollArea,
     QSizePolicy, QSpinBox, QStatusBar, QStyledItemDelegate, QVBoxLayout, QWidget,
     QTreeWidget, QTreeWidgetItem, QMenu, QGraphicsDropShadowEffect,
@@ -53,6 +53,8 @@ from ..selection import (
     RuleSet,
     apply_selection as _apply_selection,
     condition as _condition,
+    dump_presets,
+    load_presets,
     split_dirs,
 )
 
@@ -286,8 +288,9 @@ class DuplicateTree(QTreeWidget):
         self._groups: list[DuplicateGroup] = []
         self._font_size = 13
         self._guard = False   # 防止程式化 setCheckState 觸發的 itemChanged 遞迴
-        # 右鍵選單要用的目前規則（側邊列的條件與資料夾設定），由主視窗指定
+        # 右鍵選單要用的目前規則（側邊列的條件與資料夾設定）與預設集，由主視窗指定
         self.rules_provider = RuleSet
+        self.presets_provider = dict
         self._reference = FolderList([])   # 參考資料夾：檔名後面標 📌
 
         self.setColumnCount(4)
@@ -622,11 +625,11 @@ class DuplicateTree(QTreeWidget):
         reference = rules.reference()
         quick = menu.addMenu("快速選取（保留…）")
 
-        def add_quick(parent: QMenu, text: str, conditions: list, mode: str = "keep"):
+        def add_quick(parent: QMenu, text: str, conditions: list, mode: str = "keep", ref=reference):
             act = parent.addAction(text)
             act.triggered.connect(
-                lambda _, gg=g, gi=group_item, c=conditions, m=mode:
-                    self._quick_group(gi, gg, c, m, reference))
+                lambda _, gg=g, gi=group_item, c=conditions, m=mode, r=ref:
+                    self._quick_group(gi, gg, c, m, r))
             return act
 
         for cid in ("newer", "older", "sh_path", "shallow", "lo_path"):
@@ -645,6 +648,14 @@ class DuplicateTree(QTreeWidget):
         blocked = "custom" in rules.conditions and bool(custom_errors)
         add_quick(menu, "套用側邊列的條件到此群組" + ("（自訂規則有錯誤）" if blocked else ""),
                   active, rules.mode).setEnabled(bool(active) and not blocked)
+        presets: dict[str, RuleSet] = self.presets_provider()
+        if presets:
+            sub = menu.addMenu("套用預設集到此群組")
+            for name, preset in presets.items():
+                conditions = preset.build()
+                broken = "custom" in preset.conditions and bool(preset.custom_rules()[1])
+                add_quick(sub, name, conditions, preset.mode, preset.reference()).setEnabled(
+                    bool(conditions) and not broken)
         menu.addSeparator()
         a_all = menu.addAction("勾選此群組全部")
         a_all.triggered.connect(lambda: self._toggle_group(group_item, g, True))
@@ -717,6 +728,7 @@ class MainWindow(QMainWindow):
         self._removal: tuple | None = None   # 背景移除中的 (thread, worker, 進度視窗)
 
         self._global_qs_mode: str  = "keep"
+        self._presets: dict[str, RuleSet] = {}         # 具名預設集（設定檔 select/presets）
         self._sidebar_open:   bool = True
         self._sb_filter_open: bool = True
         self._sb_qs_open:     bool = True
@@ -764,6 +776,7 @@ class MainWindow(QMainWindow):
 
         self.tree = DuplicateTree(self._preview_popup)
         self.tree.rules_provider = self._current_rules
+        self.tree.presets_provider = lambda: self._presets
         self.tree.checksChanged.connect(self._update_selection_ui)
         self.tree.setHeaderHidden(True)   # 初始無結果時隱藏表頭
         cl.addWidget(self.tree, 1)
@@ -1052,6 +1065,26 @@ class MainWindow(QMainWindow):
         qb.setContentsMargins(4, 2, 4, 4)
         qb.setSpacing(6)
 
+        qb.addWidget(self._mini_label("預設集（存好的規則組合）"))
+        self.preset_combo = QComboBox()
+        self.preset_combo.setPlaceholderText("（還沒有預設集）")
+        self.preset_combo.setToolTip("選好之後按「套用」：載入這組規則並套用到所有群組")
+        qb.addWidget(self.preset_combo)
+        pr = QHBoxLayout(); pr.setSpacing(6)
+        self.btn_preset_apply = QPushButton("套用")
+        self.btn_preset_apply.setToolTip("載入這組規則（操作模式、條件、資料夾、自訂規則）並套用到所有群組")
+        self.btn_preset_apply.clicked.connect(self._apply_preset)
+        self.btn_preset_save = QPushButton("另存…")
+        self.btn_preset_save.setToolTip("把目前的操作模式、條件與設定存成具名預設集")
+        self.btn_preset_save.clicked.connect(self._save_preset)
+        self.btn_preset_delete = QPushButton("刪除")
+        self.btn_preset_delete.setToolTip("刪除選取的預設集（只刪這組設定，不會動到任何檔案）")
+        self.btn_preset_delete.clicked.connect(self._delete_preset)
+        for b in (self.btn_preset_apply, self.btn_preset_save, self.btn_preset_delete):
+            b.setStyleSheet("padding:6px 4px;")
+            pr.addWidget(b)
+        qb.addLayout(pr)
+
         qb.addWidget(self._mini_label("操作模式"))
         gm = QHBoxLayout(); gm.setSpacing(6)
         self._g_btn_keep = QPushButton("保留目標")
@@ -1199,6 +1232,8 @@ class MainWindow(QMainWindow):
         self._global_cond.reference_edit.setText(st.value("select/reference_dirs", "", str))
         self._global_cond.custom_edit.setPlainText(st.value("select/custom_rules", "", str))
         self._sync_reference()
+        self._presets = load_presets(st.value("select/presets", "", str))
+        self._refresh_presets(st.value("select/preset", "", str))
         for cond_id in st.value("select/conditions", [], list) or []:
             cb = self._global_cond._checkboxes.get(cond_id)
             if cb is not None and cb.isEnabled():
@@ -1231,6 +1266,7 @@ class MainWindow(QMainWindow):
         st.setValue("select/remove_dirs", self._global_cond.remove_dirs_edit.text())
         st.setValue("select/reference_dirs", self._global_cond.reference_edit.text())
         st.setValue("select/custom_rules", self._global_cond.custom_edit.toPlainText())
+        st.setValue("select/preset", self.preset_combo.currentText())   # 預設集本身變動時就已存好
         st.setValue("ui/sidebar_open", self._sidebar_open)
         st.setValue("ui/scan_panel_open", self._sb_scan_open)
         st.setValue("ui/filter_panel_open", self._sb_filter_open)
@@ -1272,18 +1308,95 @@ class MainWindow(QMainWindow):
         return rules
 
     def _global_apply_conditions(self):
-        rules = self._current_rules()
+        message = self._apply_rules_to_all(self._current_rules())
+        if message:
+            self.status_bar.showMessage(message)
+
+    def _apply_rules_to_all(self, rules: RuleSet) -> str | None:
+        """套用到所有顯示中的群組，回傳狀態列訊息；沒有條件或自訂規則有誤時提示並回傳 None。"""
         conditions = rules.build()
         if not conditions:
             QMessageBox.information(self, "提示", "請先勾選至少一個條件。")
-            return
+            return None
         errors = rules.custom_rules()[1]
         if "custom" in rules.conditions and errors:
             # 有錯的行會被略過，套用到所有群組前先擋下，免得留下錯的那份
             QMessageBox.warning(self, "自訂規則有誤", "請先修正自訂規則：\n\n" + "\n".join(errors[:10]))
-            return
+            return None
         decided = self.tree.apply_conditions_all(conditions, rules.mode, rules.reference())
-        self.status_bar.showMessage(_describe_decisions(decided, conditions))
+        return _describe_decisions(decided, conditions)
+
+    # ── 預設集 ────────────────────────────────────────────────────────
+    def _load_rules(self, rules: RuleSet):
+        """把一組規則放進側邊列（操作模式＋條件面板）。"""
+        self._set_global_mode(rules.mode)
+        self._global_cond.set_rule_set(rules)
+        self._sync_reference()
+
+    def _apply_preset(self):
+        """一鍵套用：載入選取的預設集，有結果時直接套用到所有群組。"""
+        name = self.preset_combo.currentText()
+        rules = self._presets.get(name)
+        if rules is None:
+            return
+        self._load_rules(rules)
+        if not self.tree._groups or not rules.conditions:
+            self.status_bar.showMessage(f"已載入預設集「{name}」")
+            return
+        message = self._apply_rules_to_all(self._current_rules())
+        if message:
+            self.status_bar.showMessage(f"預設集「{name}」— {message}")
+
+    def _save_preset(self):
+        rules = self._current_rules()
+        errors = rules.custom_rules()[1]
+        if "custom" in rules.conditions and errors:
+            QMessageBox.warning(self, "自訂規則有誤", "請先修正自訂規則再儲存：\n\n" + "\n".join(errors[:10]))
+            return
+        name, ok = QInputDialog.getText(self, "另存預設集", "預設集名稱：",
+                                        text=self.preset_combo.currentText())
+        name = name.strip()
+        if not ok or not name:
+            return
+        if name in self._presets and QMessageBox.question(
+                self, "取代預設集", f"已經有「{name}」，要用目前的規則取代嗎？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self._presets[name] = rules
+        self._store_presets(select=name)
+        self.status_bar.showMessage(f"已儲存預設集「{name}」")
+
+    def _delete_preset(self):
+        name = self.preset_combo.currentText()
+        if name not in self._presets:
+            return
+        if QMessageBox.question(
+                self, "刪除預設集", f"要刪除預設集「{name}」嗎？\n（只刪除這組設定，不會動到任何檔案）",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        del self._presets[name]
+        self._store_presets()
+        self.status_bar.showMessage(f"已刪除預設集「{name}」")
+
+    def _store_presets(self, select: str | None = None):
+        """預設集一有變動就寫進設定檔（不等關閉視窗），並更新下拉選單。"""
+        self._settings.setValue("select/presets", dump_presets(self._presets))
+        self._settings.sync()
+        self._refresh_presets(select)
+
+    def _refresh_presets(self, select: str | None = None):
+        combo = self.preset_combo
+        current = select or combo.currentText()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(list(self._presets))
+        combo.setCurrentIndex(combo.findText(current) if current in self._presets
+                              else (0 if self._presets else -1))
+        combo.blockSignals(False)
+        self.btn_preset_apply.setEnabled(bool(self._presets))
+        self.btn_preset_delete.setEnabled(bool(self._presets))
 
     def _select_all(self):
         """「全部勾選」：參考資料夾裡的檔案不會被勾選。"""
@@ -2127,6 +2240,19 @@ class ConditionPanel(QWidget):
                        remove_dirs=split_dirs(self.remove_dirs_edit.text()),
                        reference_dirs=split_dirs(self.reference_edit.text()),
                        custom=self.custom_edit.toPlainText())
+
+    def set_rule_set(self, rules: RuleSet):
+        """載入一組規則（預設集）：清掉目前的勾選，填入設定欄位，再依優先序勾選條件。"""
+        for cid in reversed(list(self._checked_order)):
+            self._checkboxes[cid].setChecked(False)
+        self.keep_dirs_edit.setText("; ".join(rules.keep_dirs))
+        self.remove_dirs_edit.setText("; ".join(rules.remove_dirs))
+        self.reference_edit.setText("; ".join(rules.reference_dirs))
+        self.custom_edit.setPlainText(rules.custom)
+        for cid in rules.conditions:
+            cb = self._checkboxes.get(cid)
+            if cb is not None and cb.isEnabled():      # 互斥的條件以前面的為準
+                cb.setChecked(True)
 
     def get_active(self) -> list:
         return self.rule_set().build()

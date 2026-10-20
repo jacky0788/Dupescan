@@ -9,6 +9,7 @@
 # 條件可疊加：依優先序逐一比較，前面的條件平手才看下一個；全部平手時取列表第一
 # （群組內檔案已依路徑排序，結果每次一致）。
 
+import json
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -265,6 +266,51 @@ class RuleSet:
     def custom_rules(self) -> tuple[list[CustomRule], list[str]]:
         """(自訂規則, 錯誤訊息)，見 parse_custom_rules。"""
         return parse_custom_rules(self.custom)
+
+    def to_dict(self) -> dict:
+        """存成預設集用（可直接 json.dumps）。"""
+        return {"mode": self.mode, "conditions": list(self.conditions),
+                "keep_dirs": list(self.keep_dirs), "remove_dirs": list(self.remove_dirs),
+                "reference_dirs": list(self.reference_dirs), "custom": self.custom}
+
+    @classmethod
+    def from_dict(cls, data) -> "RuleSet":
+        """讀回預設集：缺少或型別不對的欄位用預設值，不認得的條件 id 略過（設定檔被改壞也不會出錯）。"""
+        if not isinstance(data, dict):
+            return cls()
+
+        def strings(key: str) -> list[str]:
+            value = data.get(key)
+            return [s for s in value if isinstance(s, str)] if isinstance(value, list) else []
+
+        custom = data.get("custom")
+        return cls(mode=data.get("mode") if data.get("mode") in ("keep", "delete") else "keep",
+                   conditions=[c for c in dict.fromkeys(strings("conditions")) if c in COND_BY_ID],
+                   keep_dirs=strings("keep_dirs"), remove_dirs=strings("remove_dirs"),
+                   reference_dirs=strings("reference_dirs"),
+                   custom=custom if isinstance(custom, str) else "")
+
+
+# ── 預設集 ───────────────────────────────────────────────────────────────
+# 具名的 RuleSet，依建立順序保存；UI 存在 QSettings 的 select/presets（一段 JSON 字串）。
+def dump_presets(presets: dict[str, RuleSet]) -> str:
+    items = [{"name": name, **rules.to_dict()} for name, rules in presets.items()]
+    return json.dumps({"version": 1, "presets": items}, ensure_ascii=False)
+
+
+def load_presets(text: str) -> dict[str, RuleSet]:
+    """dump_presets 的反向；內容壞掉時回傳空的（或略過壞掉的那幾筆），不拋例外。"""
+    try:
+        data = json.loads(text) if text else {}
+    except ValueError:
+        return {}
+    items = data.get("presets") if isinstance(data, dict) else None
+    presets: dict[str, RuleSet] = {}
+    for item in items if isinstance(items, list) else []:
+        name = item.get("name") if isinstance(item, dict) else None
+        if isinstance(name, str) and name.strip():
+            presets[name.strip()] = RuleSet.from_dict(item)
+    return presets
 
 
 # ── 套用條件 ─────────────────────────────────────────────────────────────
