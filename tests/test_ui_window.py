@@ -366,3 +366,13 @@ def test_menu_exports_and_reopens_results(qapp, win, dupes, tmp_path, monkeypatc
     assert win.stack.currentWidget() is win.results
     assert not any(fi.selected for fi in win.results.groups()[0].files)
     assert win.results.info.source == str(tmp_path / "saved.dupescan")
+
+
+def test_broken_last_results_shows_message(qapp, win):
+    scan_job.last_results_path().write_bytes(b"not a results file")
+    scan_job.save_last_summary(["D:/a"], "2026-10-21T10:00:00", 3, 1024)
+    win._refresh_home()
+    assert not win.home.last_box.isHidden()
+    win.home.open_last_requested.emit()
+    assert win.stack.currentWidget() is win.home and win.home.last_box.isHidden()
+    assert "無法開啟上次的結果" in win.toast.text.text()
