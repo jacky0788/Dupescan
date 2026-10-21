@@ -12,6 +12,7 @@
 import json
 import re
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Callable
 from urllib.parse import unquote_plus
@@ -386,3 +387,81 @@ def apply_selection(group: DuplicateGroup, conditions: list, mode: str,
     for i, fi in enumerate(files):
         fi.selected = (i != winner and not is_ref[i]) if mode == "keep" else (i == winner)
     return decided
+
+
+# ── 自動選取（v1.0 介面用）────────────────────────────────────────────────
+# 結果畫面每一組都要決定保留哪一份：依序套用下面的規則，前面的平手才看下一個；
+# 全部平手時保留第一份（群組內依路徑排序，每次一致）。保護的資料夾裡的檔案一律保留。
+FALLBACKS = {"oldest": ("older", "最舊的"), "newest": ("newer", "最新的"),
+             "shortest": ("sh_path", "路徑最短的")}
+
+REASONS = {
+    "reference": "在保護的資料夾",
+    "folders": "不在優先移除的資料夾",
+    "copy_name": "原始檔名",
+    "older": "最舊的",
+    "newer": "最新的",
+    "sh_path": "路徑最短",
+    None: "條件都相同，保留第一份",
+}
+
+
+@dataclass
+class AutoRules:
+    """自動選取規則：每一組要保留哪一份。"""
+    copy_names: bool = True                                   # 保留原始檔，移除「(1)」「- 複製」這類副本
+    protected_dirs: list[str] = field(default_factory=list)   # 保護的資料夾：裡面的檔案一律保留
+    remove_dirs: list[str] = field(default_factory=list)      # 優先移除這些資料夾裡的副本
+    fallback: str = "oldest"                                  # 其他情況保留：oldest／newest／shortest
+
+    def conditions(self) -> list[Condition]:
+        conds = []
+        if self.remove_dirs:
+            keep, remove = FolderList([]), FolderList(self.remove_dirs)
+            conds.append(Condition("folders", lambda files: folder_scores(files, keep, remove),
+                                   smart=True))
+        if self.copy_names:
+            conds.append(Condition("copy_name", copy_scores, smart=True))
+        conds.append(condition(FALLBACKS.get(self.fallback, FALLBACKS["oldest"])[0]))
+        return conds
+
+    def protected(self) -> FolderList:
+        return FolderList(self.protected_dirs)
+
+    def to_dict(self) -> dict:
+        return {"copy_names": self.copy_names, "protected_dirs": list(self.protected_dirs),
+                "remove_dirs": list(self.remove_dirs), "fallback": self.fallback}
+
+    @classmethod
+    def from_dict(cls, data) -> "AutoRules":
+        """讀回設定；缺少或型別不對的欄位用預設值（設定檔被改壞也不會出錯）。"""
+        if not isinstance(data, dict):
+            return cls()
+
+        def strings(key):
+            value = data.get(key)
+            return [s for s in value if isinstance(s, str) and s.strip()] if isinstance(value, list) else []
+
+        fallback = data.get("fallback")
+        return cls(copy_names=data.get("copy_names") is not False,
+                   protected_dirs=strings("protected_dirs"), remove_dirs=strings("remove_dirs"),
+                   fallback=fallback if fallback in FALLBACKS else "oldest")
+
+
+def auto_select(groups: list[DuplicateGroup], rules: AutoRules) -> Counter:
+    """依規則替每一組選好保留哪一份（其餘標記為移除），並把原因寫進 keep_reason。
+
+    回傳各原因的組數，例如 Counter({"原始檔名": 12, "最舊的": 30})。
+    """
+    conds = rules.conditions()
+    protected = rules.protected()
+    counts: Counter = Counter()
+    for g in groups:
+        decided = apply_selection(g, conds, "keep", protected)
+        g.keep_reason = REASONS.get(decided, REASONS[None])
+        counts[g.keep_reason] += 1
+    return counts
+
+
+def is_protected_file(fi: FileInfo, rules: AutoRules) -> bool:
+    return bool(rules.protected_dirs) and rules.protected().contains(fi.path)

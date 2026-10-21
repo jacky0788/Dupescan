@@ -320,3 +320,61 @@ def test_presets_round_trip_keep_order():
     assert load_presets("") == {} and load_presets("{oops") == {} and load_presets("[1]") == {}
     text = '{"presets": [{"name": " "}, 5, {"name": " ok ", "conditions": ["newer"]}]}'
     assert load_presets(text) == {"ok": RuleSet(conditions=["newer"])}
+
+
+# ── 自動選取（v1.0 介面）────────────────────────────────────────────────
+from src.selection import AutoRules, REASONS, auto_select, is_protected_file  # noqa: E402
+
+
+def kept(g):
+    return [fi.path.as_posix() for fi in g.files if not fi.selected]
+
+
+def grp(*paths, mtimes):
+    return group_of(*paths, mtimes=dict(zip(paths, mtimes)))
+
+
+def test_auto_select_keeps_original_name_then_oldest():
+    g1 = grp("D:/a/photo (1).jpg", "D:/b/photo.jpg", mtimes=[100, 200])
+    g2 = grp("D:/a/x.jpg", "D:/b/y.jpg", mtimes=[300, 100])
+    counts = auto_select([g1, g2], AutoRules())
+    assert kept(g1) == ["D:/b/photo.jpg"] and g1.keep_reason == REASONS["copy_name"]
+    assert kept(g2) == ["D:/b/y.jpg"] and g2.keep_reason == REASONS["older"]
+    assert counts == {REASONS["copy_name"]: 1, REASONS["older"]: 1}
+
+
+@pytest.mark.parametrize("fallback, winner", [
+    ("oldest", "D:/long/folder/b.jpg"), ("newest", "D:/c.jpg"), ("shortest", "D:/c.jpg")])
+def test_auto_select_fallbacks(fallback, winner):
+    g = grp("D:/long/folder/b.jpg", "D:/c.jpg", mtimes=[100, 200])
+    auto_select([g], AutoRules(copy_names=False, fallback=fallback))
+    assert kept(g) == [winner]
+
+
+def test_auto_select_remove_folders_come_first():
+    g = grp("D:/Downloads/photo.jpg", "D:/Pictures/photo (1).jpg", mtimes=[100, 200])
+    auto_select([g], AutoRules(remove_dirs=["Downloads"]))
+    assert kept(g) == ["D:/Pictures/photo (1).jpg"]
+    assert g.keep_reason == REASONS["folders"]
+
+
+def test_auto_select_protected_files_are_always_kept():
+    g = grp("D:/Archive/a.jpg", "D:/Archive/b.jpg", "D:/c.jpg", mtimes=[300, 200, 100])
+    rules = AutoRules(protected_dirs=["D:/Archive"])
+    auto_select([g], rules)
+    assert kept(g) == ["D:/Archive/a.jpg", "D:/Archive/b.jpg"]
+    assert is_protected_file(g.files[0], rules) and not is_protected_file(g.files[2], rules)
+
+
+def test_auto_select_tie_keeps_first():
+    g = grp("D:/a/x.jpg", "D:/b/x.jpg", mtimes=[100, 100])
+    auto_select([g], AutoRules(fallback="oldest"))
+    assert kept(g) == ["D:/a/x.jpg"] and g.keep_reason == REASONS[None]
+
+
+def test_auto_rules_round_trip_and_tolerates_junk():
+    rules = AutoRules(copy_names=False, protected_dirs=["D:/A"], remove_dirs=["_trash"], fallback="newest")
+    assert AutoRules.from_dict(rules.to_dict()) == rules
+    assert AutoRules.from_dict({"copy_names": "x", "protected_dirs": "D:/A", "remove_dirs": [1, "", "ok"],
+                                "fallback": "weird"}) == AutoRules(remove_dirs=["ok"])
+    assert AutoRules.from_dict(None) == AutoRules()

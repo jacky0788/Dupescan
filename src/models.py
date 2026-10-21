@@ -35,6 +35,7 @@ class DuplicateGroup:
     hash_value: str
     size:       int
     files:      list[FileInfo] = field(default_factory=list)
+    keep_reason: str = ""   # 為什麼保留目前這份（自動選取規則或「手動選擇」），只供顯示
 
     @property
     def wasted_bytes(self) -> int:

@@ -17,6 +17,7 @@ import hashlib
 import os
 import threading
 import time
+import traceback
 from collections import Counter, defaultdict, deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
@@ -30,6 +31,7 @@ except ImportError:
     # 未安裝 xxhash 時退回 hashlib.blake2b（Python 內建，較慢但不需額外安裝）
     _FAST_HASH = False
 
+from .formatting import format_eta as _format_eta, human_size as _format_bytes  # noqa: F401
 from .hash_cache import HashCache
 from .models import DuplicateGroup, FileInfo
 from .scan_options import ScanOptions
@@ -101,30 +103,6 @@ class ScanStats:
 
 class _Stopped(Exception):
     """使用者停止掃描時，用來從深層迴圈（含 worker 執行緒）直接跳出。"""
-
-
-def _format_eta(seconds: int) -> str:
-    """將秒數格式化為中文可讀時間字串，供進度列顯示。"""
-    if seconds < 0:
-        return "計算中..."
-    if seconds < 5:
-        return "即將完成"
-    if seconds < 60:
-        return f"約 {seconds} 秒"
-    m, s = divmod(seconds, 60)
-    if m < 60:
-        return f"約 {m} 分 {s} 秒" if s else f"約 {m} 分鐘"
-    h, m2 = divmod(m, 60)
-    return f"約 {h} 小時 {m2} 分"
-
-
-def _format_bytes(n: float) -> str:
-    """進度訊息用的簡短容量字串（不依賴 humanize）。"""
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024:
-            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
-        n /= 1024
-    return f"{n:.1f} TB"
 
 
 def _new_hasher():
@@ -261,6 +239,7 @@ class Scanner:
         self.cache          = cache
         self.workers_by_dev = workers_by_dev or {}
         self.stats          = ScanStats()
+        self.error_details  = ""     # 發生例外時的完整呼叫堆疊
 
         self._stop_event  = threading.Event()
         self._pause_event = threading.Event()
@@ -303,8 +282,9 @@ class Scanner:
         try:
             groups = self._run()
         except Exception as exc:
+            self.error_details = traceback.format_exc()     # 完整的呼叫堆疊（寫進 log 用）
             if self.on_error:
-                self.on_error(str(exc))
+                self.on_error(str(exc) or type(exc).__name__)
             return None
         if groups is None:
             if self.on_cancel:
@@ -363,7 +343,7 @@ class Scanner:
         if step == 3 and total_bytes > 0:
             with self._lock:
                 done_bytes = min(self._bytes_done, total_bytes)
-            msg = (f"{label}... ({done:,}/{total_files:,} 個檔案・"
+            msg = (f"{label}... ({done:,}/{total_files:,} 個檔案 · "
                    f"{_format_bytes(done_bytes)} / {_format_bytes(total_bytes)})")
             self._emit(msg, int(1000 * done_bytes / total_bytes), 1000, step,
                        self._eta(t0, done_bytes, total_bytes))

@@ -27,15 +27,18 @@ def export_csv(path, groups: list[DuplicateGroup]):
                             str(fi.path), fi.folder, fi.name, mtime, "; ".join(fi.aliases)])
 
 
-def save_results(path, groups: list[DuplicateGroup], roots: list[str], scanned_at: str = ""):
+def save_results(path, groups: list[DuplicateGroup], roots: list[str], scanned_at: str = "",
+                 scan: dict | None = None):
+    """scan：掃描設定與統計（可省略），讀回時放在 meta["scan"]。"""
     data = {
         "format": FORMAT_NAME,
         "version": FORMAT_VERSION,
         "saved_at": datetime.now().isoformat(timespec="seconds"),
         "scanned_at": scanned_at,
         "roots": roots,
+        "scan": scan or {},
         "groups": [
-            {"hash": g.hash_value, "size": g.size,
+            {"hash": g.hash_value, "size": g.size, "reason": g.keep_reason,
              "files": [{"path": str(fi.path), "mtime": fi.mtime, "mtime_ns": fi.mtime_ns,
                         "dev": fi.dev, "ino": fi.ino, "selected": fi.selected,
                         "aliases": fi.aliases} for fi in g.files]}
@@ -49,7 +52,7 @@ def save_results(path, groups: list[DuplicateGroup], roots: list[str], scanned_a
 
 
 def load_results(path) -> tuple[list[DuplicateGroup], dict]:
-    """讀回結果檔，回傳 (群組, {"saved_at", "scanned_at", "roots"})；格式不對時拋出 ValueError。"""
+    """讀回結果檔，回傳 (群組, {"saved_at", "scanned_at", "roots", "scan"})；格式不對時拋出 ValueError。"""
     try:
         with gzip.open(path, "rt", encoding="utf-8") as f:
             data = json.load(f)
@@ -60,13 +63,19 @@ def load_results(path) -> tuple[list[DuplicateGroup], dict]:
     if data.get("version", 0) > FORMAT_VERSION:
         raise ValueError("這個結果檔是較新版本的 DupeScan 存的，請先更新 DupeScan")
     groups = []
-    for g in data.get("groups", []):
-        files = [FileInfo(path=Path(f["path"]), size=g["size"], hash_full=g["hash"],
-                          mtime=f.get("mtime", 0.0), mtime_ns=f.get("mtime_ns", 0),
-                          dev=f.get("dev", 0), ino=f.get("ino", 0),
-                          selected=f.get("selected", False), aliases=f.get("aliases", []))
-                 for f in g["files"]]
-        if len(files) > 1:
-            groups.append(DuplicateGroup(hash_value=g["hash"], size=g["size"], files=files))
+    try:
+        for g in data.get("groups", []):
+            files = [FileInfo(path=Path(f["path"]), size=g["size"], hash_full=g["hash"],
+                              mtime=f.get("mtime", 0.0), mtime_ns=f.get("mtime_ns", 0),
+                              dev=f.get("dev", 0), ino=f.get("ino", 0),
+                              selected=f.get("selected", False), aliases=f.get("aliases", []))
+                     for f in g["files"]]
+            if len(files) > 1:
+                groups.append(DuplicateGroup(hash_value=g["hash"], size=g["size"], files=files,
+                                             keep_reason=str(g.get("reason") or "")))
+    except (KeyError, TypeError, AttributeError) as exc:
+        raise ValueError(f"結果檔內容不完整：{exc}") from exc
     meta = {k: data.get(k) for k in ("saved_at", "scanned_at", "roots")}
+    meta["roots"] = [r for r in meta["roots"] or [] if isinstance(r, str)]
+    meta["scan"] = data.get("scan") if isinstance(data.get("scan"), dict) else {}
     return groups, meta
