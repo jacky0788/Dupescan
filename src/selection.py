@@ -1,15 +1,13 @@
-# 快速選取規則：決定每個重複群組要「保留」哪一份、勾選哪些待移除。
-# 純邏輯、不依賴 Qt，UI（main_window）與測試共用。
+# 自動選取：每一組重複決定保留哪一份，其餘標成「移除」。純邏輯、不依賴 Qt。
 #
-#   基本條件 — 依單一檔案的屬性比較（修改時間、路徑長短、目錄深淺、字母序、列表順序）
-#   智慧規則 — 要看整個群組才能判斷（例如「像副本的檔名」要看群組裡有沒有原名那份）；
-#              方向固定：值越大越該移除，保留模式與刪除模式都一樣
-#   參考資料夾 — 裡面的檔案永遠不會被勾選（見 apply_selection）
+# 依序套用條件，前面的條件分不出來（平手）才看下一個；全部平手時保留第一份（群組內檔案依路徑
+# 排序，每次結果一致）。保護的資料夾裡的檔案一律保留：群組裡有保護的檔案時，「保留的那份」
+# 從它們之中選，其他副本照常判斷。
 #
-# 條件可疊加：依優先序逐一比較，前面的條件平手才看下一個；全部平手時取列表第一
-# （群組內檔案已依路徑排序，結果每次一致）。
+#   優先移除的資料夾 — 在這些資料夾裡的副本優先移除（清單越前面越優先）
+#   原始檔名         — 「photo (1).jpg」「photo - 複製.jpg」這類副本優先移除，保留原始檔名
+#   其他情況         — 保留最舊的／最新的／路徑最短的
 
-import json
 import re
 import unicodedata
 from collections import Counter
@@ -18,37 +16,6 @@ from typing import Callable
 from urllib.parse import unquote_plus
 
 from .models import DuplicateGroup, FileInfo
-
-# 每個 tuple：(id, 顯示標籤, 排序 key 函式, reverse=True 表示值越大越優先, 互斥條件 id)
-# 智慧規則的排序值由 condition() 依整個群組計算，key 與 reverse 填 None
-CONDITIONS_DEF = [
-    ("newer",    "修改較新", lambda fi: fi.mtime,             True,  "older"),
-    ("older",    "修改較舊", lambda fi: fi.mtime,             False, "newer"),
-    ("sh_path",  "路徑較短", lambda fi: len(str(fi.path)),    False, "lo_path"),
-    ("lo_path",  "路徑較長", lambda fi: len(str(fi.path)),    True,  "sh_path"),
-    ("shallow",  "目錄較淺", lambda fi: len(fi.path.parts),   False, "deep"),
-    ("deep",     "目錄較深", lambda fi: len(fi.path.parts),   True,  "shallow"),
-    ("al_first", "字母較前", lambda fi: str(fi.path).lower(), False, "al_last"),
-    ("al_last",  "字母較後", lambda fi: str(fi.path).lower(), True,  "al_first"),
-    ("list_1st", "列表第一", None,                             False, None),
-    ("copy_name", "像副本的檔名優先移除", None,               None,  None),
-    ("folders",   "資料夾優先序",         None,               None,  None),
-    ("custom",    "自訂規則（正規表示式）", None,             None,  None),
-]
-COND_BY_ID = {c[0]: c for c in CONDITIONS_DEF}
-
-
-@dataclass(frozen=True)
-class Condition:
-    """排序條件：keys(files) 算出群組內每個檔案的排序值。
-
-    基本條件：reverse=True 表示值越大越優先成為「目標」（保留模式＝保留它，刪除模式＝勾選它）。
-    智慧規則（smart=True）：值越大越該移除——保留模式取最小值，刪除模式取最大值。
-    """
-    id: str
-    keys: Callable[[list], list]
-    reverse: bool = False
-    smart: bool = False
 
 
 # ── 像副本的檔名 ───────────────────────────────────────────────────────────
@@ -163,183 +130,47 @@ class FolderList:
         return self.match_folder(_folder_of(path)) is not None
 
 
-def folder_scores(files: list[FileInfo], keep: FolderList, remove: FolderList) -> list[int]:
-    """每個檔案「該移除」的程度：在優先移除的資料夾為正、優先保留的為負、都不在為 0。
-
-    清單越前面的資料夾，分數的絕對值越大。同一個檔案兩邊都符合時，以比對到比較深（比較具體）
-    的那邊為準——「D:\\Models」優先保留、「_trash」優先移除，D:\\Models\\_trash 裡的檔案算優先
-    移除；一樣深時算優先保留。
-    """
+def remove_scores(files: list[FileInfo], remove: FolderList) -> list[int]:
+    """每個檔案「該移除」的程度：在優先移除的資料夾為正（清單越前面越大），不在為 0。"""
+    n = len(remove.patterns)
     scores = []
     for fi in files:
-        folder = _folder_of(fi.path)
-        k, r = keep.match_folder(folder), remove.match_folder(folder)
-        if r is not None and (k is None or r[0] > k[0]):
-            scores.append(len(remove.patterns) - r[1])
-        elif k is not None:
-            scores.append(-(len(keep.patterns) - k[1]))
-        else:
-            scores.append(0)
+        match = remove.match_folder(_folder_of(fi.path))
+        scores.append(n - match[1] if match else 0)
     return scores
 
 
-# ── 自訂規則 ─────────────────────────────────────────────────────────────
+# ── 條件 ─────────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
-class CustomRule:
-    """以正規表示式比對完整路徑（不分大小寫；資料夾分隔寫 / 或 \\\\ 都可以）。"""
-    action: str        # "+"＝優先保留、"-"＝優先移除
-    pattern: str
+class Condition:
+    """排序條件：keys(files) 算出群組內每個檔案的分數，分數越低越優先保留。"""
+    id: str
+    keys: Callable[[list[FileInfo]], list]
 
 
-def parse_custom_rules(text: str) -> tuple[list[CustomRule], list[str]]:
-    """每行一條：「- 樣式」符合的優先移除、「+ 樣式」符合的優先保留；空行與 # 開頭的行略過。
-
-    +／- 後面的空白會忽略（要比對開頭的空白請寫 \\s）。回傳 (規則, 錯誤訊息)，有錯的行不會出現在規則裡。
-    """
-    rules, errors = [], []
-    for no, line in enumerate(text.splitlines(), 1):
-        s = line.strip()
-        if not s or s.startswith("#"):
-            continue
-        action = {"+": "+", "＋": "+", "-": "-", "－": "-"}.get(s[0])
-        pattern = s[1:].strip()
-        if action is None:
-            errors.append(f"第 {no} 行：要以 +（優先保留）或 -（優先移除）開頭")
-            continue
-        if not pattern:
-            errors.append(f"第 {no} 行：+／- 後面要接正規表示式")
-            continue
-        try:
-            re.compile(pattern, re.IGNORECASE)
-        except re.error as exc:
-            errors.append(f"第 {no} 行：正規表示式有誤（{exc}）")
-            continue
-        rules.append(CustomRule(action, pattern))
-    return rules, errors
+_CONDITIONS: dict[str, Callable[[list[FileInfo]], list]] = {
+    "older":     lambda files: [fi.mtime for fi in files],
+    "newer":     lambda files: [-fi.mtime for fi in files],
+    "sh_path":   lambda files: [len(str(fi.path)) for fi in files],
+    "copy_name": copy_scores,
+}
 
 
-def _compile_custom(rules: list[CustomRule]) -> list[tuple[str, re.Pattern]]:
-    compiled = []
-    for r in rules:
-        try:
-            compiled.append((r.action, re.compile(r.pattern, re.IGNORECASE)))
-        except re.error:
-            pass                       # parse_custom_rules 已經擋下；這裡只是保險
-    return compiled
+def condition(cond_id: str) -> Condition:
+    """依 id 建立條件：older（保留最舊）、newer（最新）、sh_path（路徑最短）、copy_name（原始檔名）。"""
+    return Condition(cond_id, _CONDITIONS[cond_id])
 
 
-def custom_scores(files: list[FileInfo], compiled: list[tuple[str, re.Pattern]]) -> list[int]:
-    """每個檔案「該移除」的程度：由上往下第一條符合的規則決定——優先移除為正、優先保留為負，
-    越上面的規則分數絕對值越大；都不符合為 0。
-
-    路徑同時以原本的形式（D:\\a\\b.png）與 / 分隔的形式（D:/a/b.png）比對，任一個符合就算。
-    """
-    n = len(compiled)
-    scores = []
-    for fi in files:
-        native = str(fi.path)
-        slash = native.replace("\\", "/")
-        score = 0
-        for i, (action, rx) in enumerate(compiled):
-            if rx.search(native) or (slash != native and rx.search(slash)):
-                score = (n - i) if action == "-" else -(n - i)
-                break
-        scores.append(score)
-    return scores
+def folders_condition(remove_dirs: list[str]) -> Condition:
+    remove = FolderList(remove_dirs)
+    return Condition("folders", lambda files: remove_scores(files, remove))
 
 
-# ── 規則組合 ─────────────────────────────────────────────────────────────
-@dataclass
-class RuleSet:
-    """一組選取規則：操作模式、條件 id（依優先序）與智慧規則需要的設定。"""
-    mode: str = "keep"                                         # keep＝保留目標；delete＝刪除目標
-    conditions: list[str] = field(default_factory=list)
-    keep_dirs: list[str] = field(default_factory=list)         # 優先保留的資料夾（越前面越優先）
-    remove_dirs: list[str] = field(default_factory=list)       # 優先移除的資料夾（越前面越優先移除）
-    reference_dirs: list[str] = field(default_factory=list)    # 參考資料夾：裡面的檔案不會被勾選
-    custom: str = ""                                           # 自訂規則原文，每行一條（含註解）
+def pick_keeper(files: list[FileInfo], conditions: list[Condition],
+                candidates: list[int] | None = None) -> tuple[int | None, str | None]:
+    """回傳 (保留的檔案索引, 決定的條件 id)；全部平手時取候選中的第一個，決定者為 None。
 
-    def build(self) -> list[Condition]:
-        """依優先序建立排序條件（不認得的 id 略過）。"""
-        return [condition(cid, self) for cid in self.conditions if cid in COND_BY_ID]
-
-    def reference(self) -> FolderList:
-        return FolderList(self.reference_dirs)
-
-    def custom_rules(self) -> tuple[list[CustomRule], list[str]]:
-        """(自訂規則, 錯誤訊息)，見 parse_custom_rules。"""
-        return parse_custom_rules(self.custom)
-
-    def to_dict(self) -> dict:
-        """存成預設集用（可直接 json.dumps）。"""
-        return {"mode": self.mode, "conditions": list(self.conditions),
-                "keep_dirs": list(self.keep_dirs), "remove_dirs": list(self.remove_dirs),
-                "reference_dirs": list(self.reference_dirs), "custom": self.custom}
-
-    @classmethod
-    def from_dict(cls, data) -> "RuleSet":
-        """讀回預設集：缺少或型別不對的欄位用預設值，不認得的條件 id 略過（設定檔被改壞也不會出錯）。"""
-        if not isinstance(data, dict):
-            return cls()
-
-        def strings(key: str) -> list[str]:
-            value = data.get(key)
-            return [s for s in value if isinstance(s, str)] if isinstance(value, list) else []
-
-        custom = data.get("custom")
-        return cls(mode=data.get("mode") if data.get("mode") in ("keep", "delete") else "keep",
-                   conditions=[c for c in dict.fromkeys(strings("conditions")) if c in COND_BY_ID],
-                   keep_dirs=strings("keep_dirs"), remove_dirs=strings("remove_dirs"),
-                   reference_dirs=strings("reference_dirs"),
-                   custom=custom if isinstance(custom, str) else "")
-
-
-# ── 預設集 ───────────────────────────────────────────────────────────────
-# 具名的 RuleSet，依建立順序保存；UI 存在 QSettings 的 select/presets（一段 JSON 字串）。
-def dump_presets(presets: dict[str, RuleSet]) -> str:
-    items = [{"name": name, **rules.to_dict()} for name, rules in presets.items()]
-    return json.dumps({"version": 1, "presets": items}, ensure_ascii=False)
-
-
-def load_presets(text: str) -> dict[str, RuleSet]:
-    """dump_presets 的反向；內容壞掉時回傳空的（或略過壞掉的那幾筆），不拋例外。"""
-    try:
-        data = json.loads(text) if text else {}
-    except (TypeError, ValueError):
-        return {}
-    items = data.get("presets") if isinstance(data, dict) else None
-    presets: dict[str, RuleSet] = {}
-    for item in items if isinstance(items, list) else []:
-        name = item.get("name") if isinstance(item, dict) else None
-        if isinstance(name, str) and name.strip():
-            presets[name.strip()] = RuleSet.from_dict(item)
-    return presets
-
-
-# ── 套用條件 ─────────────────────────────────────────────────────────────
-def condition(cond_id: str, rules: RuleSet | None = None) -> Condition:
-    """依 id 建立排序條件；智慧規則需要的設定（資料夾清單等）從 rules 取。"""
-    if cond_id == "copy_name":
-        return Condition(cond_id, copy_scores, smart=True)
-    if cond_id == "folders":
-        rules = rules or RuleSet()
-        keep, remove = FolderList(rules.keep_dirs), FolderList(rules.remove_dirs)
-        return Condition(cond_id, lambda files: folder_scores(files, keep, remove), smart=True)
-    if cond_id == "custom":
-        compiled = _compile_custom((rules or RuleSet()).custom_rules()[0])
-        return Condition(cond_id, lambda files: custom_scores(files, compiled), smart=True)
-    _, _, key_fn, rev, _ = COND_BY_ID[cond_id]
-    if key_fn is None:                          # 列表第一：維持群組內原本的順序
-        return Condition(cond_id, lambda files: list(range(len(files))))
-    return Condition(cond_id, lambda files: [key_fn(fi) for fi in files], rev)
-
-
-def _rank(files: list, conditions: list, mode: str,
-          candidates: list[int] | None) -> tuple[int | None, str | None]:
-    """依優先序逐一比較，回傳 (勝出索引, 決定勝負的條件 id)。
-
-    每個條件只留下最好的那幾個候選，平手才交給下一個條件；全部平手時取候選中的第一個，
-    此時決定者為 None。等同以倒序套用條件的多鍵穩定排序。
+    每個條件只留下分數最低的那幾個候選，平手才交給下一個條件。
     """
     best = list(range(len(files))) if candidates is None else list(candidates)
     if not best:
@@ -349,54 +180,36 @@ def _rank(files: list, conditions: list, mode: str,
         if len(best) == 1:
             break
         keys = cond.keys(files)
-        prefer_max = (mode == "delete") if cond.smart else cond.reverse
-        target = (max if prefer_max else min)(keys[i] for i in best)
-        best = [i for i in best if keys[i] == target]
+        low = min(keys[i] for i in best)
+        best = [i for i in best if keys[i] == low]
         if len(best) == 1:
             decided = cond.id
     return best[0], decided
 
 
-def rank_by_conditions(files: list, conditions: list, mode: str = "keep",
-                       candidates: list[int] | None = None) -> int | None:
-    """回傳「勝出」（成為目標）的檔案索引；candidates 限定只從這些索引裡選。"""
-    return _rank(files, conditions, mode, candidates)[0]
+def apply_selection(group: DuplicateGroup, conditions: list[Condition],
+                    protected: FolderList | None = None) -> str | None:
+    """選出保留的那份，其他標成移除（FileInfo.selected）；保護的資料夾裡的檔案一律保留。
 
-
-def apply_selection(group: DuplicateGroup, conditions: list, mode: str,
-                    reference: FolderList | None = None) -> str | None:
-    """依條件找出勝出檔案，更新群組內各檔案的 selected 旗標。
-
-    mode='keep'   → 保留勝出者（勝出者不勾選，其餘勾選待刪）
-    mode='delete' → 刪除勝出者（只勾選勝出者）
-    reference：參考資料夾，裡面的檔案永遠不會被勾選。保留模式下，群組裡有參考資料夾的檔案時，
-      保留的那份從它們之中選（其他副本照常勾選）；刪除模式下只從參考資料夾以外的檔案挑目標。
-    回傳決定勝負的條件 id；"reference"＝由參考資料夾決定；None＝條件都平手、取列表第一。
+    回傳決定的條件 id；"protected"＝由保護的資料夾決定；None＝條件都平手、保留第一份。
     """
     files = group.files
-    is_ref = [bool(reference) and reference.contains(fi.path) for fi in files]
-    if not any(is_ref):
-        candidates = None
-    elif mode == "keep":
-        candidates = [i for i, r in enumerate(is_ref) if r]
-    else:
-        candidates = [i for i, r in enumerate(is_ref) if not r]
-    winner, decided = _rank(files, conditions, mode, candidates)
-    if candidates is not None and len(candidates) <= 1:
-        decided = "reference"
+    is_protected = [bool(protected) and protected.contains(fi.path) for fi in files]
+    candidates = [i for i, p in enumerate(is_protected) if p] if any(is_protected) else None
+    winner, decided = pick_keeper(files, conditions, candidates)
+    if candidates is not None and len(candidates) == 1:
+        decided = "protected"
     for i, fi in enumerate(files):
-        fi.selected = (i != winner and not is_ref[i]) if mode == "keep" else (i == winner)
+        fi.selected = i != winner and not is_protected[i]
     return decided
 
 
-# ── 自動選取（v1.0 介面用）────────────────────────────────────────────────
-# 結果畫面每一組都要決定保留哪一份：依序套用下面的規則，前面的平手才看下一個；
-# 全部平手時保留第一份（群組內依路徑排序，每次一致）。保護的資料夾裡的檔案一律保留。
+# ── 自動選取規則 ─────────────────────────────────────────────────────────
 FALLBACKS = {"oldest": ("older", "最舊的"), "newest": ("newer", "最新的"),
              "shortest": ("sh_path", "路徑最短的")}
 
 REASONS = {
-    "reference": "在保護的資料夾",
+    "protected": "在保護的資料夾",
     "folders": "不在優先移除的資料夾",
     "copy_name": "原始檔名",
     "older": "最舊的",
@@ -417,11 +230,9 @@ class AutoRules:
     def conditions(self) -> list[Condition]:
         conds = []
         if self.remove_dirs:
-            keep, remove = FolderList([]), FolderList(self.remove_dirs)
-            conds.append(Condition("folders", lambda files: folder_scores(files, keep, remove),
-                                   smart=True))
+            conds.append(folders_condition(self.remove_dirs))
         if self.copy_names:
-            conds.append(Condition("copy_name", copy_scores, smart=True))
+            conds.append(condition("copy_name"))
         conds.append(condition(FALLBACKS.get(self.fallback, FALLBACKS["oldest"])[0]))
         return conds
 
@@ -457,7 +268,7 @@ def auto_select(groups: list[DuplicateGroup], rules: AutoRules) -> Counter:
     protected = rules.protected()
     counts: Counter = Counter()
     for g in groups:
-        decided = apply_selection(g, conds, "keep", protected)
+        decided = apply_selection(g, conds, protected)
         g.keep_reason = REASONS.get(decided, REASONS[None])
         counts[g.keep_reason] += 1
     return counts

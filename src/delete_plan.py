@@ -1,14 +1,13 @@
-# 移除前的檢查：依使用者的勾選建立「移除計畫」，在真正動檔案之前找出危險或過時的項目。
+# 移除前的檢查：依標成「移除」的檔案建立「移除計畫」，在真正動檔案之前找出危險或過時的項目。
 #
-#   整組全選      — 群組裡每一份都被勾選，移除後一份都不剩 → 預設不移除，需另外確認
-#   受保護資料夾  — Windows、Program Files、AppData、.git、Ollama 模型 blobs 等由程式
-#                   管理的位置，刪了可能讓程式壞掉 → 預設不移除，需另外確認
-#   參考資料夾    — 使用者指定的正本所在（規則不會勾選裡面的檔案）；手動勾了也視同受保護
-#                   → 預設不移除，需另外確認
-#   掃描後有變動  — 檔案已不存在、大小或修改時間變了、開頭內容和保留的那份不同 → 一律略過
+#   整組都標成移除 — 移除後一份都不剩 → 不處理這一組
+#   系統或程式資料夾 — Windows、Program Files、AppData、.git、Ollama 模型 blobs 等由程式
+#                     管理的位置，刪了可能讓程式壞掉 → 預設不移除，需另外確認
+#   保護的資料夾   — 使用者指定的正本所在（自動選取不會標成移除）；萬一標了也視同受保護
+#   掃描後有變動   — 檔案已不存在、大小或修改時間變了、開頭內容和保留的那份不同 → 一律略過
 #   保留的那份不見了 — 該群組沒有任何一份「確定還在且沒變」的副本 → 該群組一律略過
 #
-# 純邏輯、不依賴 Qt，UI（delete_dialog）與測試共用。
+# 純邏輯、不依賴 Qt，移除確認視窗與測試共用。
 
 import fnmatch
 import os
@@ -19,8 +18,8 @@ from .models import DuplicateGroup, FileInfo
 from .selection import FolderList
 
 HEAD_BYTES = 4096   # 快速複驗時比對的開頭長度
-PROTECTED_NOTE = "位於受保護資料夾"
-REFERENCE_NOTE = "位於參考資料夾"
+PROTECTED_NOTE = "在系統或程式資料夾"
+REFERENCE_NOTE = "在保護的資料夾"
 
 # 受保護資料夾（fnmatch 樣式，比對完整路徑，不分大小寫，/ 與 \ 視為相同）
 DEFAULT_PROTECTED = [
@@ -112,7 +111,7 @@ def build_plan(groups: list[tuple[int, DuplicateGroup]], protected=None,
                verify_head: bool = True, reference_dirs: list[str] | None = None) -> DeletePlan:
     """依勾選狀態建立移除計畫。groups 為 (顯示編號, 群組)，只會處理有勾選檔案的群組。
 
-    reference_dirs：參考資料夾（寫法同選取規則，完整路徑或名稱片段），裡面的檔案視同受保護。
+    reference_dirs：保護的資料夾（寫法同選取規則，完整路徑或名稱片段），裡面的檔案視同受保護。
     """
     ref_dirs = FolderList(reference_dirs or [])
     plan = DeletePlan(groups=[])

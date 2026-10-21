@@ -63,7 +63,7 @@ def test_protected_file_shows_protected_and_cannot_be_removed(page):
     model = page.model
     g = next(g for g in model.groups if g.files[0].name == "r.pdf")
     backup = g.files[1]
-    assert model.state(backup) == "protected" and model.note(g, backup) == REASONS["reference"]
+    assert model.state(backup) == "protected" and model.note(g, backup) == REASONS["protected"]
     messages = []
     page.message.connect(lambda text, kind: messages.append(text))
     page._toggle(backup, g)

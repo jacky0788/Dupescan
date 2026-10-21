@@ -9,16 +9,8 @@ from PyQt6.QtWidgets import (
 )
 
 from .. import file_ops
+from ..formatting import human_size
 from ..logger import logger
-
-
-def _size(n: int) -> str:
-    f = float(n)
-    for unit in ("B", "KB", "MB", "GB"):
-        if f < 1024:
-            return f"{f:.0f} {unit}" if unit == "B" else f"{f:.1f} {unit}"
-        f /= 1024
-    return f"{f:.1f} TB"
 
 
 class HistoryDialog(QDialog):
@@ -81,7 +73,7 @@ class HistoryDialog(QDialog):
                 "全部已還原" if total and restored == total else f"{restored}/{total} 已還原")
             cells = [e.get("time", "").replace("T", " "), str(e.get("recycled", 0)),
                      str(e.get("quarantined", 0)), str(e.get("failed", 0)),
-                     _size(e.get("bytes", 0)), status]
+                     human_size(e.get("bytes", 0)), status]
             for c, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 if c:

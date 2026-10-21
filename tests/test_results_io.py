@@ -6,7 +6,6 @@ import pytest
 
 from helpers import blob, make_scanner
 from src.results_io import export_csv, load_results, save_results
-from src.scanner import Scanner
 
 KB = 1024
 
@@ -51,5 +50,5 @@ def test_export_csv(tree, tmp_path):
     path = tmp_path / "r.csv"
     export_csv(path, groups)
     rows = list(csv.reader(open(path, encoding="utf-8-sig")))
-    assert rows[0][0] == "群組" and len(rows) == 4
-    assert sum(1 for r in rows[1:] if r[4] == "是") == 1
+    assert rows[0][:2] == ["群組", "處理"] and len(rows) == 4
+    assert [r[1] for r in rows[1:]].count("移除") == 1

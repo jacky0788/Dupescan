@@ -313,3 +313,56 @@ def test_remove_dialog_protected_files_need_confirmation(qapp, tree, monkeypatch
     assert len(dialog.selected()) == 2 and "2 個" in dialog.ok_button.text()
     dialog._toggle_list()
     assert dialog.tree.topLevelItemCount() == 1
+
+
+def test_scan_without_duplicates_shows_empty_state(qapp, win, tree):
+    tree("a.bin", blob(200 * KB, 1))
+    tree("b.bin", blob(200 * KB, 2))
+    scan(qapp, win, tree.root)
+    assert win.results.body.currentIndex() == 1 and win.results.bottom.isHidden()
+    assert "2 個檔案" in win.results.empty_text.text()
+
+
+def test_drop_folders_onto_folder_list(qapp, win, tree):
+    from PyQt6.QtCore import QMimeData, QPointF, Qt, QUrl
+    from PyQt6.QtGui import QDropEvent
+    (tree.root / "x").mkdir()
+    file_path = tree("y.bin", b"1")
+    mime = QMimeData()
+    mime.setUrls([QUrl.fromLocalFile(str(tree.root / "x")), QUrl.fromLocalFile(str(file_path))])
+    messages = []
+    win.home.folders.message.connect(messages.append)
+    event = QDropEvent(QPointF(5, 5), Qt.DropAction.CopyAction, mime, Qt.MouseButton.LeftButton,
+                       Qt.KeyboardModifier.NoModifier)
+    win.home.folders.dropEvent(event)
+    assert win.home.folders.paths() == [str(tree.root / "x")]
+    assert messages and "只能加入資料夾" in messages[-1]
+
+
+def test_menu_exports_and_reopens_results(qapp, win, dupes, tmp_path, monkeypatch):
+    import webbrowser
+    from PyQt6.QtWidgets import QFileDialog
+    scan(qapp, win, dupes)
+    win._update_menu()
+    assert win.act_save.isEnabled() and win.act_csv.isEnabled() and win.act_report.isEnabled()
+    opened = []
+    monkeypatch.setattr(webbrowser, "open", lambda url: opened.append(url))
+    win._export_report()
+    assert opened and opened[0].startswith("file:")
+    monkeypatch.setattr(QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: (str(tmp_path / "out.csv"), "")))
+    win._export_csv()
+    assert (tmp_path / "out.csv").exists()
+    monkeypatch.setattr(QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: (str(tmp_path / "saved.dupescan"), "")))
+    g = win.results.groups()[0]
+    win.results.model.keep_all(g)
+    win._save_results_file()
+    assert (tmp_path / "saved.dupescan").exists()
+    win.results.home_requested.emit()
+    monkeypatch.setattr(QFileDialog, "getOpenFileName",
+                        staticmethod(lambda *a, **k: (str(tmp_path / "saved.dupescan"), "")))
+    win._open_results_file()
+    assert win.stack.currentWidget() is win.results
+    assert not any(fi.selected for fi in win.results.groups()[0].files)
+    assert win.results.info.source == str(tmp_path / "saved.dupescan")

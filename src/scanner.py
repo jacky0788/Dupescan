@@ -31,7 +31,7 @@ except ImportError:
     # 未安裝 xxhash 時退回 hashlib.blake2b（Python 內建，較慢但不需額外安裝）
     _FAST_HASH = False
 
-from .formatting import format_eta as _format_eta, human_size as _format_bytes  # noqa: F401
+from .formatting import human_size
 from .hash_cache import HashCache
 from .models import DuplicateGroup, FileInfo
 from .scan_options import ScanOptions
@@ -344,7 +344,7 @@ class Scanner:
             with self._lock:
                 done_bytes = min(self._bytes_done, total_bytes)
             msg = (f"{label}... ({done:,}/{total_files:,} 個檔案 · "
-                   f"{_format_bytes(done_bytes)} / {_format_bytes(total_bytes)})")
+                   f"{human_size(done_bytes)} / {human_size(total_bytes)})")
             self._emit(msg, int(1000 * done_bytes / total_bytes), 1000, step,
                        self._eta(t0, done_bytes, total_bytes))
         else:

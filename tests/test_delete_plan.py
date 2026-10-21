@@ -6,7 +6,6 @@ from helpers import blob, make_scanner
 from src.delete_plan import (
     KEEP, OK, PROTECTED, PROTECTED_NOTE, REFERENCE_NOTE, SKIP, build_plan, is_protected,
 )
-from src.scanner import Scanner
 
 KB = 1024
 

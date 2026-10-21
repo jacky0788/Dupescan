@@ -19,7 +19,7 @@ from .. import __version__, hash_cache, scan_job
 from ..app_paths import data_dir
 from ..delete_plan import build_plan
 from ..formatting import human_size
-from ..logger import LOG_DIR, logger
+from ..logger import log_dir, logger
 from ..report import save_report
 from ..results_io import RESULT_SUFFIX, export_csv, load_results, save_results
 from ..scan_options import ScanOptions
@@ -106,7 +106,7 @@ class AppWindow(QMainWindow):
         self.act_csv = self.menu.addAction("匯出 CSV…", self._export_csv)
         self.menu.addSeparator()
         self.menu.addAction("設定…", self._show_settings)
-        self.menu.addAction("開啟 log 資料夾", lambda: self._open_folder(LOG_DIR))
+        self.menu.addAction("開啟 log 資料夾", lambda: self._open_folder(log_dir()))
         self.menu.addAction("關於 DupeScan", lambda: about(self))
         self.menu_button.setMenu(self.menu)
         lay.addWidget(self.menu_button)
@@ -471,7 +471,7 @@ class AppWindow(QMainWindow):
     def _show_settings(self):
         dialog = SettingsDialog(self.settings, hash_cache.cache_size(), self.controller.busy, self)
         dialog.data_button.clicked.connect(lambda: self._open_folder(data_dir()))
-        dialog.log_button.clicked.connect(lambda: self._open_folder(LOG_DIR))
+        dialog.log_button.clicked.connect(lambda: self._open_folder(log_dir()))
         accepted = dialog.exec() == SettingsDialog.DialogCode.Accepted
         text_size, method, full_verify = dialog.values()
         clear = dialog.cache_cleared

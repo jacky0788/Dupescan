@@ -35,7 +35,7 @@ if errorlevel 1 goto pip_failed
 copy /y requirements.txt "%STAMP%" >nul
 
 :check
-"%PY%" -c "import PyQt6.QtWidgets, xxhash, humanize" >nul 2>&1
+"%PY%" -c "import PyQt6.QtWidgets, xxhash" >nul 2>&1
 if not errorlevel 1 goto launch
 :: 套件壞掉或被刪除：重新安裝一次
 echo [2/3] 相依套件不完整，重新安裝...

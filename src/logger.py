@@ -3,12 +3,19 @@
 # 單純 import 不會建立檔案，測試或其他程式引用掃描引擎時不會在 logs/ 留下空檔。
 
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 
-# log 檔放在專案根目錄的 logs/ 子目錄（已加入 .gitignore）
-LOG_DIR = Path(__file__).parent.parent / "logs"
+# log 檔放在專案根目錄的 logs/ 子目錄（已加入 .gitignore）；測試用環境變數 DUPESCAN_LOG_DIR 改到別處
+_DEFAULT_LOG_DIR = Path(__file__).parent.parent / "logs"
 KEEP_LOGS = 30   # 只保留最近幾份 log（每次啟動一份）
+
+
+def log_dir() -> Path:
+    """log 與當機紀錄的資料夾。"""
+    override = os.environ.get("DUPESCAN_LOG_DIR")
+    return Path(override) if override else _DEFAULT_LOG_DIR
 
 # 模組層級單例，其他模組直接 from src.logger import logger 使用；
 # 尚未 setup_logging() 前只掛 NullHandler，訊息直接丟棄
@@ -18,15 +25,16 @@ logger.addHandler(logging.NullHandler())
 logger.log_file = ""   # type: ignore[attr-defined]
 
 
-def setup_logging(log_dir: Path = LOG_DIR) -> str:
+def setup_logging(folder: Path | None = None) -> str:
     """建立本次執行的 log 檔並掛上 handler，回傳 log 檔路徑；重複呼叫不會重複建立。"""
     if logger.log_file:   # type: ignore[attr-defined]
         return logger.log_file   # type: ignore[attr-defined]
-    log_dir.mkdir(exist_ok=True)
+    folder = folder or log_dir()
+    folder.mkdir(parents=True, exist_ok=True)
 
     # 用啟動時間戳記產生不重複的檔名，方便事後追查特定執行紀錄
     stamp    = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = log_dir / f"dupescan_{stamp}.log"
+    log_file = folder / f"dupescan_{stamp}.log"
 
     fh  = logging.FileHandler(log_file, encoding="utf-8")
     fh.setFormatter(logging.Formatter(
@@ -36,7 +44,7 @@ def setup_logging(log_dir: Path = LOG_DIR) -> str:
     logger.addHandler(fh)
 
     # 清掉較舊的 log，只留最近 KEEP_LOGS 份（都是 DupeScan 自己產生的紀錄檔）
-    for old in sorted(log_dir.glob("dupescan_*.log"))[:-KEEP_LOGS]:
+    for old in sorted(folder.glob("dupescan_*.log"))[:-KEEP_LOGS]:
         try:
             old.unlink()
         except OSError:

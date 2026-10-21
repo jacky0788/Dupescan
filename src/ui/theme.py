@@ -157,8 +157,6 @@ QMenu::item:selected {{ background: {ACCENT_BG}; }}
 QMenu::item:disabled {{ color: {TEXT_3}; }}
 QMenu::separator {{ height: 1px; background: {BORDER_2}; margin: 5px 8px; }}
 
-QStatusBar {{ background: {SURFACE}; border-top: 1px solid {BORDER}; color: {TEXT_2}; }}
-QFrame#warnbox {{ background: #2a2414; border: 1px solid #5c4a1a; border-radius: 10px; }}
 """
 
 
@@ -202,10 +200,3 @@ def set_role(widget, role: str):
     style = widget.style()
     style.unpolish(widget)
     style.polish(widget)
-
-
-# ── 舊介面相容（新介面接手後移除）──────────────────────────────────────────
-PANEL, SURFACE_HI, BORDER_HI = SURFACE, SURFACE_3, BORDER_2
-SUBTEXT, FAINT, ACCENT_HI = TEXT_2, TEXT_3, ACCENT_2
-GREEN, DANGER_HI, ORANGE = SUCCESS, DANGER_2, WARNING
-STYLE = stylesheet(13)

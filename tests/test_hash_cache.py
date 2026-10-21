@@ -9,7 +9,6 @@ import pytest
 from helpers import blob, group_paths, make_scanner
 import src.scanner as sc
 from src.hash_cache import HashCache, _stable_ids
-from src.scanner import Scanner
 
 KB = 1024
 

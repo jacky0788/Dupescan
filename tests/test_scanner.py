@@ -10,7 +10,6 @@ from pathlib import Path
 import pytest
 
 from helpers import blob, group_paths, make_scanner
-from src.scanner import Scanner
 
 KB = 1024
 needs_windows = pytest.mark.skipif(sys.platform != "win32", reason="Windows 專用")

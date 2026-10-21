@@ -294,7 +294,7 @@ class ResultsModel(QAbstractItemModel):
 
     def note(self, g: DuplicateGroup, fi: FileInfo) -> str:
         if self.is_protected(fi):
-            return REASONS["reference"]
+            return REASONS["protected"]
         if fi.selected:
             return ""
         if fi is self.kept_file(g):
@@ -333,7 +333,7 @@ class ResultsModel(QAbstractItemModel):
         self._group_changed(g)
 
     def reselect(self, g: DuplicateGroup):
-        decided = apply_selection(g, self.rules.conditions(), "keep", self.rules.protected())
+        decided = apply_selection(g, self.rules.conditions(), self.rules.protected())
         g.keep_reason = REASONS.get(decided, REASONS[None])
         self._group_changed(g)
 

@@ -1,6 +1,6 @@
 # 掃描結果的匯出與存檔：
 #   export_csv     — 完整結果 CSV（每個檔案一列，Excel 直接開）
-#   save_results   — 可再開啟的結果檔（gzip 壓縮的 JSON，含勾選狀態），副檔名 .dupescan
+#   save_results   — 可再開啟的結果檔（gzip 壓縮的 JSON，含保留／移除的選擇），副檔名 .dupescan
 #   load_results   — 讀回結果檔；檔案在存檔後可能已變動，移除前的檢查（delete_plan）會把關
 import csv
 import gzip
@@ -18,13 +18,14 @@ RESULT_SUFFIX  = ".dupescan"
 def export_csv(path, groups: list[DuplicateGroup]):
     with open(path, "w", newline="", encoding="utf-8-sig") as f:   # BOM：Excel 直接開不亂碼
         w = csv.writer(f)
-        w.writerow(["群組", "hash", "單檔大小(bytes)", "群組可省(bytes)", "已勾選",
-                    "路徑", "資料夾", "檔名", "修改時間", "硬連結路徑"])
+        w.writerow(["群組", "處理", "路徑", "資料夾", "檔名", "大小(bytes)", "修改時間",
+                    "保留原因", "這組可釋放(bytes)", "硬連結路徑", "hash"])
         for number, g in enumerate(groups, 1):
             for fi in g.files:
                 mtime = datetime.fromtimestamp(fi.mtime).isoformat(sep=" ", timespec="seconds")
-                w.writerow([number, g.hash_value, g.size, g.wasted_bytes, "是" if fi.selected else "",
-                            str(fi.path), fi.folder, fi.name, mtime, "; ".join(fi.aliases)])
+                w.writerow([number, "移除" if fi.selected else "保留", str(fi.path), fi.folder, fi.name,
+                            g.size, mtime, "" if fi.selected else g.keep_reason, g.wasted_bytes,
+                            "; ".join(fi.aliases), g.hash_value])
 
 
 def save_results(path, groups: list[DuplicateGroup], roots: list[str], scanned_at: str = "",

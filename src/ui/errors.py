@@ -10,7 +10,7 @@ import traceback
 from PyQt6.QtCore import QObject, QtMsgType, Qt, pyqtSignal, qInstallMessageHandler
 from PyQt6.QtWidgets import QApplication, QPlainTextEdit
 
-from ..logger import LOG_DIR, logger
+from ..logger import log_dir, logger
 from ..session import read_crash_log
 from .dialogs import Dialog, open_folder
 from .theme import icon
@@ -51,7 +51,7 @@ class ErrorDialog(Dialog):
         self.details.hide()
         self.lay.addWidget(self.details, 1)
         copy = button("複製錯誤內容", slot=self._copy)
-        logs = button("開啟 log 資料夾", slot=lambda: open_folder(LOG_DIR))
+        logs = button("開啟 log 資料夾", slot=lambda: open_folder(log_dir()))
         close = button("關閉", "primary", self.accept)
         self.add_buttons(close, left=[copy, logs])
         close.setDefault(True)
@@ -154,7 +154,7 @@ class CrashNoticeDialog(Dialog):
             box.setMinimumHeight(180)
             self.lay.addWidget(box, 1)
         self.log_text = log_text
-        logs = button("開啟 log 資料夾", slot=lambda: open_folder(LOG_DIR))
+        logs = button("開啟 log 資料夾", slot=lambda: open_folder(log_dir()))
         ok = button("知道了", "primary", self.accept)
         self.add_buttons(ok, left=[logs])
         ok.setDefault(True)
