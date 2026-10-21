@@ -149,3 +149,52 @@ def test_old_entries_are_pruned(tree, tmp_path):
     later.open()
     later.close()
     assert count() == 0
+
+
+# ── 快取出狀況時不讓掃描失敗 ─────────────────────────────────────────────
+def test_corrupt_cache_is_backed_up_and_rebuilt(tree, tmp_path):
+    make_data(tree)
+    db = tmp_path / "cache.sqlite3"
+    db.write_bytes(b"this is not a sqlite database" * 100)
+    s, groups = scan(tree.root, db)
+    assert len(groups) == 1
+    assert "損壞" in s.stats.cache_note
+    assert list(tmp_path.glob("cache.sqlite3.bad-*"))          # 壞掉的檔案有備份
+    s2, _ = scan(tree.root, db)                                # 重建後可以正常使用
+    assert s2.stats.cache_hits_full == 3 and s2.stats.cache_note == ""
+
+
+def test_locked_cache_is_skipped(tree, tmp_path):
+    import sqlite3
+    make_data(tree)
+    db = tmp_path / "cache.sqlite3"
+    scan(tree.root, db)
+    holder = sqlite3.connect(db)
+    holder.execute("BEGIN EXCLUSIVE")                          # 模擬另一個 DupeScan 正在寫入
+    try:
+        s = make_scanner([tree.root], cache=HashCache(db, timeout=0.2))
+        groups = s.scan()
+    finally:
+        holder.rollback()
+        holder.close()
+    assert len(groups) == 1                                    # 掃描照常完成
+    assert "另一個" in s.stats.cache_note
+
+
+def test_cache_is_written_periodically(tree, tmp_path, monkeypatch):
+    import sqlite3
+    import src.hash_cache as hc
+    monkeypatch.setattr(hc, "FLUSH_SECONDS", 0.0)              # 每筆都立刻寫入
+    db = tmp_path / "cache.sqlite3"
+    cache = HashCache(db)
+    cache.open()
+    tree("a.bin", b"x" * 10)
+    from src.models import FileInfo
+    fi = FileInfo(path=tree.root / "a.bin", size=10, mtime_ns=123)
+    cache.store(fi, "algo", head="h1")
+    conn = sqlite3.connect(db)                                 # 還沒 close，另一個連線就讀得到
+    try:
+        assert conn.execute("SELECT head FROM files").fetchall() == [("h1",)]
+    finally:
+        conn.close()
+        cache.close()

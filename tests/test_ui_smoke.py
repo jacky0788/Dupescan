@@ -159,6 +159,10 @@ print("reset returned, threads =", len(win._threads), flush=True)
 assert wait_for(lambda: not win._threads, 15)
 print("retired thread released", flush=True)
 
+# 模擬的卡住函式不理會停止、照樣回傳結果，被存進了快取；改修改時間讓快取失效，第二次才會再算
+for name in os.listdir(sys.argv[2]):
+    later = time.time() + 10
+    os.utime(os.path.join(sys.argv[2], name), (later, later))
 state["hashing"] = 0
 win._start_scan()
 assert wait_for(lambda: state["hashing"] > 0, 15)
@@ -173,7 +177,7 @@ def test_reset_and_close_during_long_hash_do_not_crash(tree, tmp_path):
     import subprocess
     import sys
     from conftest import ROOT
-    data = blob(4 * KB, 1)
+    data = blob(8 * KB, 1)          # 大於 4 KB 才會進到整檔比對
     tree("data/a.bin", data)
     tree("data/b.bin", data)
     script = tmp_path / "reset_check.py"

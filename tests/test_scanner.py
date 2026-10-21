@@ -369,18 +369,97 @@ def test_scan_options_round_trip_and_bad_data():
 
 
 def test_workers_per_device(tree, monkeypatch):
-    data = blob(4 * KB, 1)
+    import src.scanner as sc
+    data = blob(5 * KB, 1)
     tree("a.bin", data)
     tree("b.bin", data)
     dev = os.stat(tree.root).st_dev
-    used = []
-    orig = Scanner._hash_batch
+    sizes = []
+    real_pool = sc.ThreadPoolExecutor
 
-    def spy(self, files, fn, workers):
-        used.append(workers)
-        return orig(self, files, fn, workers)
+    def spy(max_workers, **kw):
+        sizes.append(max_workers)
+        return real_pool(max_workers=max_workers, **kw)
 
-    monkeypatch.setattr(Scanner, "_hash_batch", spy)
-    make_scanner([str(tree.root)], min_size=1, pass2_workers=1, pass3_workers=1,
-            workers_by_dev={dev: (6, 3)}).scan()
-    assert used == [6, 3]
+    monkeypatch.setattr(sc, "ThreadPoolExecutor", spy)
+    make_scanner([tree.root], pass2_workers=1, pass3_workers=1,
+                 workers_by_dev={dev: (6, 3)}).scan()
+    assert sizes == [6, 3]                     # 第 2 步 6 個、第 3 步 3 個執行緒
+
+
+# ── 演算法：小檔不重讀、大檔比檔尾、HDD 依路徑順序、不同磁碟同時進行 ──────
+def test_small_files_are_read_only_once(tree, monkeypatch):
+    import src.scanner as sc
+    full_calls = []
+    orig = sc._full_hash
+    monkeypatch.setattr(sc, "_full_hash", lambda p, cp=None: full_calls.append(p) or orig(p, cp))
+    small = blob(3 * KB, 1)
+    tree("a.txt", small)
+    tree("b.txt", small)
+    tree("c.txt", blob(3 * KB, 2))             # 同大小、內容不同
+    s = make_scanner([tree.root])
+    groups = s.scan()
+    assert group_paths(groups, tree.root) == {frozenset({"a.txt", "b.txt"})}
+    assert full_calls == [] and s.stats.small_files == 2
+    assert groups[0].hash_value == orig(tree.root / "a.txt")   # 開頭 hash 就是完整 hash
+
+
+def test_tail_sample_skips_full_read_of_different_big_files(tree, monkeypatch):
+    import src.scanner as sc
+    monkeypatch.setattr(sc, "TAIL_MIN_SIZE", 64 * KB)
+    full_calls = []
+    orig = sc._full_hash
+    monkeypatch.setattr(sc, "_full_hash", lambda p, cp=None: full_calls.append(p.name) or orig(p, cp))
+    head = blob(100 * KB, 1)
+    tree("x1.bin", head + b"1" * 1000)          # 開頭、大小都一樣，只有結尾不同
+    tree("x2.bin", head + b"2" * 1000)
+    same = blob(101 * KB, 2)
+    tree("y1.bin", same)
+    tree("y2.bin", same)
+    s = make_scanner([tree.root])
+    assert group_paths(s.scan(), tree.root) == {frozenset({"y1.bin", "y2.bin"})}
+    assert sorted(full_calls) == ["y1.bin", "y2.bin"]          # x1、x2 不必整檔讀
+    assert s.stats.tail_checked == 4
+
+
+def test_single_worker_disk_reads_in_path_order(tree, monkeypatch):
+    import src.scanner as sc
+    order = []
+    orig = sc._partial_hash
+    monkeypatch.setattr(sc, "_partial_hash",
+                        lambda p, cp=None: order.append(p.relative_to(tree.root).as_posix()) or orig(p, cp))
+    # 大小不同的兩組交錯放在不同資料夾：舊做法依大小分組的順序讀，會在資料夾之間跳來跳去
+    for d in ("a", "b", "c"):
+        tree(f"{d}/big.bin", blob(9 * KB, 1))
+        tree(f"{d}/small.bin", blob(5 * KB, 2))
+    make_scanner([tree.root], pass2_workers=1, pass3_workers=1).scan()
+    assert order == sorted(order, key=str.casefold)
+
+
+def test_different_disks_run_at_the_same_time(tree):
+    from src.models import FileInfo
+    import time as _time
+    files = []
+    for dev in (1, 2):
+        for i in range(4):
+            files.append(FileInfo(path=tree(f"d{dev}/f{i}.bin", b"x"), size=1, dev=dev))
+    s = make_scanner([tree.root], workers_by_dev={1: (1, 1), 2: (1, 1)})
+    lock = threading.Lock()
+    active, peak = [0], [0]
+
+    def slow(path, checkpoint=None):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        _time.sleep(0.05)
+        with lock:
+            active[0] -= 1
+        return "h"
+
+    t0 = time.monotonic()
+    results = list(s._hash_stage(files, slow, 2, "測試"))
+    assert len(results) == 8
+    assert peak[0] == 2                         # 兩顆磁碟各一個執行緒，同時進行
+    assert time.monotonic() - t0 < 0.35         # 依序跑要 0.4 秒以上
+
+
