@@ -134,6 +134,8 @@ QTreeView::item:hover, QListWidget::item:hover {{ background: {SURFACE_2}; }}
 QTreeView::item:selected, QListWidget::item:selected, QTableWidget::item:selected {{
     background: {ACCENT_BG}; color: {TEXT}; }}
 QTreeView::branch {{ background: transparent; }}
+QTreeView::branch:has-children:closed {{ image: url(icons:chevron-right.svg); }}
+QTreeView::branch:has-children:open {{ image: url(icons:chevron-down.svg); }}
 QHeaderView {{ background: transparent; }}
 QHeaderView::section {{ background: {SURFACE}; color: {TEXT_2}; border: none; border-bottom: 1px solid {BORDER};
                         padding: 7px 8px; font-weight: 600; }}
