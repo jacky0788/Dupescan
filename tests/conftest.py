@@ -41,6 +41,28 @@ def tree(tmp_path):
     return make
 
 
+@pytest.fixture(autouse=True)
+def destroy_qt_widgets_after_test():
+    """每個測試結束時確定地關閉並刪除所有頂層視窗，再做一次垃圾回收。
+
+    否則測試留下的視窗（被 lambda 連線形成的循環參照留住）會在之後某次處理 Qt 事件時才被
+    垃圾回收刪掉，可能正好刪到正在處理事件的物件而讓整個測試程序崩潰。
+    """
+    yield
+    import gc
+    from PyQt6.QtCore import QCoreApplication, QEvent
+    from PyQt6.QtWidgets import QApplication
+    app = QApplication.instance()
+    if app is None:
+        return
+    for widget in app.topLevelWidgets():
+        widget.close()
+        widget.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    app.processEvents()
+    gc.collect()
+
+
 @pytest.fixture(scope="session")
 def qapp():
     from PyQt6.QtWidgets import QApplication
