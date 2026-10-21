@@ -375,8 +375,11 @@ class Banner(QFrame):
 
     def add_button(self, text: str, slot, kind: str | None = None) -> QPushButton:
         btn = button(text, kind, slot)
-        self._buttons.addWidget(btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.add_widget(btn)
         return btn
+
+    def add_widget(self, widget: QWidget):
+        self._buttons.addWidget(widget, 0, Qt.AlignmentFlag.AlignVCenter)
 
 
 # ── 浮動訊息 ─────────────────────────────────────────────────────────────
@@ -392,7 +395,6 @@ class Toast(QFrame):
         lay.setContentsMargins(16, 10, 10, 10)
         lay.setSpacing(12)
         self.text = label("", wrap=True)
-        self.text.setMaximumWidth(560)
         lay.addWidget(self.text, 1)
         self.action = button("", "link")
         self.action.hide()
@@ -412,6 +414,8 @@ class Toast(QFrame):
         self.text.setText(text)
         set_role(self.text, {"info": "", "success": "success", "warning": "warning",
                              "error": "error"}.get(kind, ""))
+        width = self.text.fontMetrics().horizontalAdvance(text) + 8       # 短訊息一行顯示，長的換行
+        self.text.setFixedWidth(max(min(width, 600, self._host.width() - 180), 160))
         if action:
             self.action.setText(action[0])
             self._slot = action[1]

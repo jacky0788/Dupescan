@@ -89,6 +89,7 @@ QPushButton#link:hover {{ color: {TEXT}; text-decoration: underline; }}
 QPushButton#icon {{ background: transparent; border: none; border-radius: 6px; padding: 4px 8px;
                     color: {TEXT_2}; font-size: {heading}px; }}
 QPushButton#icon:hover {{ background: {SURFACE_2}; color: {TEXT}; }}
+QPushButton#icon::menu-indicator {{ image: none; width: 0; }}
 QPushButton#chip {{ background: {SURFACE}; border: 1px solid {BORDER}; border-radius: 13px; padding: 4px 14px;
                     min-height: 18px; color: {TEXT_2}; }}
 QPushButton#chip:hover {{ border-color: {BORDER_2}; color: {TEXT}; }}
