@@ -23,3 +23,15 @@ def wait_until(app, cond, timeout: float = 10.0) -> bool:
         time.sleep(0.01)
     app.processEvents()
     return cond()
+
+
+_OPTION_KEYS = {"min_size", "include_hidden", "types", "custom_exts", "exclude_dirs", "skip_system"}
+
+
+def make_scanner(roots, **kw):
+    """測試用：Scanner(ScanOptions(roots=…, …), …) 的簡寫；min_size 預設 1 位元組。"""
+    from src.scan_options import ScanOptions
+    from src.scanner import Scanner
+    opt = {k: kw.pop(k) for k in list(kw) if k in _OPTION_KEYS}
+    opt.setdefault("min_size", 1)
+    return Scanner(ScanOptions(roots=[str(r) for r in roots], **opt), **kw)

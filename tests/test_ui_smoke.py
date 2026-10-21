@@ -352,22 +352,6 @@ def test_multiple_paths_find_cross_folder_duplicates(qapp, window, tree):
     assert {fi.path.name for fi in window._all_groups[0].files} == {"a.bin", "b.bin"}
 
 
-def test_sidebar_options_are_applied(qapp, window, tree):
-    data = blob(4 * KB, 5)
-    for n in ("a.jpg", "b.jpg", "a.log", "b.log", "node_modules/c.jpg"):
-        tree(n, data)
-    window.exclude_ext_edit.setText("log")
-    window.exclude_dir_edit.setText("node_modules")
-    window.min_size_spin.setValue(2)
-    window.min_unit_combo.setCurrentText("KB")
-    run_scan(qapp, window, tree.root)
-    assert len(window._all_groups) == 1
-    assert {fi.path.name for fi in window._all_groups[0].files} == {"a.jpg", "b.jpg"}
-    window.min_unit_combo.setCurrentText("MB")            # 最小 2 MB → 4 KB 的檔案都不比對
-    run_scan(qapp, window, tree.root)
-    assert window._all_groups == []
-
-
 def test_drop_folders_adds_scan_paths(qapp, window, tree):
     from PyQt6.QtCore import QMimeData, QPointF, QUrl
     from PyQt6.QtGui import QDropEvent

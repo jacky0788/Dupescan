@@ -34,6 +34,7 @@ except ImportError:
 
 from .hash_cache import HashCache
 from .models import DuplicateGroup, FileInfo
+from .scan_options import ScanOptions
 
 HASH_ALGO     = "xxh64" if _FAST_HASH else "blake2b"   # 寫進快取，換演算法時舊紀錄自動作廢
 PARTIAL_READ  = 4096    # Pass 2 每個檔案讀取的前綴長度（bytes）
@@ -204,26 +205,25 @@ class Scanner:
 
     def __init__(
         self,
-        roots: list[str],
-        min_size: int = 1,
-        include_hidden: bool = False,
-        pass2_workers: int = 1,   # Pass 2 執行緒數（由 DiskProfile 提供）
-        pass3_workers: int = 1,   # Pass 3 執行緒數（由 DiskProfile 提供）
+        options: ScanOptions,
+        *,
+        cache: HashCache | None = None,   # 雜湊快取；None 表示每次都重新讀檔
+        workers_by_dev: dict[int, tuple[int, int]] | None = None,
+                                          # 各磁碟（st_dev）的 (Pass2, Pass3) 執行緒數
+        pass2_workers: int = 1,           # 沒有個別設定的磁碟用的執行緒數
+        pass3_workers: int = 1,
         on_progress: ProgressCallback | None = None,
         on_done: Callable[[list[DuplicateGroup], ScanStats], None] | None = None,
         on_error: Callable[[str], None] | None = None,
         on_cancel: Callable[[], None] | None = None,
-        cache: HashCache | None = None,   # 雜湊快取；None 表示每次都重新讀檔
-        max_size: int | None = None,      # 大於此大小的檔案不比對（None＝不限）
-        include_exts=(),                  # 只比對這些副檔名（不含點；空＝全部）
-        exclude_exts=(),                  # 不比對這些副檔名
-        exclude_dirs=(),                  # 排除的資料夾：名稱（任何位置）或完整路徑
-        workers_by_dev: dict[int, tuple[int, int]] | None = None,
-                                          # 各磁碟（st_dev）的 (Pass2, Pass3) 執行緒數
     ):
-        self.roots          = normalize_roots(roots)
-        self.min_size       = min_size
-        self.include_hidden = include_hidden
+        self.options        = options
+        self.roots          = normalize_roots(options.roots)
+        self.min_size       = max(options.min_size, 1)   # 空檔案一律不算重複
+        self.include_hidden = options.include_hidden
+        self.extensions     = options.extensions()       # None＝所有檔案
+        self.excluded_names = options.excluded_names()
+        self.excluded_paths = options.excluded_paths()
         self.pass2_workers  = pass2_workers
         self.pass3_workers  = pass3_workers
         self.on_progress    = on_progress
@@ -231,13 +231,6 @@ class Scanner:
         self.on_error       = on_error
         self.on_cancel      = on_cancel
         self.cache          = cache
-        self.max_size       = max_size or None
-        self.include_exts   = {e.strip().lower().lstrip(".") for e in include_exts if e.strip()}
-        self.exclude_exts   = {e.strip().lower().lstrip(".") for e in exclude_exts if e.strip()}
-        self.exclude_dir_names = {d.strip().casefold() for d in exclude_dirs
-                                  if d.strip() and not os.path.isabs(d.strip())}
-        self.exclude_dir_paths = {os.path.normcase(os.path.abspath(d.strip())) for d in exclude_dirs
-                                  if d.strip() and os.path.isabs(d.strip())}
         self.workers_by_dev = workers_by_dev or {}
         self.stats          = ScanStats()
 
@@ -376,8 +369,8 @@ class Scanner:
                                 if _is_junction(entry):
                                     stats.skipped_links += 1
                                 elif (name.casefold() in EXCLUDED_DIR_NAMES
-                                      or name.casefold() in self.exclude_dir_names
-                                      or os.path.normcase(entry.path) in self.exclude_dir_paths):
+                                      or name.casefold() in self.excluded_names
+                                      or os.path.normcase(entry.path) in self.excluded_paths):
                                     stats.skipped_excluded += 1
                                 elif not self.include_hidden and _is_hidden(
                                         name, getattr(entry.stat(follow_symlinks=False),
@@ -402,13 +395,11 @@ class Scanner:
                         if attrs & _CLOUD_ATTRS:
                             stats.skipped_cloud += 1
                             continue
-                        if st.st_size < self.min_size or (self.max_size and st.st_size > self.max_size):
+                        if st.st_size < self.min_size:
                             continue
-                        if self.include_exts or self.exclude_exts:
-                            ext = os.path.splitext(name)[1][1:].lower()
-                            if ((self.include_exts and ext not in self.include_exts)
-                                    or ext in self.exclude_exts):
-                                continue
+                        if (self.extensions is not None
+                                and os.path.splitext(name)[1][1:].lower() not in self.extensions):
+                            continue
                         stats.files_seen += 1
                         yield FileInfo(path=Path(entry.path), size=st.st_size,
                                        mtime=st.st_mtime, mtime_ns=st.st_mtime_ns)

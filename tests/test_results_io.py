@@ -4,7 +4,7 @@ import gzip
 
 import pytest
 
-from helpers import blob
+from helpers import blob, make_scanner
 from src.results_io import export_csv, load_results, save_results
 from src.scanner import Scanner
 
@@ -15,7 +15,7 @@ def scanned(tree):
     data = blob(4 * KB, 1)
     for n in ("a.bin", "x/b.bin", "y/c.bin"):
         tree(n, data)
-    groups = Scanner([str(tree.root)], min_size=1).scan()
+    groups = make_scanner([str(tree.root)], min_size=1).scan()
     groups[0].files[1].selected = True
     groups[0].files[0].aliases = [str(tree.root / "link.bin")]
     return groups

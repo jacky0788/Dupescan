@@ -2,7 +2,7 @@
 import os
 from pathlib import Path
 
-from helpers import blob
+from helpers import blob, make_scanner
 from src.delete_plan import (
     KEEP, OK, PROTECTED, PROTECTED_NOTE, REFERENCE_NOTE, SKIP, build_plan, is_protected,
 )
@@ -15,7 +15,7 @@ def scan_one_group(tree, names, data=None):
     data = data or blob(8 * KB, 1)
     for n in names:
         tree(n, data)
-    groups = Scanner([str(tree.root)], min_size=1).scan()
+    groups = make_scanner([str(tree.root)], min_size=1, skip_system=False).scan()
     assert len(groups) == 1
     return groups[0]
 

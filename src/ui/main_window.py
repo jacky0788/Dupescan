@@ -44,6 +44,7 @@ from .theme import (
 )
 from ..hash_cache import HashCache, clear_cache
 from ..results_io import RESULT_SUFFIX, export_csv, load_results, save_results
+from ..scan_options import ScanOptions
 from ..scanner import Scanner, ScanStats, STEP_NAMES, _format_eta
 from ..models import DuplicateGroup, FileInfo
 from ..logger import logger
@@ -128,16 +129,20 @@ class ScanWorker(QObject):
                  use_cache: bool = True, **options):
         super().__init__()
         self.scan_id = scan_id
+        # 舊介面的欄位轉成 ScanOptions（新介面完成後整個 ScanWorker 會換掉）
+        scan_options = ScanOptions(
+            roots=list(roots), min_size=min_size,
+            custom_exts=[e.lstrip(".").lower() for e in options.get("include_exts", [])],
+            exclude_dirs=[d for d in options.get("exclude_dirs", []) if os.path.isabs(d)],
+            include_hidden=options.get("include_hidden", False))
         # Scanner 在建構時就建立：run() 開始前呼叫 stop() 也會生效
         self._scanner = Scanner(
-            roots=roots,
-            min_size=min_size,
+            scan_options,
             cache=HashCache() if use_cache else None,
             on_progress=lambda m, c, t, s, ts, eta: self.progress.emit(scan_id, m, c, t, s, ts, eta),
             on_done=lambda g, st: self.finished.emit(scan_id, g, st),
             on_error=lambda e: self.error.emit(scan_id, e),
             on_cancel=lambda: self.cancelled.emit(scan_id),
-            **options,
         )
 
     def run(self):

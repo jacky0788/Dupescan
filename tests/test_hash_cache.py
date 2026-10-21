@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from helpers import blob, group_paths
+from helpers import blob, group_paths, make_scanner
 import src.scanner as sc
 from src.hash_cache import HashCache, _stable_ids
 from src.scanner import Scanner
@@ -42,7 +42,7 @@ def make_data(tree):
 
 
 def scan(root, db, **kw):
-    s = Scanner([str(root)], min_size=1, cache=HashCache(db), **kw)
+    s = make_scanner([str(root)], min_size=1, cache=HashCache(db), **kw)
     return s, s.scan()
 
 
@@ -103,7 +103,7 @@ def test_cancelled_scan_keeps_progress(tree, tmp_path, monkeypatch):
         return result
 
     monkeypatch.setattr(sc, "_full_hash", slow_full)
-    s = Scanner([str(tree.root)], min_size=1, cache=HashCache(db))
+    s = make_scanner([str(tree.root)], min_size=1, cache=HashCache(db))
     th = threading.Thread(target=s.scan)
     th.start()
     end = time.monotonic() + 20
@@ -133,7 +133,7 @@ def test_algorithm_change_invalidates_cache(tree, tmp_path, calls, monkeypatch):
 def test_old_entries_are_pruned(tree, tmp_path):
     make_data(tree)
     db = tmp_path / "cache.sqlite3"
-    s = Scanner([str(tree.root)], min_size=1, cache=HashCache(db))
+    s = make_scanner([str(tree.root)], min_size=1, cache=HashCache(db))
     s.cache._now -= 400 * 86400                   # 這次寫入的紀錄假裝是一年多前看到的
     s.scan()
 
