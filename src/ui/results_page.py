@@ -8,6 +8,7 @@
 import os
 import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from PyQt6.QtCore import (
     QAbstractItemModel, QEvent, QModelIndex, QPoint, QRect, QSize, Qt, QTimer, pyqtSignal,
@@ -358,6 +359,33 @@ class ResultsModel(QAbstractItemModel):
         self.refresh()
         self.selection_changed.emit()
 
+    def remove_folders(self, folders: list[str]):
+        """整個資料夾移除後：資料夾裡的路徑都拿掉（硬連結在外面還有路徑的，改用外面那個）。"""
+        keys = [os.path.normcase(os.path.normpath(f)).rstrip(os.sep) + os.sep for f in folders]
+
+        def gone(path) -> bool:
+            k = os.path.normcase(os.path.normpath(str(path)))
+            return any(k.startswith(prefix) for prefix in keys)
+
+        kept_groups = []
+        for g in self._groups:
+            files = []
+            for fi in g.files:
+                paths = [p for p in [str(fi.path), *fi.aliases] if not gone(p)]
+                if not paths:
+                    continue
+                if paths[0] != str(fi.path):
+                    fi.path = Path(paths[0])
+                fi.aliases = paths[1:]
+                files.append(fi)
+            g.files = files
+            if len(files) > 1:
+                kept_groups.append(g)
+        self._groups = kept_groups
+        self._haystack.clear()
+        self.refresh()
+        self.selection_changed.emit()
+
     def _group_changed(self, g: DuplicateGroup):
         row = self._row_of.get(id(g))
         if row is not None:
@@ -583,6 +611,8 @@ class ResultsPage(QWidget):
     rescan_requested = pyqtSignal()
     rules_requested = pyqtSignal()
     remove_requested = pyqtSignal()
+    folders_requested = pyqtSignal()                    # 找出整個都是重複的資料夾
+    folder_check_requested = pyqtSignal(str)            # 檢查這個資料夾（與上層）是否整個重複
     unreadable_requested = pyqtSignal()
     open_file_requested = pyqtSignal(object)            # FileInfo
     reveal_file_requested = pyqtSignal(object)          # FileInfo
@@ -701,6 +731,9 @@ class ResultsPage(QWidget):
         texts.addWidget(self.summary)
         texts.addWidget(self.summary_hint)
         bottom_lay.addLayout(texts, 1)
+        self.folders_button = button("重複的資料夾…", slot=self.folders_requested.emit,
+                                     tooltip="找出裡面每個檔案在別處都有一份的資料夾，可以整個移除")
+        bottom_lay.addWidget(self.folders_button)
         bottom_lay.addWidget(button("自動選取規則…", slot=self.rules_requested.emit,
                                     tooltip="決定每一組要保留哪一份"))
         self.remove_button = button(self.remove_label, "danger", self.remove_requested.emit)
@@ -746,6 +779,11 @@ class ResultsPage(QWidget):
 
     def files_removed(self, removed: set[str]):
         self.model.remove_paths(removed)
+        self._after_refresh()
+        self._update_header()
+
+    def folders_removed(self, folders: list[str]):
+        self.model.remove_folders(folders)
         self._after_refresh()
         self._update_header()
 
@@ -853,6 +891,10 @@ class ResultsPage(QWidget):
         menu.addAction("這組全部保留", lambda: self._edit(self.model.keep_all, g))
         menu.addAction("這組依規則重新選取", lambda: self._edit(self.model.reselect, g))
         if fi is not None:
+            menu.addSeparator()
+            folder = fi.folder
+            menu.addAction(f"整個資料夾「{os.path.basename(folder) or folder}」都重複嗎？…",
+                           lambda: self.folder_check_requested.emit(folder))
             menu.addSeparator()
             menu.addAction("複製路徑", lambda: QApplication.clipboard().setText(str(fi.path)))
         menu.exec(pos)

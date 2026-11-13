@@ -27,11 +27,15 @@ from ..selection import auto_select
 from ..session import pid_alive
 from . import theme
 from .app_settings import AppSettings
-from .dialogs import RemoveDialog, RulesDialog, SettingsDialog, TextDialog, about, open_folder, unreadable_dialog
+from ..folder_dupes import FolderFinder
+from .dialogs import (
+    FolderRemoveDialog, RemoveDialog, RulesDialog, SettingsDialog, TextDialog, about, open_folder,
+    unreadable_dialog,
+)
 from .errors import CrashNoticeDialog
 from .history_dialog import HistoryDialog
 from .home_page import HomePage
-from .removal import remove_items
+from .removal import remove_folders, remove_items
 from .results_page import ResultsInfo, ResultsPage, open_file, reveal_in_explorer
 from .scan_controller import ScanController
 from .scan_page import ScanPage
@@ -140,6 +144,8 @@ class AppWindow(QMainWindow):
         results.rescan_requested.connect(self._rescan)
         results.rules_requested.connect(self._edit_rules)
         results.remove_requested.connect(self._remove_selected)
+        results.folders_requested.connect(lambda: self._find_folders())
+        results.folder_check_requested.connect(self._find_folders)
         results.unreadable_requested.connect(self._show_unreadable)
         results.open_file_requested.connect(self._open_file)
         results.reveal_file_requested.connect(self._reveal_file)
@@ -416,6 +422,77 @@ class AppWindow(QMainWindow):
             self._task_failed("移除檔案時發生錯誤", exc)
             return
         self._removal_done(results, method, {str(fi.path): fi.size for fi, _ in items})
+
+    # ── 整個資料夾移除 ────────────────────────────────────────────────
+    def _folder_finder(self, report=None) -> FolderFinder:
+        info = self.results.info
+        return FolderFinder(self.results.groups(), info.roots if info else [],
+                            reference_dirs=self.settings.auto_rules.protected_dirs, report=report)
+
+    def _find_folders(self, folder: str = ""):
+        """找出整個都是重複的資料夾（folder 有值時只看這個資料夾與它的上層），確認後整個移除。"""
+        if not self.results.groups():
+            return
+        if folder:
+            fn = lambda report: self._folder_finder(report).find_for(folder)
+        else:
+            fn = lambda report: (self._folder_finder(report).find_all(), "")
+        try:
+            found, reason = run_task(self, "找重複的資料夾", "正在檢查資料夾裡的檔案…", fn)
+        except TaskError as exc:
+            self._task_failed("檢查資料夾時發生錯誤", exc)
+            return
+        logger.info(f"整個重複的資料夾：{len(found)} 個" + (f"（從 {folder} 往上找）" if folder else ""))
+        method, full_verify = self.settings.remove_method, self.settings.full_verify
+        preselect = found[-1].path if folder and found else ""      # 最接近點的那個資料夾
+        dialog = FolderRemoveDialog(found, method, full_verify, preselect=preselect,
+                                    not_found_reason=reason if folder else "", parent=self)
+        accepted = dialog.exec() == FolderRemoveDialog.DialogCode.Accepted
+        chosen = dialog.selected() if accepted else []
+        dialog.deleteLater()
+        if not chosen:
+            return
+        logger.info(f"整個移除 {len(chosen)} 個資料夾（{method}{'，完整比對' if full_verify else ''}）："
+                    + "、".join(f.path for f in chosen))
+        hwnd = int(self.winId())
+        try:
+            removed, results = run_task(
+                self, "移除資料夾", "正在移除…",
+                lambda report: remove_folders(chosen, self._folder_finder, method, hwnd, full_verify, report),
+                delay_ms=0)
+        except TaskError as exc:
+            self._task_failed("移除資料夾時發生錯誤", exc)
+            return
+        self._folders_removed(removed, results, method)
+
+    def _folders_removed(self, removed: list, results: list, method: str):
+        ok = [r for r in results if r.ok]
+        bad = [r for r in results if not r.ok]
+        for r in ok:
+            logger.info(f"  {'回收筒' if r.method == 'recycle' else '隔離'}：{r.path}" + (f"（{r.note}）" if r.note else ""))
+        for r in bad:
+            logger.warning(f"  沒有移除：{r.path}（{r.note}）")
+        if removed:
+            self.results.folders_removed([f.path for f in removed])
+            self._results_dirty = True
+            self._save_last_results()
+        files = sum(len(f.files) + len(f.extra) for f in removed)
+        freed = sum(f.size for f in removed)
+        quarantined = sum(1 for r in ok if r.method == "quarantine")
+        where = "資源回收筒" if method == "recycle" and not quarantined else (
+            "隔離資料夾" if quarantined == len(ok) else "資源回收筒或隔離資料夾")
+        text = (f"已把 {len(removed):,} 個資料夾（{files:,} 個檔案）移到{where}，釋放 {human_size(freed)}。"
+                if removed else "沒有移除任何資料夾。")
+        if bad:
+            text += f" {len(bad):,} 個沒有移除。"
+            body = "\n".join(f"{r.path}（{r.note}）" for r in bad)
+            self.show_message(text, "warning", ("查看", lambda: self._show_text(
+                "沒有移除的資料夾", f"{len(bad):,} 個資料夾沒有移除",
+                "這些資料夾維持原狀（沒有被刪除或搬移）。", body)))
+        elif quarantined:
+            self.show_message(text, "success", ("操作紀錄", self._show_history))
+        else:
+            self.show_message(text, "success")
 
     def _removal_done(self, results: list, method: str, sizes: dict[str, int]):
         ok = [r for r in results if r.ok]
