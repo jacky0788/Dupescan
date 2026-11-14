@@ -98,6 +98,23 @@ class DupFolder:
     def name(self) -> str:
         return os.path.basename(os.path.normpath(self.path)) or self.path
 
+    def outside_files(self) -> list[FileInfo]:
+        """這個資料夾裡的檔案，在資料夾外面的副本（保留這個資料夾、改移除另一邊時會移除的檔案）。
+        硬連結有任何一個路徑在資料夾裡的不算（移掉外面那個路徑不會釋放空間）。"""
+        out, seen = [], set()
+        for ff in self.files:
+            if id(ff.group) in seen:
+                continue
+            seen.add(id(ff.group))
+            for fi in ff.group.files:
+                if not any(_under(_key(p), self.key) for p in [str(fi.path), *fi.aliases]):
+                    out.append(fi)
+        return out
+
+    @property
+    def outside_size(self) -> int:
+        return sum(fi.size for fi in self.outside_files())
+
     def elsewhere_text(self) -> str:
         if not self.elsewhere:
             return ""
@@ -313,6 +330,52 @@ def conflict(selected: list[DupFolder], candidate: DupFolder) -> str:
             where = f"「{other.name}」" if other else "其他勾選的資料夾"
             return f"「{os.path.basename(ff.path)}」的另一份在{where}裡，兩邊不能同時移除"
     return ""
+
+
+def choice_conflict(removing: list[DupFolder], keeping: list[DupFolder],
+                    candidate: DupFolder, keep: bool) -> str:
+    """勾選 candidate 時能不能和其他已勾選的一起處理；可以時回傳空字串，不行時回傳原因。
+
+    removing：整個移除的資料夾；keeping：保留、改移除另一邊副本的資料夾。
+    keep 為 True 表示 candidate 要保留、改移除另一邊。
+    """
+    removing = [f for f in removing if f.key != candidate.key]
+    keeping = [f for f in keeping if f.key != candidate.key]
+    for f in keeping if keep else [*keeping, *removing]:
+        if f.key == candidate.key:
+            continue
+        if _under(candidate.key, f.key):
+            return f"已經包含在「{f.name}」裡"
+        if _under(f.key, candidate.key):
+            return f"已勾選的「{f.name}」在這個資料夾裡"
+    if keep:
+        for f in removing:
+            if _under(candidate.key, f.key):
+                return f"要保留的資料夾在要移除的「{f.name}」裡"
+            if _under(f.key, candidate.key):
+                return f"要移除的「{f.name}」在這個要保留的資料夾裡"
+        return ""
+    return conflict(removing, candidate)
+
+
+def keep_side_selector(keeping: list[DupFolder], removing: list[DupFolder] = ()
+                       ) -> tuple[list[DuplicateGroup], Callable[[FileInfo], bool]]:
+    """保留 keeping 這些資料夾、改移除另一邊的副本：回傳 (相關的群組, 判斷哪個檔案要移除)。
+
+    要保留的資料夾裡的檔案一律不移除；整個移除的資料夾（removing）裡的檔案也不另外處理
+    （跟著資料夾一起走）。每一組在保留的資料夾裡都至少有一份，所以不會一份都不剩。
+    """
+    groups, seen = [], set()
+    for f in keeping:
+        for ff in f.files:
+            if id(ff.group) not in seen:
+                seen.add(id(ff.group))
+                groups.append(ff.group)
+    keys = [f.key for f in keeping] + [f.key for f in removing]
+
+    def is_selected(fi: FileInfo) -> bool:
+        return not any(_under(_key(p), k) for p in [str(fi.path), *fi.aliases] for k in keys)
+    return groups, is_selected
 
 
 def _outside_paths(ff: FolderFile, folder_keys: list[str]) -> list[tuple[FileInfo | None, str]]:

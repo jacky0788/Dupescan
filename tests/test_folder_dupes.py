@@ -172,3 +172,103 @@ def test_results_model_drops_files_under_removed_folder(qapp, photos):
     page.folders_removed([str(photos.root / "Backup")])
     left = {fi.path.relative_to(photos.root).as_posix() for g in page.groups() for fi in g.files}
     assert left == {"Photos/c.jpg", "Mixed/c.jpg"}       # a.jpg、b.jpg 只剩一份，不再是重複
+
+
+# ── 保留這個資料夾、改移除另一邊 ──────────────────────────────────────────
+@pytest.fixture
+def one_way(tree):
+    """Album 整個重複；另一份散在 Downloads（Downloads 還有別的檔案，所以只能單向列出）。"""
+    a, b = blob(4 * KB, 1), blob(4 * KB, 2)
+    tree("Album/a.mp3", a)
+    tree("Album/sub/b.mp3", b)
+    tree("Downloads/a.mp3", a)
+    tree("Downloads/b-copy.mp3", b)
+    tree("Downloads/other.zip", blob(2 * KB, 3))
+    return tree
+
+
+def test_one_way_folder_can_keep_and_remove_other_side(one_way):
+    from src.delete_plan import OK, build_plan
+    from src.folder_dupes import keep_side_selector
+    groups = scan(one_way)
+    found = finder(one_way, groups).find_all()
+    assert names(found, one_way.root) == ["Album"]
+    album = found[0]
+    outside = sorted(Path(fi.path).relative_to(one_way.root).as_posix() for fi in album.outside_files())
+    assert outside == ["Downloads/a.mp3", "Downloads/b-copy.mp3"] and album.outside_size == 8 * KB
+
+    keep_groups, is_selected = keep_side_selector([album])
+    plan = build_plan(list(enumerate(keep_groups, 1)), is_selected=is_selected)
+    removable = sorted(Path(e.file.path).relative_to(one_way.root).as_posix()
+                       for _, e in plan.removable())
+    assert removable == ["Downloads/a.mp3", "Downloads/b-copy.mp3"]
+    assert not plan.whole_groups
+    for g in plan.groups:                                # Album 裡的一律保留
+        for e in g.entries:
+            inside = "Album" in Path(e.file.path).parts
+            assert (e.status != OK) == inside
+
+
+def test_keep_side_respects_reference_dirs(one_way):
+    from src.delete_plan import PROTECTED, build_plan
+    from src.folder_dupes import keep_side_selector
+    groups = scan(one_way)
+    album = finder(one_way, groups).find_all()[0]
+    keep_groups, is_selected = keep_side_selector([album])
+    plan = build_plan(list(enumerate(keep_groups, 1)), is_selected=is_selected,
+                      reference_dirs=[str(one_way.root / "Downloads")])
+    assert not plan.removable()
+    assert len(plan.entries_with(PROTECTED)) == 2
+
+
+def test_keep_two_mutual_copies_cannot_both_be_chosen(tree):
+    """互為副本的兩個資料夾：兩邊都選「保留」會兩邊都刪掉對方 → 不能同時選；一保留一移除也不行。"""
+    from src.folder_dupes import choice_conflict
+    data = blob(4 * KB, 1)
+    tree("One/x.bin", data)
+    tree("Two/x.bin", data)
+    groups = scan(tree)
+    one, two = sorted(finder(tree, groups).find_all(), key=lambda f: f.path)
+    assert choice_conflict([], [one], two, keep=False) == ""        # 保留 One＝移除 Two 的檔，Two 整個移除也一樣安全
+    assert choice_conflict([one], [], two, keep=False)             # 兩個都整個移除 → 不行
+    assert choice_conflict([], [], two, keep=True) == ""
+
+
+def test_keep_side_and_nested_folders_conflict(photos):
+    from src.folder_dupes import choice_conflict
+    groups = scan(photos)
+    outer, inner = finder(photos, groups).find_for(str(photos.root / "Backup" / "2020"))[0]
+    assert "包含" in choice_conflict([], [outer], inner, keep=True)
+    assert "要移除的" in choice_conflict([outer], [], inner, keep=True)
+    assert choice_conflict([], [inner], outer, keep=False)
+
+
+def test_keep_side_skips_files_in_folders_being_removed(tree):
+    from src.folder_dupes import keep_side_selector
+    data = blob(4 * KB, 1)
+    tree("Keep/x.bin", data)
+    tree("Gone/x.bin", data)
+    tree("Loose/x.bin", data)
+    tree("Loose/other.bin", blob(KB, 5))
+    groups = scan(tree)
+    found = {f.name: f for f in finder(tree, groups).find_all()}
+    _, is_selected = keep_side_selector([found["Keep"]], [found["Gone"]])
+    picked = sorted(Path(fi.path).relative_to(tree.root).as_posix()
+                    for g in groups for fi in g.files if is_selected(fi))
+    assert picked == ["Loose/x.bin"]
+
+
+def test_dialog_lets_each_row_choose_side(qapp, one_way):
+    from src.ui.dialogs import FolderRemoveDialog
+    groups = scan(one_way)
+    found = finder(one_way, groups).find_all()
+    dialog = FolderRemoveDialog(found, "recycle", False)
+    assert not dialog.ok_button.isEnabled()
+    dialog.sides[0].setCurrentIndex(FolderRemoveDialog.REMOVE_OTHER)     # 選了哪邊就自動勾起來
+    assert dialog.kept() == found and dialog.selected() == []
+    assert dialog.ok_button.isEnabled() and "另一邊的副本 2 個檔案" in dialog.ok_button.text()
+    assert dialog.sides[0].itemText(0).startswith("移除「Album」")
+    assert dialog.sides[0].itemText(1).startswith("移除「Downloads」裡的副本（2 個")
+    dialog.sides[0].setCurrentIndex(FolderRemoveDialog.REMOVE_THIS)
+    assert dialog.selected() == found and dialog.kept() == []
+    dialog.deleteLater()

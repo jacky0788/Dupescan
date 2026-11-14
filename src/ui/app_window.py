@@ -27,7 +27,7 @@ from ..selection import auto_select
 from ..session import pid_alive
 from . import theme
 from .app_settings import AppSettings
-from ..folder_dupes import FolderFinder
+from ..folder_dupes import FolderFinder, keep_side_selector
 from .dialogs import (
     FolderRemoveDialog, RemoveDialog, RulesDialog, SettingsDialog, TextDialog, about, open_folder,
     unreadable_dialog,
@@ -449,9 +449,47 @@ class AppWindow(QMainWindow):
                                     not_found_reason=reason if folder else "", parent=self)
         accepted = dialog.exec() == FolderRemoveDialog.DialogCode.Accepted
         chosen = dialog.selected() if accepted else []
+        kept = dialog.kept() if accepted else []
         dialog.deleteLater()
-        if not chosen:
+        if chosen:
+            self._remove_folders(chosen, method, full_verify)
+        if kept:
+            self._remove_other_side(kept, chosen, method, full_verify)
+
+    def _remove_other_side(self, kept: list, removed_folders: list, method: str, full_verify: bool):
+        """保留 kept 這些資料夾，改移除資料夾外面一樣的檔案（走一般的移除確認）。"""
+        groups, is_selected = keep_side_selector(kept, removed_folders)
+        numbers = {id(g): n for n, g in enumerate(self.results.groups(), 1)}
+        groups = [(numbers[id(g)], g) for g in groups if id(g) in numbers]     # 已經不重複的組不用處理
+        if not groups:
+            self.show_message("另一邊已經沒有可以移除的副本。", "warning")
             return
+        rules = self.settings.auto_rules
+        try:
+            plan = run_task(self, "檢查檔案", "正在確認要移除的檔案還在、而且沒有變動…",
+                            lambda report: build_plan(groups, reference_dirs=rules.protected_dirs,
+                                                      is_selected=is_selected))
+        except TaskError as exc:
+            self._task_failed("檢查檔案時發生錯誤", exc)
+            return
+        dialog = RemoveDialog(plan, method, full_verify, self)
+        accepted = dialog.exec() == RemoveDialog.DialogCode.Accepted
+        items = dialog.selected() if accepted else []
+        dialog.deleteLater()
+        if not items:
+            return
+        logger.info(f"保留 {len(kept)} 個資料夾、移除另一邊的 {len(items)} 個檔案（{method}）："
+                    + "、".join(f.path for f in kept))
+        hwnd = int(self.winId())
+        try:
+            results = run_task(self, "移除檔案", "正在移除…",
+                               lambda report: remove_items(items, method, hwnd, full_verify, report), delay_ms=0)
+        except TaskError as exc:
+            self._task_failed("移除檔案時發生錯誤", exc)
+            return
+        self._removal_done(results, method, {str(fi.path): fi.size for fi, _ in items})
+
+    def _remove_folders(self, chosen: list, method: str, full_verify: bool):
         logger.info(f"整個移除 {len(chosen)} 個資料夾（{method}{'，完整比對' if full_verify else ''}）："
                     + "、".join(f.path for f in chosen))
         hwnd = int(self.winId())

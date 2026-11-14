@@ -13,6 +13,7 @@ import fnmatch
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from .models import DuplicateGroup, FileInfo
 from .selection import FolderList
@@ -108,21 +109,24 @@ def _head(path: Path) -> bytes | None:
 
 
 def build_plan(groups: list[tuple[int, DuplicateGroup]], protected=None,
-               verify_head: bool = True, reference_dirs: list[str] | None = None) -> DeletePlan:
+               verify_head: bool = True, reference_dirs: list[str] | None = None,
+               is_selected: Callable[[FileInfo], bool] | None = None) -> DeletePlan:
     """依勾選狀態建立移除計畫。groups 為 (顯示編號, 群組)，只會處理有勾選檔案的群組。
 
     reference_dirs：保護的資料夾（寫法同選取規則，完整路徑或名稱片段），裡面的檔案視同受保護。
+    is_selected：要移除哪些檔案；預設看結果清單上的勾選（fi.selected）。
     """
     ref_dirs = FolderList(reference_dirs or [])
+    pick = is_selected or (lambda fi: fi.selected)
     plan = DeletePlan(groups=[])
     for number, g in groups:
-        selected = [fi for fi in g.files if fi.selected]
+        selected = [fi for fi in g.files if pick(fi)]
         if not selected:
             continue
         pg = PlanGroup(number=number, group=g, whole_group=len(selected) == len(g.files))
 
         # 找一份「確定還在且沒變」的副本當比對基準：優先用保留的；整組全選時用第一份還在的
-        kept = [fi for fi in g.files if not fi.selected]
+        kept = [fi for fi in g.files if not pick(fi)]
         reference = next((fi for fi in kept if not _changed(fi)), None)
         if reference is None and pg.whole_group:
             reference = next((fi for fi in g.files if not _changed(fi)), None)
@@ -130,7 +134,7 @@ def build_plan(groups: list[tuple[int, DuplicateGroup]], protected=None,
         pg.reference = str(reference.path) if reference else ""
 
         for fi in g.files:
-            if not fi.selected:
+            if not pick(fi):
                 pg.entries.append(PlanEntry(fi, KEEP, "" if fi is reference or not _changed(fi)
                                             else _changed(fi)))
                 continue

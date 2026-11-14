@@ -1,16 +1,17 @@
 # 對話框：自動選取規則、移除確認、整個資料夾移除、設定、無法讀取的檔案、純文字清單、關於。
 import os
+from collections import Counter
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QBrush, QColor, QFont
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QDialog, QHBoxLayout, QHeaderView, QMessageBox, QPlainTextEdit,
+    QApplication, QCheckBox, QComboBox, QDialog, QHBoxLayout, QHeaderView, QMessageBox, QPlainTextEdit,
     QRadioButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
 )
 
 from .. import __version__
 from ..delete_plan import KEEP, OK, PROTECTED, REFERENCE_NOTE, SKIP, DeletePlan
-from ..folder_dupes import conflict
+from ..folder_dupes import choice_conflict
 from ..formatting import human_size
 from ..selection import FALLBACKS, AutoRules
 from .app_settings import AppSettings
@@ -248,10 +249,14 @@ def _brush(color: str) -> QBrush:
 
 # ── 整個資料夾移除 ───────────────────────────────────────────────────────
 class FolderRemoveDialog(Dialog):
-    """整個都是重複的資料夾：勾選要移除的，連同空的子資料夾一起移走。
+    """整個都是重複的資料夾：勾選要處理的，每一列可以選要移除哪一邊。
 
-    勾選時檢查能不能一起移除（兩個資料夾互為副本、或一個包含另一個時不行）。
+    「這個資料夾」：連同空的子資料夾整個移走。
+    「另一邊的副本」：保留這個資料夾，改移除資料夾外面那些一樣的檔案。
+    勾選或切換時檢查能不能一起處理（互為副本、或一個包含另一個時不行）。
     """
+
+    REMOVE_THIS, REMOVE_OTHER = 0, 1
 
     def __init__(self, folders: list, method: str, full_verify: bool, preselect: str = "",
                  not_found_reason: str = "", parent=None):
@@ -262,8 +267,9 @@ class FolderRemoveDialog(Dialog):
         self._updating = False
         if folders:
             self.add_heading(f"{len(folders):,} 個資料夾整個都是重複的",
-                             "這些資料夾裡的每個檔案，在資料夾外面都還有一份一模一樣的，"
-                             "整個移走不會少任何內容。勾選要移除的資料夾。")
+                             "這些資料夾裡的每個檔案，在資料夾外面都還有一份一模一樣的。"
+                             "勾選要處理的資料夾，再在「移除哪邊」選要移掉這個資料夾，"
+                             "還是保留它、改移掉另一邊的副本。")
         else:
             self.add_heading("沒有整個重複的資料夾",
                              "要每個檔案在資料夾外面都有一份一樣的，資料夾才能整個移除。")
@@ -271,7 +277,7 @@ class FolderRemoveDialog(Dialog):
             self.lay.addWidget(label(f"這個資料夾不行：{not_found_reason}", "warning", wrap=True))
 
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["資料夾", "檔案", "大小", "另一份在"])
+        self.tree.setHeaderLabels(["資料夾", "檔案", "大小", "另一份在", "移除哪邊"])
         self.tree.setRootIsDecorated(False)
         self.tree.setUniformRowHeights(True)
         self.tree.setTextElideMode(Qt.TextElideMode.ElideMiddle)
@@ -279,12 +285,17 @@ class FolderRemoveDialog(Dialog):
         hdr = self.tree.header()
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        hdr.setStretchLastSection(False)
+        self.tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.tree.setColumnWidth(1, 90)
         self.tree.setColumnWidth(2, 90)
+        self.tree.setColumnWidth(4, 360)
         self.items: list[QTreeWidgetItem] = []
+        self.sides: list[QComboBox] = []
         for f in folders:
             files = f"{len(f.files):,} 個" + (f"＋{len(f.extra)} 小檔" if f.extra else "")
-            item = QTreeWidgetItem([f.path, files, human_size(f.size), f.elsewhere_text()])
+            item = QTreeWidgetItem([f.path, files, human_size(f.size), f.elsewhere_text(), ""])
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(0, Qt.CheckState.Unchecked)
             tip = [f.path, f"{len(f.files):,} 個重複的檔案" + (f"、{f.subfolders:,} 個子資料夾" if f.subfolders else "")]
@@ -298,7 +309,25 @@ class FolderRemoveDialog(Dialog):
             item.setToolTip(0, "\n".join(tip))
             item.setToolTip(3, "\n".join(where for where, _ in f.elsewhere[:10]))
             self.items.append(item)
+            outside = f.outside_files()
+            dirs = Counter(os.path.dirname(str(fi.path)) for fi in outside)
+            first = f"「{_short_name(dirs.most_common(1)[0][0])}」" if dirs else "另一邊"
+            where = f"{first}等 {len(dirs):,} 處的副本" if len(dirs) > 1 else f"{first}裡的副本"
+            side = QComboBox()
+            side.addItem(f"移除「{_short_name(f.path)}」（{human_size(f.size)}）")
+            side.addItem(f"移除{where}（{len(outside):,} 個，{human_size(sum(fi.size for fi in outside))}）")
+            side.setItemData(0, f"整個移除：{f.path}\n保留：{f.elsewhere_text()} 裡的副本",
+                             Qt.ItemDataRole.ToolTipRole)
+            side.setItemData(1, f"保留：{f.path}\n移除這些位置裡一樣的檔案：\n"
+                             + "\n".join(f"  {d}（{n:,} 個）" for d, n in dirs.most_common(10))
+                             + (f"\n  …等 {len(dirs):,} 處" if len(dirs) > 10 else ""),
+                             Qt.ItemDataRole.ToolTipRole)
+            side.setEnabled(bool(outside))
+            self.sides.append(side)
         self.tree.addTopLevelItems(self.items)
+        for item, side in zip(self.items, self.sides):
+            self.tree.setItemWidget(item, 4, side)
+            side.currentIndexChanged.connect(lambda _, it=item: self._side_changed(it))
         self.tree.itemChanged.connect(self._item_changed)
         self.tree.itemDoubleClicked.connect(lambda item, _: open_folder_existing(item.text(0)))
         self.tree.setVisible(bool(folders))
@@ -310,7 +339,8 @@ class FolderRemoveDialog(Dialog):
         if folders:
             self.lay.addWidget(label("雙擊可以在檔案總管開啟資料夾。" + explain
                                      + ("移除前會再完整比對一次內容（設定中可以關閉）。" if full_verify
-                                        else "移除前會再確認一次檔案沒有變動。"), "muted", wrap=True))
+                                        else "移除前會再確認一次檔案沒有變動。")
+                                     + "選「移除…裡的副本」時，會再列出要移除的檔案讓你確認。", "muted", wrap=True))
 
         self.select_all = button("全選", slot=self._select_all)
         self.select_all.setVisible(len(folders) > 1)
@@ -326,48 +356,93 @@ class FolderRemoveDialog(Dialog):
                 if f.key == key:
                     item.setCheckState(0, Qt.CheckState.Checked)
         self._refresh()
-        self.resize(max(self.width(), 900), 520 if folders else 220)
+        self.resize(max(self.width(), 1180), 520 if folders else 220)
+
+    # ── 勾選的結果 ────────────────────────────────────────────────────
+    def _checked(self, side: int) -> list:
+        return [f for item, combo, f in zip(self.items, self.sides, self.folders)
+                if item.checkState(0) == Qt.CheckState.Checked and combo.currentIndex() == side]
 
     def selected(self) -> list:
-        return [f for item, f in zip(self.items, self.folders) if item.checkState(0) == Qt.CheckState.Checked]
+        """整個移除的資料夾。"""
+        return self._checked(self.REMOVE_THIS)
+
+    def kept(self) -> list:
+        """保留、改移除另一邊副本的資料夾。"""
+        return self._checked(self.REMOVE_OTHER)
+
+    # ── 互動 ──────────────────────────────────────────────────────────
+    def _check_row(self, item: QTreeWidgetItem) -> bool:
+        """這一列（已勾選）能不能和其他勾選的一起處理；不行時取消勾選並說明。"""
+        index = self.items.index(item)
+        folder = self.folders[index]
+        keep = self.sides[index].currentIndex() == self.REMOVE_OTHER
+        removing = [f for f in self.selected() if f is not folder]
+        keeping = [f for f in self.kept() if f is not folder]
+        reason = choice_conflict(removing, keeping, folder, keep)
+        if not reason:
+            return True
+        self._updating = True
+        item.setCheckState(0, Qt.CheckState.Unchecked)
+        self._updating = False
+        self.conflict.setText(f"「{folder.name}」不能一起處理：{reason}")
+        self.conflict.show()
+        return False
 
     def _item_changed(self, item: QTreeWidgetItem, column: int):
         if self._updating or column != 0:
             return
-        if item.checkState(0) == Qt.CheckState.Checked:
-            folder = self.folders[self.items.index(item)]
-            reason = conflict([f for f in self.selected() if f is not folder], folder)
-            if reason:
-                self._updating = True
-                item.setCheckState(0, Qt.CheckState.Unchecked)
-                self._updating = False
-                self.conflict.setText(f"「{folder.name}」不能一起移除：{reason}")
-                self.conflict.show()
-                return
+        if item.checkState(0) == Qt.CheckState.Checked and not self._check_row(item):
+            self._refresh()
+            return
         self.conflict.hide()
         self._refresh()
 
+    def _side_changed(self, item: QTreeWidgetItem):
+        if self._updating:
+            return
+        if item.checkState(0) != Qt.CheckState.Checked:     # 選了哪邊就順便勾起來
+            item.setCheckState(0, Qt.CheckState.Checked)    # 觸發 _item_changed
+            return
+        if self._check_row(item):
+            self.conflict.hide()
+        self._refresh()
+
     def _select_all(self):
-        """依可釋放空間由大到小，能一起移除的都勾起來。"""
+        """依可釋放空間由大到小，能一起處理的都勾起來（照每一列目前選的那一邊）。"""
         self._updating = True
-        chosen = []
-        for item, f in sorted(zip(self.items, self.folders), key=lambda t: -t[1].size):
-            ok = not conflict(chosen, f)
+        removing, keeping = [], []
+        for item, combo, f in sorted(zip(self.items, self.sides, self.folders), key=lambda t: -t[2].size):
+            keep = combo.currentIndex() == self.REMOVE_OTHER
+            ok = not choice_conflict(removing, keeping, f, keep)
             item.setCheckState(0, Qt.CheckState.Checked if ok else Qt.CheckState.Unchecked)
             if ok:
-                chosen.append(f)
+                (keeping if keep else removing).append(f)
         self._updating = False
-        skipped = len(self.folders) - len(chosen)
+        skipped = len(self.folders) - len(removing) - len(keeping)
         self.conflict.setText(f"有 {skipped:,} 個資料夾和其他勾選的互為副本或互相包含，沒有勾選。" if skipped else "")
         self.conflict.setVisible(bool(skipped))
         self._refresh()
 
     def _refresh(self):
-        chosen = self.selected()
-        count = len(chosen)
-        self.ok_button.setText(f"{self.action}（{count:,} 個資料夾，{human_size(sum(f.size for f in chosen))}）"
-                               if count else self.action)
-        self.ok_button.setEnabled(count > 0)
+        removing, keeping = self.selected(), self.kept()
+        parts = []
+        if removing:
+            parts.append(f"{len(removing):,} 個資料夾")
+        if keeping:
+            parts.append(f"另一邊的副本 {sum(len(f.outside_files()) for f in keeping):,} 個檔案")
+        size = sum(f.size for f in removing) + sum(f.outside_size for f in keeping)
+        self.ok_button.setText(f"{self.action}（{'＋'.join(parts)}，{human_size(size)}）" if parts else self.action)
+        self.ok_button.setEnabled(bool(parts))
+
+
+def _short_name(path: str, limit: int = 18) -> str:
+    """資料夾名稱（太長時中間用 … 省略），用在下拉選單裡分辨是哪個資料夾。"""
+    name = os.path.basename(os.path.normpath(str(path))) or str(path)
+    if len(name) <= limit:
+        return name
+    half = (limit - 1) // 2
+    return name[:half] + "…" + name[-(limit - 1 - half):]
 
 
 def open_folder_existing(path) -> str:
